@@ -1,0 +1,35 @@
+selected_files:
+  - file: arc_jog_left_loop_002__A029_retargeted.npz
+    weight: 1.0
+  - file: arc_walk_left_loop_001__A029_retargeted.npz
+    weight: 1.0
+  - file: idle_turn_270_001__A048_retargeted.npz
+    weight: 1.0
+  - file: idle_turn_360_001__A047_retargeted.npz
+    weight: 1.0
+  - file: jog_arc_cw_loop_004__A045_retargeted.npz
+    weight: 1.0
+  - file: jog_backward_loop_002__A022_retargeted.npz
+    weight: 1.0
+  - file: jog_backward_loop_003__A023_retargeted.npz
+    weight: 1.0
+  - file: jog_forward_loop_003__A021_retargeted.npz
+    weight: 1.0
+  - file: jog_forward_loop_003__A022_retargeted.npz
+    weight: 1.0
+  - file: step_rotate_idle_000_002__A026_retargeted.npz
+    weight: 1.0
+  - file: walk_arc_cw_loop_002__A046_retargeted.npz
+    weight: 1.0
+  - file: walk_backward_loop_001__A022_retargeted.npz
+    weight: 1.0
+  - file: walk_backward_loop_001__A024_retargeted.npz
+    weight: 1.0
+  - file: walk_forward_loop_002__A022_retargeted.npz
+    weight: 1.0
+  - file: walk_forward_loop_002__A024_retargeted.npz
+    weight: 1.0
+  - file: walk_sideway_left_loop_002__A021_retargeted.npz
+    weight: 1.0
+  - file: walk_sideway_right_loop_001__A022_retargeted.npz
+    weight: 1.0

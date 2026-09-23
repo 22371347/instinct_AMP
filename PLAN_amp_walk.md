@@ -150,15 +150,37 @@ critic   : 同上 + base_lin_vel(3)，且关闭噪声
 
 ### 3.4 运动风格数据集（AMP_mjlab 经验，务必参考）
 
-**AMP_mjlab v4 最终只用了 7 个 clip**（清单见 `motion_data_csv/amp_selected.txt`，`WalkandRun/` 下原有 17 个）：
+**AMP_mjlab v4 最终只用了 7 个 clip**（清单见 `motion_data_csv/amp_selected.txt`，`WalkandRun/` 下原有 17 个）。
+⚠️ 清单里的 `walk_backward_loop_003__A143` **在 `WalkandRun/` 中并不存在**（只有 `walk_backward_loop_001__A022/A024`），说明“选中清单”与“实际部署集”并不一致 —— 这也是我们在迁移时必须**以实测数据为准**、而不是照抄清单的原因。
 
-| 类别 | clip | 速度特征 |
-|---|---|---|
-| 行走直向 | `walk_forward_loop_002__A022` | 前进 ~0.6–1.0 m/s |
-| | `walk_backward_loop_003__A143` | 后退 ~−0.5 m/s |
-| | `walk_sideway_left_loop_002__A021` / `walk_sideway_right_loop_001__A022` | 左/右侧移 |
-| 慢跑直向 | `jog_forward_loop_003__A022` | 巡航 ~1.7–1.9（高速档） |
-| 曲线 | `arc_walk_left_loop_001__A029` / `walk_arc_cw_loop_002__A046` | 左/右弧行走 |
+**已实测的 17 个 clip 特性**（`instinct/tools/convert_amp_motion.py --stats`，本体系速度，单位 m/s）：
+
+| 类别 | clip | vx | vy | ωz (°/s) | 曲线半径 |
+|---|---|---|---|---|---|
+| 行走直向 | `walk_forward_loop_002__A022` / `__A024` | +0.63 / +0.75 | — | ~0 | 直行 |
+| 行走后退 | `walk_backward_loop_001__A022` / `__A024` | −0.58 / −0.50 | — | ~0 | 直行 |
+| 侧移 | `walk_sideway_left_loop_002__A021` | ~0 | **+0.55** | ~0 | 直行 |
+| | `walk_sideway_right_loop_001__A022` | ~0 | **−0.48** | ~0 | 直行 |
+| 慢跑直向 | `jog_forward_loop_003__A021` / `__A022` | +0.90 / +1.02 | — | ~0 | 直行 |
+| 慢跑后退 | `jog_backward_loop_002__A022` / `__A023` | −0.90 / −1.07 | — | ~0 | 直行 |
+| 弧线行走 | `walk_arc_cw_loop_002__A046` | +0.78 | — | −27.1 | 1.66 m |
+| | `arc_walk_left_loop_001__A029` | +1.04 | — | +34.3 | 1.74 m |
+| 弧线慢跑 | `jog_arc_cw_loop_004__A045` | +1.29 | — | −44.2 | 1.68 m |
+| | `arc_jog_left_loop_002__A029` | **+1.69** | — | +57.0 | 1.71 m |
+| 原地转 | `idle_turn_270_001__A048` | 0 | 0 | −14.3 | — |
+| | `idle_turn_360_001__A047` | 0 | 0 | −24.1 | — |
+| 原地踏步 | `step_rotate_idle_000_002__A026` | 0 | 0 | ~0 | — |
+
+**实测数据集包络（速度指令必须落在此范围内）**：
+
+$$v_x \in [-1.07,\ +1.69]\ \text{m/s},\quad v_y \in [-0.48,\ +0.55]\ \text{m/s},\quad \omega_z \in [-44.2°,\ +57.0°]\ \text{/s}$$
+
+几点直接可用的结论：
+
+1. **前后向覆盖最好**（±0.5 ~ ±1.07 直行共 6 段），**侧向覆盖最薄**（仅 2 段、且 |vy| ≤ 0.55）→ 指令里 `vy` 上限**不应超过 ±0.5**，否则重演“判别器压制侧移”的问题
+2. **所有弧线半径统一 ≈1.7 m** → 曲线命令实际是“v 与 ωz 耦合”的一维族，`ωz` 不宜与 `|v|` 解耦采样
+3. **最高速度只有 1.69 m/s**，且只有 1 段 → 若命令上限设到 2.0 m/s，高速档将缺乏参考密度（**这正是 AMP_mjlab 排除 `jog_forward_loop_003__A021` 的原因**）；建议初版命令上限取 **±1.2 m/s**
+4. 所有 clip 的 `torso_link` 高度一致（0.749 ~ 0.827 m，均值 ≈0.81 m）→ 与 InstinctMJ `_POPSICLE_INIT_STATE` 的 `pos_z=0.82` **吻合**，间接支持“articulation root = `torso_link`”
 
 **选取准则（关键）：clip 的速度分布必须落在速度指令范围内**
 
@@ -190,6 +212,15 @@ critic   : 同上 + base_lin_vel(3)，且关闭噪声
 **命令课程**：y 全程不缩小；早期（step<2000）x 上限压到 ±1.0，2000 后恢复全对称。
 
 **对我们的指导**：`DirectionalVelocityCommandCfg` 只是 `UniformVelocityCommandCfg` 的子类，**可直接移植**到 instinct_xu 的 mdp 里并替掉 Uniform。注意 OmniLoco 原任务断言了命令范围与 `rel_standing_envs=0`；新任务可自定，但建议保持 `rel_standing_envs=0`（“站立”交给 `prob_low` 分支，避免双重站立语义）。
+
+**具体数值按 §3.4 实测包络取**：
+
+| 参数 | 初版取值（依据） |
+|---|---|
+| `lin_vel_x` | ±1.2 m/s（数据集最高 1.69 但仅 1 段，留余量） |
+| `lin_vel_y` | ±0.5 m/s（**不得超过 0.55**，侧向参考仅 2 段） |
+| `ang_vel_z` | ±0.9 rad/s ≈ ±51°/s（**不得超过 57°/s**） |
+| `heading` | 保持开启（弧线半径固定 1.7 m，转向与前进耦合） |
 
 ---
 
@@ -321,22 +352,39 @@ alg_class = importlib.import_module() if ":" in alg_class_name else getattr(algo
 
 ## 5. 关键风险与待确认项
 
-### 5.1 ⚠️ 参考动作数据格式（最大工作量项）
+### 5.1 ✅ 参考动作数据格式（**已解决**，实测 2025-09-23）
 
-**instinctlab 需要的 npz 字段**（实测学长 Vault 数据）：
+**instinctlab 加载器实际只需要 5 个字段**（读 `motion_reference/motion_files/amass_motion.py::_read_retargetted_motion_file`）：
 ```
-framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4),
-velocity_command(T,3), obstacle_size(3)?, obstacle_pos(3)?, obstacle_quat(4)?
+framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
+```
+- `velocity_command` **不是必需的** —— 加载器会自行估计速度（`velocity_estimation_method`）
+- `joint_vel` / `base_lin_vel_w` / `base_ang_vel_w` **也不需提供**，由 `_pack_retargetted_motion_sequence` 自动差分估计
+- 加载器会**按关节名**映射到 `isaac_joint_names`，并按 `motion_target_framerate` 自动插值
+
+**原计划中的两个“必须处理点”经实测均为误判，已纠正**：
+
+| 原假设 | 实测结果 |
+|---|---|
+| 要手动翻转四元数 xyzw→wxyz | ❌ **不需要** —— `csv_to_npz.py` 生成 npz 时**已经**做了 `[:, [3,0,1,2]]`，npz 里已是 wxyz（实测四元数模长 = 1.000） |
+| 要手动补 `velocity_command` | ❌ **不需要** —— 加载器自动估计 |
+
+**更重要的是：关节列序不需要重排**。已用 FK 严格验证（MJCF 做正运动学，比对 npz 自带的 `body_pos_w`）：
+
+```
+17 个 clip 全部：max|FK − body_pos_w| ≤ 1e-6 m
 ```
 
-**AMP_mjlab 的行走数据**：`src/assets/motions/g1/amp/WalkandRun/*.npz`（mjlab 7 字段格式），中间产物是 36 列 CSV `[base_pos(3), base_quat_xyzw(4), dof_pos(29)]`。
+即：**npz 的 `joint_pos` 列序 == MJCF hinge 顺序 == `csv_to_npz.py` 的 `joint_names` 列表 == IsaacLab 命名**（三重一致，带 `_joint` 后缀）。
 
-→ **需要写一个转换脚本**。三个必须处理的点：
-1. **四元数顺序**：AMP_mjlab CSV 是 **xyzw**，而 Isaac/IsaacLab 是 **wxyz** → 必须翻转，否则姿态全错
-2. **补 `velocity_command`**：instinctlab 需要，CSV 里没有 → 由 base_pos_w 差分 + 航向推算（可参考 `motion_reference/utils.py` 里的估计方法）
-3. **补 `joint_names` / `framerate`**，并保证关节序与 `OMNI_LOCO_JOINT_ORDER` 一致
+**交付物**：
 
-另外 `VaultMotionCfg` 继承的是 `AmassMotionCfgBase` —— 说明这个 cfg **本身就是通用的 npz 加载器**，不一定非要是 AMASS 数据，我们的行走 npz 可直接复用。
+| 文件 | 说明 |
+|---|---|
+| `instinct/tools/convert_amp_motion.py` | 转换器（内置 FK 验证、`--verify-only`、`--stats`、`--base-body`） |
+| `instinct_xu/.../tasks/locomotion/config/g1/motions/amp_walk/` | 17 个 `*_retargeted.npz` + `amp_walk_motion_selection.yaml` |
+
+**唯一尚需运行时确认的点（低风险）**：`base_pos_w` 的参考系。脚本默认用 **`torso_link`**（依据：`MotionReferenceManagerCfg.prim_path` 指向 `Robot/torso_link`，且实测 `torso_link` 高度 0.81 m 与 InstinctMJ `_POPSICLE_INIT_STATE.pos_z=0.82` 吻合）。若运行时发现参考与机器人有**恒定偏移**，重跑 `--base-body pelvis` 即可（1 行参数）。
 
 ### 5.2 其它风险
 
@@ -359,8 +407,10 @@ velocity_command(T,3), obstacle_size(3)?, obstacle_pos(3)?, obstacle_quat(4)?
 ## 6. 执行顺序（分段）
 
 ```
-① 参考动作数据   按命令范围挑选 clip（§3.4）→ AMP_mjlab CSV/npz → instinctlab 格式 npz
-                 （四元数 xyzw→wxyz 翻转 + 补 velocity_command，见 §5.1）
+✅① 参考动作数据   【已完成】转换器 + 17 个 clip 已产出
+                 instinct/tools/convert_amp_motion.py
+                 （FK 校验全通过 ≤1e-6 m；四元数无需翻转；无需补 velocity_command；见 §5.1）
+                 另：--stats 实测出数据集速度包络，已回填 §3.4/§3.5
 ② 任务骨架       复制 OmniLoco → amp_walk_env_cfg（actor obs 加 base_lin_vel、保留高程图、先不加 AMP）
 ③ 速度指令       移植 DirectionalVelocityCommandCfg（§3.5），替掉 UniformVelocityCommand
 ④ AMP 观测组     构造 amp_policy / amp_reference（anchor-relative 13 body），校验同构
@@ -377,4 +427,4 @@ velocity_command(T,3), obstacle_size(3)?, obstacle_pos(3)?, obstacle_quat(4)?
 >
 > 三处迁移要点：**奖励混合**（模式 + 权重两参，一行奖励函数都不改）、**运动数据集选取**（按命令范围挑 clip，保证每方向参考密度）、**速度指令采样**（换方向分档，否则纯侧向命令采不出来）。
 >
-> **最大的实际工作量在参考动作数据格式转换**，而不是算法本身。
+> 原以为“最大的实际工作量在参考动作数据格式转换”——**实测后已被证伪**：转换器一天内写完并全部通过 FK 验证（误差 ≤1e-6 m），四元数无需翻转、速度无需手工补、关节序无需重排。真正的风险集中在**数据集速度包络**与**奖励混合的数值一致性**上。
