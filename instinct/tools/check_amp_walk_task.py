@@ -27,6 +27,7 @@ E. 契约继承：`G1AmpWalkTeacherEnv` 覆盖的三个期望值 == 对应常量
 from __future__ import annotations
 
 import ast
+import json
 import math
 import sys
 from pathlib import Path
@@ -37,6 +38,9 @@ G1_DIR = INSTINCTLAB / "tasks/locomotion/config/g1"
 TARGET = G1_DIR / "amp_walk_env_cfg.py"
 COMMANDS_PY = INSTINCTLAB / "tasks/locomotion/mdp/commands.py"
 MOTION_DIR = G1_DIR / "motions/amp_walk"
+FLAT_CFG = G1_DIR / "flat_env_cfg.py"
+REWARDS_AMP_PY = INSTINCTLAB / "tasks/locomotion/mdp/rewards_amp.py"
+FOOT_SEP_STATS = REPO / "instinct/tools/amp_walk_foot_sep_stats.json"
 
 EXPECTED_SIZE = 626
 EXPECTED_AMP_STATE_SIZE = 670
@@ -61,6 +65,57 @@ ALLOWED_NEW_SYMBOLS = {
 
 #: 目标文件里模块级的字面量常量表（用于解析 `(AMP_STATE_HISTORY, 3)` 这类写法）
 _CONSTS: dict[str, object] = {}
+
+#: 步骤⑤ 奖励迁移契约。基类 `G1FlatRewardsCfg` 的这些权重**必须原样不变** ——
+#: 用户要求「不改奖励函数与权重」，因为 OmniLoco / Vault / flat 三条链路已训好。
+BASE_REWARD_WEIGHTS_UNCHANGED = {
+    "termination_penalty": -200.0,
+    "track_lin_vel_xy_exp": 1.0,
+    "track_ang_vel_z_exp": 1.0,
+    "feet_air_time": 1.0,
+    "feet_slide": -0.1,
+    "flat_orientation_l2": -1.0,
+    "stand_still": -0.8,
+    "dof_pos_limits": -1.0,
+    "lin_vel_z_l2": -0.1,
+    "action_rate_l2": -0.05,
+}
+#: AMP 行走子类**只允许**覆盖这三项的权重（AMP_mjlab v5 的表）。
+AMP_WALK_REWARD_OVERRIDES = {
+    "track_lin_vel_xy_exp": 1.5,
+    "track_ang_vel_z_exp": 1.2,
+    "feet_slide": -0.25,
+}
+#: 迁移过来的新项 → 期望权重（其余参数在下面单独对账）。
+AMP_WALK_REWARD_NEW = {
+    "track_base_height": 1.5,
+    "body_ang_vel_xy": 0.7,
+    "track_default_pose_on_stand": -1.0,
+    "feet_lateral_width": -10.0,
+    "feet_crossing": -20.0,
+}
+#: 直线行走标定集（与 `tools/calibrate_foot_sep.py` 的 `WALK_CLIPS` 一致）。
+FOOT_SEP_WALK_CLIPS = (
+    "walk_forward_loop_002__A022",
+    "walk_forward_loop_002__A024",
+    "walk_backward_loop_001__A022",
+    "walk_backward_loop_001__A024",
+)
+#: 交叉式侧步 clip（实测 21% 帧 sep<0）—— 它们是 `gate_lateral=True` 的依据。
+CROSS_STEP_CLIPS = (
+    "walk_sideway_left_loop_002__A021",
+    "walk_sideway_right_loop_001__A022",
+)
+
+#: `asset.data.<attr>` 中允许「本仓库无直接先例」的属性（值 = 理由）。
+#: 这道守卫防的是 `AttributeError` —— 与 C 类同一个思路，但针对数据容器属性
+#: （C 类只能查 `<模块>.<名字>`，查不到 `asset.data.xxx`）。
+ALLOWED_DATA_ATTRS = {
+    "root_ang_vel_b":
+        "IsaacLab 标准属性：`isaaclab.envs.mdp.base_ang_vel` 的实现就是 `asset.data.root_ang_vel_b`，"
+        "而 `instinctlab/envs/mdp/observations/expanded.py` 正是从那里转发的；"
+        "仓库里只是没直接写过 `data.root_ang_vel_b` 而已",
+}
 
 _errors: list[str] = []
 _warns: list[str] = []
@@ -897,6 +952,266 @@ def check_amp_state_isomorphism(tree: ast.Module) -> None:
 
 
 # ---------------------------------------------------------------------------
+# J. 奖励集迁移对账（步骤⑤：AMP_mjlab v5 → G1AmpWalkRewardsCfg）
+# ---------------------------------------------------------------------------
+
+def _reward_terms(path: Path, class_name: str) -> dict[str, dict]:
+    """取一个 configclass 里的 `RewTerm(...)` 字段：{名: {weight, func, params}}。"""
+    cls = class_defs(parse(path)).get(class_name)
+    if cls is None:
+        return {}
+    out: dict[str, dict] = {}
+    for name, call in child_assignments(cls):
+        if call_func_name(call) != "RewTerm":
+            continue
+        spec: dict = {"weight": None, "func": "", "params": {}}
+        for kw in call.keywords:
+            if kw.arg == "weight":
+                spec["weight"] = literal(kw.value)
+            elif kw.arg == "func":
+                v = kw.value
+                if isinstance(v, ast.Call):
+                    spec["func"] = call_func_name(v)
+                elif isinstance(v, ast.Name):
+                    spec["func"] = v.id
+                else:
+                    spec["func"] = ast.unparse(v)
+            elif kw.arg == "params" and isinstance(kw.value, ast.Dict):
+                for k, v in zip(kw.value.keys, kw.value.values):
+                    key = string_value(k)
+                    if key is not None:
+                        spec["params"][key] = literal(v)
+        out[name] = spec
+    return out
+
+
+def _num(spec: dict, key: str):
+    v = spec["params"].get(key)
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def _data_attr_precedents(exclude: Path) -> set[str]:
+    """扫描仓库，收集所有 `...data.<attr>` 里出现过的属性名。"""
+    out: set[str] = set()
+    for py in INSTINCTLAB.rglob("*.py"):
+        if py == exclude:
+            continue
+        try:
+            t = parse(py)
+        except SyntaxError:
+            continue
+        for node in ast.walk(t):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "data"
+            ):
+                out.add(node.attr)
+    return out
+
+
+def _used_data_attrs(path: Path) -> list[str]:
+    return sorted({
+        n.attr
+        for n in ast.walk(parse(path))
+        if isinstance(n, ast.Attribute)
+        and isinstance(n.value, ast.Attribute)
+        and n.value.attr == "data"
+    })
+
+
+def check_reward_migration(tree: ast.Module) -> None:
+    """把「奖励从 AMP_mjlab 迁移」这条要求变成**可执行的契约**。
+
+    四件事：
+    1. 证明**基类一个字没动**（否则会连带影响 OmniLoco/Vault 三条已训链路）；
+    2. 证明迁移表逐项落地（覆盖项 / 新增项的权重）；
+    3. 证明**没有**偷改其它项的权重（「不改权重」约束）；
+    4. 把 `sep_floor` / `walk_max_lin_vel` 与①产出的**实测标定数据**做数值对账。
+    """
+    print("J. 奖励集迁移对账（步骤⑤，AMP_mjlab v5 → G1AmpWalkRewardsCfg）")
+
+    base = _reward_terms(FLAT_CFG, "G1FlatRewardsCfg")
+    if not base:
+        err("J: 未能解析 G1FlatRewardsCfg（基类奖励集）")
+        return
+
+    # --- 1) 基类零改动 ------------------------------------------------------
+    bad = []
+    for name, want in BASE_REWARD_WEIGHTS_UNCHANGED.items():
+        got = base.get(name, {}).get("weight")
+        if got is None:
+            bad.append(f"{name} 缺失")
+        elif abs(float(got) - float(want)) > 1e-12:
+            bad.append(f"{name}={got}（应为 {want}）")
+    if bad:
+        err("J: 基类 G1FlatRewardsCfg 的权重被动过！" + "; ".join(bad))
+    else:
+        print(f"   ✅ 基类 G1FlatRewardsCfg 的 {len(BASE_REWARD_WEIGHTS_UNCHANGED)} 项权重原样未动")
+        print("      → OmniLoco / Vault / flat 三条已训链路不受影响")
+
+    # --- 2) 子类接线 --------------------------------------------------------
+    classes = class_defs(tree)
+    sub_bases = _bases_of(classes, "G1AmpWalkRewardsCfg")
+    if not any(b.startswith("G1FlatRewardsCfg") for b in sub_bases):
+        err(f"J: G1AmpWalkRewardsCfg 未继承 G1FlatRewardsCfg（基类={sub_bases}）")
+    env_fields = _ann_fields(classes.get("G1AmpWalkEnvCfg")) if "G1AmpWalkEnvCfg" in classes else {}
+    if "rewards" not in env_fields or not env_fields["rewards"].startswith("G1AmpWalkRewardsCfg"):
+        err(f"J: G1AmpWalkEnvCfg.rewards 未接到 G1AmpWalkRewardsCfg（实际 {env_fields.get('rewards')!r}）")
+    else:
+        print(f"   ✅ G1AmpWalkEnvCfg.rewards = {env_fields['rewards']}")
+
+    sub = _reward_terms(TARGET, "G1AmpWalkRewardsCfg")
+    if not sub:
+        err("J: 未能解析 G1AmpWalkRewardsCfg")
+        return
+
+    # --- 3) 覆盖项 / 新增项的权重对账 ---------------------------------------
+    for name, want in AMP_WALK_REWARD_OVERRIDES.items():
+        spec = sub.get(name)
+        if spec is None:
+            err(f"J: 缺少覆盖项 '{name}'（应为 {want}）")
+        elif spec["weight"] is None or abs(float(spec["weight"]) - want) > 1e-12:
+            err(f"J: '{name}' 权重 {spec['weight']} != 迁移表期望 {want}")
+        else:
+            print(f"   ✅ 覆盖 {name:26s} weight={want:+g}（基类 {base.get(name, {}).get('weight'):+g}）")
+
+    for name, want in AMP_WALK_REWARD_NEW.items():
+        spec = sub.get(name)
+        if spec is None:
+            err(f"J: 缺少新增项 '{name}'（应为 {want}）")
+        elif spec["weight"] is None or abs(float(spec["weight"]) - want) > 1e-12:
+            err(f"J: '{name}' 权重 {spec['weight']} != 迁移表期望 {want}")
+        else:
+            print(f"   ✅ 新增 {name:26s} weight={want:+g}")
+
+    # --- 4) 没有偷改其它项的权重 -------------------------------------------
+    tampered = []
+    for name, spec in sub.items():
+        if name in AMP_WALK_REWARD_OVERRIDES or name in AMP_WALK_REWARD_NEW:
+            continue
+        base_w = base.get(name, {}).get("weight")
+        if base_w is None:
+            tampered.append(f"{name}（基类里没有这一项，却出现在子类）")
+        elif spec["weight"] is None or abs(float(spec["weight"]) - float(base_w)) > 1e-12:
+            tampered.append(f"{name}: {spec['weight']} != 基类 {base_w}")
+    if tampered:
+        err("J: 子类动了不该动的奖励项 —— " + "; ".join(tampered))
+    else:
+        others = [n for n in sub if n not in AMP_WALK_REWARD_OVERRIDES and n not in AMP_WALK_REWARD_NEW]
+        print(f"   ✅ 其余 {len(others)} 个声明项权重与基类一致（未偷改）")
+
+    # --- 5) 新项的 func 必须真的定义在 rewards_amp.py -----------------------
+    if not REWARDS_AMP_PY.is_file():
+        err(f"J: 缺少 {REWARDS_AMP_PY.relative_to(REPO)}")
+    else:
+        authored = {f"locomotion_mdp.{n}" for n in top_level_names(parse(REWARDS_AMP_PY))}
+        init_src = (REWARDS_AMP_PY.parent / "__init__.py").read_text(encoding="utf-8")
+        if "from .rewards_amp import *" not in init_src:
+            err("J: locomotion/mdp/__init__.py 未转发 `from .rewards_amp import *`，新奖励项不可用")
+        missing = [f"{n} → {sub[n]['func']}" for n in AMP_WALK_REWARD_NEW
+                   if sub[n]["func"] not in authored]
+        if missing:
+            err("J: 新奖励项的 func 不在 mdp/rewards_amp.py 里定义：" + "; ".join(missing))
+        else:
+            print(f"   ✅ {len(AMP_WALK_REWARD_NEW)} 个新奖励项的 func 均在 mdp/rewards_amp.py 中定义")
+
+    # --- 6) 步宽 / 交叉项的参数对账（vs 实测标定）---------------------------
+    width = sub.get("feet_lateral_width", {}).get("params", {})
+    cross = sub.get("feet_crossing", {}).get("params", {})
+    for label, params in (("feet_lateral_width", width), ("feet_crossing", cross)):
+        if params.get("gate_lateral") is not True:
+            err(f"J: {label}.gate_lateral 必须为 True —— 实测侧移 clip 有 ~21% 帧 sep<0"
+                "（交叉式侧步，属参考动作风格），关掉方向门控会与 AMP 风格先验对撞、压制侧移")
+        if params.get("command_name") != "base_velocity":
+            err(f"J: {label}.command_name 应为 'base_velocity'（实际 {params.get('command_name')!r}）")
+        if params.get("walk_max_lin_vel") is None:
+            warn(f"J: {label} 未设 walk_max_lin_vel，慢跑摆动腿内收会被误罚")
+
+    worst = []
+    for label, params in (("feet_lateral_width", width), ("feet_crossing", cross)):
+        mc = params.get("max_cost")
+        if isinstance(mc, (int, float)):
+            worst.append((label, abs(AMP_WALK_REWARD_NEW[label]) * float(mc)))
+    for label, v in worst:
+        flag = "⚠️" if v > 2.5 else "✅"
+        print(f"   {flag} {label:20s} 单帧最大惩罚 = |{AMP_WALK_REWARD_NEW[label]:g}| × "
+              f"max_cost = {v:.2f}（硬封顶，与 AMP_mjlab 的 max_cost 一致）")
+
+    # --- 7) sep_floor vs 实测标定 ------------------------------------------
+    sep_floor = _num(sub.get("feet_lateral_width", {}), "sep_floor")
+    walk_max = _num(sub.get("feet_lateral_width", {}), "walk_max_lin_vel")
+    if sep_floor is None:
+        err("J: feet_lateral_width 缺少 sep_floor")
+        return
+    if not FOOT_SEP_STATS.is_file():
+        warn(f"J: 找不到标定文件 {FOOT_SEP_STATS.relative_to(REPO)}，跳过 sep_floor 对账"
+             "（先跑 tools/calibrate_foot_sep.py）")
+    else:
+        stats = json.loads(FOOT_SEP_STATS.read_text(encoding="utf-8"))
+        hw = stats["healthy_walk"]
+        p1, lo = float(hw["p1"]), float(hw["min"])
+        print(f"   实测（直线行走 {hw['n_clips']} 段 / {hw['n_frames']} 帧）: "
+              f"min={lo:.4f}  p1={p1:.4f}  中位={float(hw['median']):.4f}  "
+              f"脚部参考 body={stats['foot_bodies']['left']}/{stats['foot_bodies']['right']}")
+        print(f"   配置 sep_floor = {sep_floor:.3f}")
+        if sep_floor <= 0.0:
+            err(f"J: sep_floor={sep_floor} 必须为正")
+        elif sep_floor > p1 + 1e-9:
+            err(f"J: sep_floor={sep_floor} 高于直线行走实测 p1={p1:.4f} → "
+                f"健康步态会被误罚（AMP_mjlab 的教训：地板要放在健康下探值之下）")
+        else:
+            print(f"   ✅ sep_floor ≤ 直线行走 p1（健康步态被罚的帧 ≲1%）；"
+                  f"最坏下探 {lo:.4f} ≥ sep_floor−max_cost 之下也不误伤")
+        # 侧移 clip 的交叉占比 —— gate_lateral 的经验依据
+        lat = [stats["per_clip"][c] for c in CROSS_STEP_CLIPS if c in stats["per_clip"]]
+        if lat:
+            neg = max(float(r["neg_frac"]) for r in lat)
+            print(f"   交叉式侧步实测 sep<0 帧占比（最大）= {neg:.3f}")
+            if neg < 0.05:
+                warn("J: 侧移 clip 已几乎不交叉 → gate_lateral=True 的依据变弱，可考虑复核")
+        for c in FOOT_SEP_WALK_CLIPS:
+            r = stats["per_clip"].get(c)
+            if r and float(r["neg_frac"]) > 0.0:
+                err(f"J: 直线行走 clip {c} 出现 {r['neg_frac']:.4f} 帧 sep<0；"
+                    f"若属实则 sep 的符号/左右定义可能反了")
+
+    # --- 8) walk_max_lin_vel 必须高于直线行走速度 ---------------------------
+    if walk_max is not None:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import convert_amp_motion as cam  # noqa: PLC0415
+            speeds = [
+                abs(cam.body_frame_stats(MOTION_DIR / f"{c}_retargeted.npz")["vx"])
+                for c in FOOT_SEP_WALK_CLIPS
+                if (MOTION_DIR / f"{c}_retargeted.npz").is_file()
+            ]
+        except Exception as e:  # pragma: no cover
+            speeds = []
+            warn(f"J: 无法读取直线行走速度（{e}），跳过 walk_max_lin_vel 对账")
+        if speeds:
+            top = max(speeds)
+            print(f"   直线行走实测 |vx| 最大 = {top:.3f} m/s；配置 walk_max_lin_vel = {walk_max:.2f}")
+            if walk_max <= top:
+                err(f"J: walk_max_lin_vel={walk_max} ≤ 直线行走速度 {top:.3f} → 正常行走会被门控掉一部分")
+            else:
+                print("   ✅ 门控上限高于直线行走速度，正常行走不受速档豁免影响")
+
+    # --- 9) 新奖励函数用到的 `asset.data.<attr>` 必须有仓库先例 --------------
+    if REWARDS_AMP_PY.is_file():
+        precedents = _data_attr_precedents(REWARDS_AMP_PY)
+        used = _used_data_attrs(REWARDS_AMP_PY)
+        unknown = [a for a in used if a not in precedents and a not in ALLOWED_DATA_ATTRS]
+        allowed_used = [a for a in used if a in ALLOWED_DATA_ATTRS and a not in precedents]
+        if unknown:
+            err("J: rewards_amp.py 用到的 asset.data 属性在本仓库无先例（运行时可能 AttributeError）："
+                + ", ".join(unknown))
+        else:
+            print(f"   ✅ {len(used)} 个 asset.data.* 属性均有仓库先例"
+                  + (f"（{', '.join(allowed_used)} 走 allowlist）" if allowed_used else ""))
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     if not TARGET.is_file():
@@ -923,6 +1238,8 @@ def main() -> int:
     check_command_envelope(tree)
     print("-" * 72)
     check_amp_state_isomorphism(tree)
+    print("-" * 72)
+    check_reward_migration(tree)
     print("=" * 72)
 
     for w in _warns:

@@ -161,8 +161,13 @@ bash /path/to/llp/instinct/tools/cloud_smoke_amp_walk.sh
 |---|---|---|
 | 1 | `import isaaclab.envs.mdp` 里 `UniformVelocityCommand` 类是否存在 | 步骤③ 的方向分档指令**依赖它**（本机无法验证，是最大风险点） |
 | 2 | `UniformVelocityCommand` 是否有 `vel_command_b` 缓冲 | 同上；`DirectionalVelocityCommand.__init__` 有 fail-fast 会直接报错 |
-| 3 | `--task Instinct-Amp-Walk-G1-v0 --num_envs 16 --max_iterations 2` | 端到端：G1 资产 + 高程图 527 射线 + 626 维观测 + 方向分档指令 + `motion_reference`/`robot_reference` 场景 + `amp_policy`/`amp_reference` 同构 |
+| 3 | `--task Instinct-Amp-Walk-G1-v0 --num_envs 16 --max_iterations 2` | 端到端：G1 资产 + 高程图 527 射线 + 626 维观测 + 方向分档指令 + `motion_reference`/`robot_reference` 场景 + `amp_policy`/`amp_reference` 同构 + **步骤⑤ 的奖励集能被 `RewardManager` 实例化并跑通前向** |
 | 4 | 契约校验器打印 `[AMP-WALK PASS]` | 说明动作空间/时序/执行器/命令范围全部符合预期 |
+
+> 第 3 项顺带覆盖步骤⑤：`RewardManager` 在 `load_managers()` 里**先于**契约校验构建，
+> 因此任一奖励项 `func` 不存在 / 参数名写错 / `asset.data.<attr>` 不存在，
+> 都会在 `[AMP-WALK PASS]` 之前就报错。跑起来后可顺带看 TensorBoard 里的
+> `Metrics/foot_sep_mean`（应≈0.19~0.25）与 `Metrics/foot_cross_frac`（直线段应≈0）。
 
 **已知会在云端首次暴露、本机无法验证的假设**（按风险排序）：
 
@@ -171,11 +176,17 @@ bash /path/to/llp/instinct/tools/cloud_smoke_amp_walk.sh
 3. `robot_reference` + `motion_reference` 传感器在 `G1OmniLocoSceneCfg` 基础上叠加后能否正常构建
 4. `motion_reference` 的关节顺序与机器人是否逐一对齐（两侧 AMP 状态逐项同构依赖它）
 5. `isaaclab.envs.mdp.joint_vel_rel` 存在
+6. ⭐ **步骤⑤ 新增**：`LL_FOOT` / `LR_FOOT` 是否真的出现在 `robot.body_names` 里
+   （URDF 里它们是 `merge_fixed_joints=False` 保留的、质量 1e-9 的纯框架 link）。
+   若被 PhysX 丢掉，`feet_lateral_sep` 会自动退到 `left/right_ankle_roll_link`
+   （横向偏移为 0，两者数值几乎一致），但**日志里会少掉这个信号**，
+   建议在冒烟输出里 `print` 一次 `robot.body_names` 确认。
+7. ⭐ **步骤⑤ 新增**：`root_ang_vel_b`（IsaacLab 标准属性，仓库里只是没直接用过）。
 
-> 这 5 条每一条都已在本地用**静态契约检查**做过能做的部分
-> （`instinct/tools/check_amp_walk_task.py`，9 类检查 A–I 全过），
+> 这些条每一条都已在本地用**静态契约检查**做过能做的部分
+> （`instinct/tools/check_amp_walk_task.py`，10 类检查 A–J 全过），
 > 但静态检查不能替代真实运行。**建议云环境一通就先跑第 3 层冒烟**，
-> 把 ②③④ 三步积累的「未验证断言」一次性清掉，再继续写 ⑤⑥。
+> 把 ②③④⑤ 四步积累的「未验证断言」一次性清掉，再继续写 ⑥。
 
 ---
 

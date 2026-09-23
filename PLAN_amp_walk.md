@@ -129,8 +129,8 @@ IsaacLab 会自动实例化；它内部 `physx.create_simulation_view` 取重力
 | 1 | `tasks/locomotion/config/g1/amp_walk_env_cfg.py` | **新增** | 继承 `G1OmniLocoEnvCfg`，覆盖：actor obs 加 `base_lin_vel`；新增 `amp_policy`/`amp_reference` 两组；替换为 AMP 奖励集；挂 `motion_reference` 场景实体 |
 | 2 | `tasks/locomotion/config/g1/agents/amp_walk_rl_cfg.py` | **新增** | `InstinctRlOnPolicyRunnerCfg` 子类；`algorithm.class_name = "WasabiPPO"` + WASABI 参数；`policy` 用 `InstinctRlActorCriticCfg`（hidden 建议 512/256/128） |
 | 3 | `tasks/locomotion/config/g1/__init__.py` | 修改 | 追加 `Instinct-Amp-Walk-G1-v0`(+ Play) 注册（**只加不删**） |
-| 4 | `tasks/locomotion/mdp/rewards_amp.py` | **新增** | 从 AMP_mjlab 迁移的奖励函数（见 §3.1） |
-| 5 | `tasks/locomotion/mdp/velocity_command.py` | **新增** | 移植 AMP_mjlab 的 `DirectionalVelocityCommandCfg`（见 §3.5） |
+| 4 | `tasks/locomotion/mdp/rewards_amp.py` | ✅ **已完成**（新增） | 从 AMP_mjlab v5 迁移的奖励函数（见 §3.1、§3.7） |
+| 5 | `tasks/locomotion/mdp/commands.py` | ✅ **已完成**（新增） | `DirectionalVelocityCommand(UniformVelocityCommand)` + Cfg（见 §3.5） |
 | 6 | `tasks/locomotion/mdp/observations_amp.py` | **新增**（可选） | 若需要 AMP_mjlab 那种 anchor-relative body 量 |
 | 7 | 参考动作 npz + selection yaml | **新增** | 行走参考动作（见 §3.4、§5.1） |
 | 8 | 算法子类 `WasabiPPOAmpMix` | **新增** | 实现 `additive`/`lerp` 两种奖励混合模式（见 §4.2）；**只 override 一个方法**。放置位置见 §4.2（runner 有 1 处 bug，需选 A 或 B） |
@@ -142,22 +142,33 @@ IsaacLab 会自动实例化；它内部 `physx.create_simulation_view` 取重力
 
 ## 3. 从 AMP_mjlab 迁移什么 / 不迁移什么
 
-### 3.1 奖励：迁移（你的要求 3）
+### 3.1 奖励：迁移（你的要求 3）—— **已实施（步骤⑤）**
 
-| AMP_mjlab 奖励项 | 权重 | 迁移建议 |
+实现位置：`instinct_xu/.../tasks/locomotion/mdp/rewards_amp.py`（新增）+ `amp_walk_env_cfg.py::G1AmpWalkRewardsCfg`。
+**不新建任何奖励函数的情况**：`track_lin_vel_xy_yaw_frame_exp` / `track_ang_vel_z_world_exp` /
+`instinct_mdp.contact_slide` 三者直接复用，只改权重。
+
+| AMP_mjlab 奖励项 | 权重 | 落地结果 |
 |---|---|---|
-| `track_anchor_linear_velocity` | 1.5 | ✅ 迁（instinct_xu 已有 `track_lin_vel_xy_yaw_frame_exp`，语义等价，可直接改权重） |
-| `track_anchor_angular_velocity` | 1.2 | ✅ 迁（对应 `track_ang_vel_z_world_exp`） |
-| `track_root_height` | 1.5 | ✅ 迁（instinct_xu 里 `base_height_l2` 被注释掉了，需启用或自写） |
-| `body_ang_vel_xy_l2` | 0.7 | ✅ 迁 |
-| `track_default_pose_on_stand` | -1.0 | ✅ **建议迁**（低速回 default 站姿 + 速度阻尼；对"停稳"很关键） |
-| `feet_lateral_width` | -10.0 | ✅ 迁（防侧向并步过窄） |
-| `feet_crossing` | -20.0 | ✅ 迁（防交叉步） |
-| `self_collisions` | -0.1 | ✅ 迁 |
-| `foot_slip` | — | ✅ 迁（instinct_xu 已有 `feet_slide`） |
-| `torso_posture` / `feet_swing_clearance` / `soft_landing` | 已注释 | ⬜ 暂不迁（AMP_mjlab 自己也没用） |
+| `track_anchor_linear_velocity` | 1.5 | ✅ 复用 `track_lin_vel_xy_yaw_frame_exp`，权重 1.0 → **1.5**（误差范数在偏航旋转下不变，语义等价） |
+| `track_anchor_angular_velocity` | 1.2 | ✅ 复用 `track_ang_vel_z_world_exp`，权重 1.0 → **1.2** |
+| `track_root_height` | 1.5 | ✅ 新写 `track_base_height_exp`（weight **+1.5**, std 0.3，目标高度 = `default_root_state[z]` = 0.82） |
+| `body_ang_vel_xy_l2` | 0.7 | ✅ 新写 `track_root_ang_vel_xy_exp`（weight **+0.7**, std 3.14）。⚠️ 原名带 `l2` 但**其实是 exp 正奖励** |
+| `track_default_pose_on_stand` | −1.0 | ✅ 新写同名函数（L1 + 平滑门控 `gate_tau=0.25` + `waist_yaw_joint: 3.0`） |
+| `feet_lateral_width` | −10.0 | ✅ 新写 `feet_lateral_width_cost`（**`sep_floor` 已按本仓库实测重标定为 0.145**，见 §3.7） |
+| `feet_crossing` | −20.0 | ✅ 新写 `feet_crossing_cost`。⚠️ **有意偏离**：额外加了方向门控，见 §3.7 |
+| `foot_slip` | −0.25 | ✅ 复用 `instinct_mdp.contact_slide`（`feet_slide`），权重 −0.1 → **−0.25** |
+| `self_collisions` | −0.1 | ❌ **不迁移**。IsaacLab 的 `ContactSensorCfg.filter_prim_paths_expr` 在 PhysX 上**只支持一对多**（官方 attention：`prim_path` 必须只匹配每环境**一个** prim），所以 `Robot/.*` 过滤 `Robot/.*` 这种自碰撞检测做不出来；且本任务已有更强兜底：资产 `enabled_self_collisions=True` + `G1FlatTerminationsCfg.base_contact` 对躯干/手臂/髋/膝接触直接 **−200 并终止** |
+| `torso_posture` / `feet_swing_clearance` / `soft_landing` | 已注释 | ⬜ 不迁（AMP_mjlab 自己也没用） |
 
-**保留 instinct_xu 原有**的：`termination_penalty(-200)`、`stand_still(-0.8)`、`joint_deviation_*`、`action_rate_l2`、`dof_acc_l2`、`dof_torques_l2`、`dof_pos_limits`、`flat_orientation_l2`、`lin_vel_z_l2`、`feet_air_time(1.0)`。
+**保留 instinct_xu 原有**的（权重原样）：`termination_penalty(-200)`、`stand_still(-0.8)`、
+`joint_deviation_*`、`action_rate_l2`、`dof_acc_l2`、`dof_torques_l2`、`dof_pos_limits`、
+`flat_orientation_l2`、`lin_vel_z_l2`、`feet_air_time(1.0)`。
+
+> 「不改奖励函数与权重」这条约束的落地方式：**基类 `G1FlatRewardsCfg` 一行不改**，
+> 全部改动都在子类 `G1AmpWalkRewardsCfg(G1FlatRewardsCfg)` 里 —— 覆盖 3 项权重 + 新增 5 项。
+> `check_amp_walk_task.py` 的 **J 类检查**会逐项断言基类权重未变、子类未偷改其它项权重。
+
 
 ### 3.2 观测：**不迁移**（你的要求 3/4）
 
@@ -279,6 +290,46 @@ super()._resample_command(env_ids)   # 父类先填好默认均匀命令 + 维�
 
 **刻意不移植** AMP_mjlab 的两部分（均为 mjlab 专有 API）：
 `init_velocity_prob`（直接把命令速度写进 root state）与 `quat_apply` 世界系换算。
+
+### 3.7 步宽地板 / 交叉惩罚的**实测重标定**（步骤⑤ 的关键发现）
+
+AMP_mjlab 的 `sep_floor = 0.15` 是在**他们自己的模型 + `left_foot`/`right_foot` site** 上
+标定的，且只用了**一段前向 clip**（`A022`）。搬到本仓库后参考点、基准帧、数据集都不同，
+所以工具 `instinct/tools/calibrate_foot_sep.py` 用**与运行时奖励函数完全相同的量**重标：
+
+$$\text{sep}(t) = \Big[R_{\text{yaw}}\big(q_{\text{root}}\big)^{\top}\,\big(p_{\text{LL\_FOOT}}(t) - p_{\text{LR\_FOOT}}(t)\big)\Big]_y$$
+
+脚部参考点用 URDF 里的 **`LL_FOOT` / `LR_FOOT`**（挂在 `*_ankle_roll_link` 下、偏移
+`(0.04, 0, −0.037)`，几乎就是 mjlab `left_foot`/`right_foot` site 的同源物；
+实测同一帧下两者世界坐标一致，且横向偏移为 0，所以退化成 ankle body 也几乎不变）。
+
+**实测结果**（17 段 / 7417 帧，输出见 `instinct/tools/amp_walk_foot_sep_stats.json`）：
+
+| 种群 | sep min | p1 | 中位 | sep<0 帧占比 |
+|---|---|---|---|---|
+| **直线行走** 4 段（前/后 ×2） | **+0.1387** | 0.1455 | 0.2140 | **0.000** |
+| 交叉式侧步 2 段（`walk_sideway_*`） | **−0.1503** | −0.144 | 0.2234 | **0.210** |
+| 慢跑 4 段 | +0.040 | — | ~0.21 | 0 |
+| 弧线 / 原地转 / 踏步 | ≥ +0.12 | — | — | 0 |
+
+（中位 0.2140 与 AMP_mjlab 报告的 0.199 同量级，说明测量管线与他们的口径一致；
+用他们的模型 + pelvis 偏航复算 `A022` 得到 p1 = 0.1584 / 中位 0.1990 / sep<0 = 0，
+**逐字复现了他们 §v3.5 的标定注记**。）
+
+由此得到两个**必须偏离 AMP_mjlab** 的结论：
+
+1. **`sep_floor` 取 0.145，不是 0.15** —— 取直线行走 p1 向下取整，保证健康步态被罚的帧 ≲1%。
+2. ⚠️ **`feet_crossing` 必须加方向门控 `w_dir = |vx|/‖v‖`（AMP_mjlab 原文是不加的）**：
+   本仓库参考动作的侧移 clip 用的是**交叉式侧步（grapevine）**，21% 的帧 `sep < 0`，
+   这是参考动作**本身的风格**，不是缺陷。对纯侧向指令无条件施加 −20 的交叉惩罚
+   会与 AMP 风格先验正面对撞（判别器说「像参考」、奖励说「不许」），直接压制侧移能力 ——
+   正是 §3.4 记录的那个坑。宽度项 AMP_mjlab 本来就有 `gate_lateral`，这里让两项共用。
+
+> ⚠️ 踩坑记录：标定脚本第一版忘了**按关节名重映射列序**（npz 的 `joint_pos` 列序 ==
+> AMP_mjlab MJCF 的 hinge 顺序，**腿在前**；本仓库 MJCF 是**腰在前**），直接按列喂进去
+> 得到的是完全错误的姿态，凭空把 sep 从 +0.15 算成 −0.25、伪造出「7.9% 真交叉」。
+> 修正后两侧（本仓库 MJCF / AMP_mjlab MJCF）在同一 clip 上结果一致。
+> 这是本项目第三次踩「同名不同序」的坑（前两次见 §5.1）。
 
 ---
 
@@ -458,8 +509,8 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
 | 8 | **License** | instinct_xu 继承了 InstinctLab 的 CC BY-NC 4.0 |
 | 9 | **数据集覆盖面决定 AMP 压制什么** | 参考 clip 缺某方向（侧向/后退）时，判别器会把该方向姿态判为“不像参考”而抑制。**改命令分布无法解决（已实测）**，只能补参考数据。见 §3.4 |
 | 10 | **`UniformVelocityCommand` 采不出纯侧向命令** | instinct_xu OmniLoco 用的就是 Uniform（三轴独立均匀）→ x 恰为 0 概率为零 → 左右直移学不出来。见 §3.5 |
-| 11 | **runner 没法用 `module:class` 指定算法** | `on_policy_runner.py` 里 `importlib.import_module()` 漏传参数 → 写 `"module:Class"` 会 `TypeError`。见 §4.2 的 A/B 方案 |
-
+| 11 | **runner 没法用 `module:class` 指定算法** | `on_policy_runner.py` 里 `importlib.import_module()` 漏传参数 → 写 `"module:Class"` 会 `TypeError`。见 §4.2 的 A/B 方案 || 12 | **`feet_crossing` 的方向门控不能关** | 参考动作的侧移 clip 是交叉式侧步，21% 帧 sep<0（§3.7 实测）。关掉 `gate_lateral` 会与 AMP 风格先验对撞，压制侧移能力 |
+| 13 | **`sep_floor` 必须用本仓库实测值** | 参考 body / 基准帧 / 数据集都不同，用 AMP_mjlab 的 0.15 会误伤本仓库 1% 的健康步态帧。实测值见 §3.7 |
 ---
 
 ## 6. 执行顺序（分段）
@@ -481,7 +532,10 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
                  新增 G1AmpWalkSceneCfg：+ robot_reference + motion_reference 传感器
                  行走循环步态：已关 RSI，motion_bin_length_s = None
                  I 类检查自动验证两侧同构与维度算术
-⑤ 奖励迁移       AMP_mjlab 奖励函数移植 + 权重对齐（§3.1）
+⑤ 奖励迁移       【已完成】新增 `tasks/locomotion/mdp/rewards_amp.py`
+                 + `G1AmpWalkRewardsCfg(G1FlatRewardsCfg)`（覆盖 3 项权重 + 新增 5 项）
+                 步宽地板/交叉惩罚已用 `instinct/tools/calibrate_foot_sep.py` **实测重标定**（§3.7）
+                 `self_collisions` 经核实**不可迁移**（PhysX 过滤限制，见 §3.1）
 ⑥ 算法接线       WasabiPPO + WasabiPPOAmpMix（reward_mix_mode="lerp" + style_lerp），参数映射（§4.1）
 ⑦ 注册与冒烟     注册新任务 ID；小规模验证（motion_reference 采样 / 判别器前向 / 奖励量级）
 ```
@@ -497,10 +551,13 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
 | ②~⑥ 配置与算法 | ✅ **静态契约校验**（`instinct/tools/check_amp_walk_task.py`） | 真实 `gym.make()` + 前向 |
 | ⑦ 冒烟 | ⚠️ 只能静态 | ✅ 完整 |
 
-`check_amp_walk_task.py` 做 9 类检查（A 维度算术 / B 字段顺序 / C 符号真实性 /
+`check_amp_walk_task.py` 做 10 类检查（A 维度算术 / B 字段顺序 / C 符号真实性 /
 D 注册一致性 / E 契约继承 / F 配置接线 / G 射线数独立复算 /
 H **速度指令包络 vs 参考动作实测包络对账** /
-I **AMP 两侧状态逐项同构**），其中 **C 类最有价值**：
+I **AMP 两侧状态逐项同构** /
+J **奖励集迁移对账**：基类权重零改动、迁移表逐项落地、未偷改其它项、
+`sep_floor`/`walk_max_lin_vel` 与①产出实测数据数值对账、`asset.data.*` 属性有仓库先例），
+其中 **C 类最有价值**：
 它用「本仓库模块**直接查定义**（跟随显式 `from .x import *` 转发）+ 外部模块查仓库先例」
 来判定符号真实性，能抓住 `instinct_mdp.base_lin_vel` 这种**看起来对、到 Isaac Sim 里才
 `AttributeError`** 的错误（`instinctlab.envs.mdp` 只转发了 `base_ang_vel`，
@@ -517,5 +574,11 @@ I **AMP 两侧状态逐项同构**），其中 **C 类最有价值**：
 > 学长的 `instinct_xu` 已经把 AMP 算法（`wasabi.py`）和参考动作基建（`motion_reference` + `*_reference_as_state`）都备好了，只是**没用起来**。我们只需**新建一个行走任务**：actor 观测在 OmniLoco 的 623 维基础上加 3 维 `base_lin_vel`，补上 `amp_policy`/`amp_reference` 两组观测，算法从 `PPO` 换成 `WasabiPPO`，并用一个**零侵入的 `reward_mix_mode="lerp"`** 精确复刻 AMP_mjlab 的 `(1-λ)·风格 + λ·任务` 混合。
 >
 > 三处迁移要点：**奖励混合**（模式 + 权重两参，一行奖励函数都不改）、**运动数据集选取**（按命令范围挑 clip，保证每方向参考密度）、**速度指令采样**（换方向分档，否则纯侧向命令采不出来）。
+>
+> 步骤⑤ 补上第四条：**阈值类奖励必须在本仓库重新标定，不能照抄**。步宽地板看似只是一个数，
+> 但它同时取决于「脚部参考点」「root 基准帧」「参考数据集」三件本仓库都不同的事；
+> 实测后 `sep_floor` 从 0.15 改成 0.145，而且发现**参考动作的侧移 clip 本身就是交叉式侧步**
+> （21% 帧 sep<0）→ `feet_crossing` 必须加方向门控，否则奖励会和 AMP 风格先验正面对撞。
+> 这类「照抄一个数」的错误在静态检查里是看不出来的，只能靠**把参考数据算一遍**。
 >
 > 原以为“最大的实际工作量在参考动作数据格式转换”——**实测后已被证伪**：转换器一天内写完并全部通过 FK 验证（误差 ≤1e-6 m），四元数无需翻转、速度无需手工补、关节序无需重排。真正的风险集中在**数据集速度包络**与**奖励混合的数值一致性**上。

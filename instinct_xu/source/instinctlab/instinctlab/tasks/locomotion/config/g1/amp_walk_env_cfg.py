@@ -1,8 +1,11 @@
 """AMP 行走专家策略任务（G1 29-DoF，privileged teacher）。
 
-相对 OmniLoco 的**唯一接口差异**
---------------------------------
-actor 观测在 623 维基础上 **增加 3 维 `base_lin_vel`** → **626 维**。
+相对 OmniLoco 的接口差异
+------------------------
+1. actor 观测在 623 维基础上 **增加 3 维 `base_lin_vel`** → **626 维**；
+2. 速度指令换成**方向分档**（否则「纯侧向」命令采不出来）；
+3. 奖励集换成 **AMP_mjlab v5 迁移版**（步骤⑤，`G1AmpWalkRewardsCfg`）；
+4. 场景额外挂 `robot_reference` + `motion_reference`（为步骤⑥ 的判别器提供参考状态）。
 
 其余全部继承、不改动：
 
@@ -12,9 +15,10 @@ actor 观测在 623 维基础上 **增加 3 维 `base_lin_vel`** → **626 维**
 | 时序 | `dt=0.005`，`decimation=4`，`step_dt=0.02` | `G1FlatEnvCfg.__post_init__` |
 | 高程图 | 527 射线（31×17，3.0×1.6 m，res 0.1） | `G1OmniLocoSceneCfg` |
 | 执行器 | `beyondmimic_g1_29dof_actuators` | `G1OmniLocoEnvCfg.__post_init__` |
-| 奖励 / 事件 / 终止 | 与 OmniLoco 相同 | `G1FlatRewardsCfg` 等 |
+| 事件 / 终止 | 与 OmniLoco 相同 | `G1FlatEventsCfg` / `G1FlatTerminationsCfg` |
 | Critic 观测 | 含 `base_lin_vel`（本就对称） | `G1FlatCriticObsCfg` |
 | 速度指令 | **方向分档**（`DirectionalVelocityCommand`） | `tasks/locomotion/mdp/commands.py` |
+| 奖励函数本体 | **一行不改**（只覆盖权重 + 新增 5 项） | `tasks/locomotion/mdp/rewards_amp.py` |
 
 为什么 actor 要加 `base_lin_vel`
 --------------------------------
@@ -25,11 +29,13 @@ actor 观测在 623 维基础上 **增加 3 维 `base_lin_vel`** → **626 维**
 3. `G1OmniLocoEnvCfg` 的 fail-fast 契约校验**只允许 623 维**，因此必须新建任务
    （`G1OmniLocoTeacherEnv._validate_teacher_contract` 会直接 `RuntimeError`）。
 
-本文件对应 `PLAN_amp_walk.md` §6 的**步骤②③**：
+本文件对应 `PLAN_amp_walk.md` §6 的**步骤②③④⑤**：
 - ② 任务骨架（actor obs 626），
-- ③ 速度指令换成方向分档（否则「纯侧向」命令采不出来，见 `Plan` §3.5）。
+- ③ 速度指令换成方向分档（见 §3.5），
+- ④ AMP 观测组 `amp_policy`/`amp_reference`（670 维，逐项同构），
+- ⑤ 奖励集迁移（见 §3.1 与 `mdp/rewards_amp.py` 的对照表）。
 
-**尚未接入 AMP**（步骤⑥）。
+**尚未接入 AMP 算法**（步骤⑥）。
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ import os
 from isaaclab.envs import mdp
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -50,7 +57,7 @@ from instinctlab.motion_reference import MotionReferenceManagerCfg
 from instinctlab.motion_reference.motion_files.amass_motion_cfg import AmassMotionCfg as AmassMotionCfgBase
 from instinctlab.motion_reference.utils import motion_interpolate_bilinear
 
-from .flat_env_cfg import G1FlatCriticObsCfg, G1_CFG
+from .flat_env_cfg import G1FlatCriticObsCfg, G1FlatRewardsCfg, G1_CFG
 from .omni_loco_env_cfg import (
     G1OmniLocoCommandsCfg,
     G1OmniLocoEnvCfg,
@@ -393,6 +400,129 @@ class G1AmpWalkObservationsCfg:
 
 
 # ============================================================================
+# 奖励配置（步骤⑤：奖励集从 AMP_mjlab v5 迁移）
+# ============================================================================
+
+#: 步宽地板（m）—— **本仓库实测标定**，不是照抄 AMP_mjlab 的 0.15。
+#: 出处：`instinct/tools/calibrate_foot_sep.py` → `tools/amp_walk_foot_sep_stats.json`
+#:   直线行走 4 段 / 2186 帧：sep min = 0.1387、p1 = 0.1455、中位 = 0.2140
+#: `sep_floor` 取 p1 向下取整，保证健康步态几乎零惩罚。
+AMP_WALK_SEP_FLOOR = 0.145
+#: 行走速档门控上限（m/s）：vx_cmd ≤ 0.8 全量塑形、0.8~1.0 线性过渡、≥1.0 豁免。
+#: 依据：实测慢跑 clip 摆动腿合法内收（`jog_forward_loop_003__A021` sep 低到 0.040），
+#: 而行走 clip 从不低于 0.1387。AMP_mjlab v5 同样取 1.0。
+AMP_WALK_WALK_MAX_LIN_VEL = 1.0
+
+
+@configclass
+class G1AmpWalkRewardsCfg(G1FlatRewardsCfg):
+    """`G1FlatRewardsCfg` → AMP_mjlab v5 奖励集。
+
+    只做两类操作，**不改任何奖励函数本体，也不改基类**：
+
+    1. **覆盖权重**（下面 3 个项；`func` / `params` 与基类逐字一致，只动 `weight`）
+       —— 基类配置和 OmniLoco/Vault 任务完全不受影响，因为改的是子类字段；
+    2. **新增 5 项**（高度跟踪 / root 角速度 / 低速回 default / 步宽 / 真交叉），
+       实现全部在 `tasks/locomotion/mdp/rewards_amp.py`。
+
+    迁移对照与**刻意偏离**的说明见 `rewards_amp.py` 的模块 docstring；要点：
+    - `self_collisions` **不迁移**（PhysX 不支持多对多 contact 过滤；且本任务已有
+      `base_contact` 终止 −200 的更强兜底）；
+    - `feet_crossing` **额外加了方向门控**（参考动作的侧移 clip 是交叉式侧步，
+      实测 21% 帧 sep < 0，无条件惩罚会压制侧移）。
+    """
+
+    # --- 1. 覆盖既有项的权重（来自 AMP_mjlab v5）---------------------------
+    # 速度跟踪 1.0 → 1.5；转向跟踪 1.0 → 1.2。
+    # 注意 `std` 保持本仓库的 0.5（不照搬 AMP_mjlab 的 1.0 / 3.14）：
+    # 奖励函数的**形状**与同族 OmniLoco/Vault 教师保持一致，便于日后对照与蒸馏。
+    track_lin_vel_xy_exp = RewTerm(
+        func=locomotion_mdp.track_lin_vel_xy_yaw_frame_exp,
+        weight=1.5,
+        params={"command_name": "base_velocity", "std": 0.5},
+    )
+    track_ang_vel_z_exp = RewTerm(
+        func=locomotion_mdp.track_ang_vel_z_world_exp,
+        weight=1.2,
+        params={"command_name": "base_velocity", "std": 0.5},
+    )
+    # 足部滑移惩罚 −0.1 → −0.25（AMP_mjlab 的 foot_slip）。
+    # ⚠️ 两边实现不同（AMP 用 foot site 速度 + 指令门控；本仓库用 isaaclab 的
+    # `contact_slide`，body 速度、无门控），量级不可严格换算，此处只按迁移表对齐权重。
+    feet_slide = RewTerm(
+        func=instinct_mdp.contact_slide,
+        weight=-0.25,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
+        },
+    )
+
+    # --- 2. 新增项 ---------------------------------------------------------
+    # 高度保持（AMP_mjlab `track_root_height`，权重 1.5 / std 0.3）。
+    # 基类里的 `base_height_l2` 是被注释掉的，所以这里是**新写**的 exp 形式。
+    track_base_height = RewTerm(
+        func=locomotion_mdp.track_base_height_exp,
+        weight=1.5,
+        params={"std": 0.3},
+    )
+    # root 横滚/俯仰角速度抑制（AMP_mjlab `body_ang_vel_xy_l2`，权重 0.7 / std 3.14）。
+    # 名字带 l2 但那条其实是 **exp 正奖励**，本项保持一致语义。
+    body_ang_vel_xy = RewTerm(
+        func=locomotion_mdp.track_root_ang_vel_xy_exp,
+        weight=0.7,
+        params={"std": 3.14},
+    )
+    # 低速/静止回 default 站姿 + 关节速度阻尼（AMP_mjlab，权重 −1.0）。
+    # `gate_tau=0.25` 是平滑门控：指令 → 0 时权重 → 1，指令变大指数衰减。
+    # `prob_low` 档会给出精确 (0,0,0) 指令 → 门控 = 1，与分档采样天然对齐。
+    # `waist_yaw_joint: 3.0` 是 AMP_mjlab v3.4c 加的：防止腰部锁在 90° 的假吸引子。
+    track_default_pose_on_stand = RewTerm(
+        func=locomotion_mdp.track_default_pose_on_stand,
+        weight=-1.0,
+        params={
+            "command_name": "base_velocity",
+            "command_threshold": 0.1,
+            "pos_scale": 4.0,
+            "vel_scale": 0.5,
+            "gate_tau": 0.25,
+            "pos_joint_weights": {"waist_yaw_joint": 3.0},
+        },
+    )
+    # 步宽下限（AMP_mjlab `feet_lateral_width`，权重 −10.0）。
+    # `max_cost=0.10` 单帧封顶，防深度交叉的奖励尖峰（−10 × 0.10 = 单步最多 −1.0）。
+    feet_lateral_width = RewTerm(
+        func=locomotion_mdp.feet_lateral_width_cost,
+        weight=-10.0,
+        params={
+            "command_name": "base_velocity",
+            "command_threshold": 0.1,
+            "sep_floor": AMP_WALK_SEP_FLOOR,
+            "gate_lateral": True,
+            "max_cost": 0.10,
+            "walk_max_lin_vel": AMP_WALK_WALK_MAX_LIN_VEL,
+            "walk_gate_width": 0.2,
+        },
+    )
+    # 真交叉惩罚（AMP_mjlab `feet_crossing`，权重 −20.0）。
+    # ⚠️ `gate_lateral=True` 是对 AMP_mjlab 的**有意偏离**：
+    #    本仓库参考动作的侧移 clip 本身就是交叉式侧步（grapevine），实测 21% 帧
+    #    sep < 0。不加方向门控会与 AMP 风格先验正面对撞、压制侧移能力。
+    feet_crossing = RewTerm(
+        func=locomotion_mdp.feet_crossing_cost,
+        weight=-20.0,
+        params={
+            "command_name": "base_velocity",
+            "command_threshold": 0.1,
+            "gate_lateral": True,
+            "max_cost": 0.10,
+            "walk_max_lin_vel": AMP_WALK_WALK_MAX_LIN_VEL,
+            "walk_gate_width": 0.2,
+        },
+    )
+
+
+# ============================================================================
 # 环境配置
 # ============================================================================
 
@@ -401,13 +531,14 @@ class G1AmpWalkObservationsCfg:
 class G1AmpWalkEnvCfg(G1OmniLocoEnvCfg):
     """AMP 行走教师训练配置。
 
-    奖励 / 事件 / 终止 / 时序 / 动作 **全部继承 OmniLoco**（= flat 基线）；
-    替换的只有：场景（+参考机器人+运动参考传感器）、观测组、速度指令项。
+    事件 / 终止 / 时序 / 动作 **全部继承 OmniLoco**（= flat 基线）；
+    替换的是：场景（+参考机器人+运动参考传感器）、观测组、速度指令项、**奖励集**。
     """
 
     scene: G1AmpWalkSceneCfg = G1AmpWalkSceneCfg(num_envs=4096, env_spacing=2.5)
     commands: G1AmpWalkCommandsCfg = G1AmpWalkCommandsCfg()
     observations: G1AmpWalkObservationsCfg = G1AmpWalkObservationsCfg()
+    rewards: G1AmpWalkRewardsCfg = G1AmpWalkRewardsCfg()
 
     def __post_init__(self):
         super().__post_init__()
@@ -415,7 +546,7 @@ class G1AmpWalkEnvCfg(G1OmniLocoEnvCfg):
         #    因此必须在其之后“再”写回我们的方向分档参数。
         apply_amp_walk_command_ranges(self.commands.base_velocity)
         # 父类 __post_init__ 已经把 run_name 设成 OmniLoco 的，这里必须覆盖。
-        self.run_name = "G1AmpWalkPlane_obs626_directional"
+        self.run_name = "G1AmpWalkPlane_obs626_directional_rew5"
 
 
 @configclass
@@ -454,8 +585,27 @@ class G1AmpWalkTeacherEnv(G1OmniLocoTeacherEnv):
 
     def _validate_teacher_contract(self):
         super()._validate_teacher_contract()
+        # --- 步骤⑤ 的附带诊断（只在日志里，不做断言）----------------------
+        # 1) 脚部参考 body：`feet_lateral_sep` 优先用 LL_FOOT/LR_FOOT，
+        #    找不到时静默退回 `*_ankle_roll_link`（横向偏移为 0，数值几乎一致，
+        #    但 sep 的标定量是前者，所以这里必须把实际用的哪一套打出来）。
+        robot = self.scene["robot"]
+        body_names = list(robot.body_names)
+        has_foot_bodies = all(b in body_names for b in ("LL_FOOT", "LR_FOOT"))
+        # 2) 奖励项数量：确认 `G1AmpWalkRewardsCfg` 真的生效（而不是继承了 OmniLoco 的）
+        terms = getattr(self.reward_manager, "active_terms", None)
+        n_rewards = len(terms) if terms is not None else -1
         print(
             f"[AMP-WALK PASS] policy={sum(self.expected_policy_dims)} "
             f"(height_scan={self.expected_scan_rays} + base_lin_vel), action=29, scale=1.0, "
-            f"cmd_ranges={self.expected_command_ranges} (directional)"
+            f"cmd_ranges={self.expected_command_ranges} (directional), "
+            f"foot_bodies={'LL_FOOT/LR_FOOT' if has_foot_bodies else 'ankle_roll_link(FALLBACK)'}, "
+            f"rewards={n_rewards}"
         )
+        if not has_foot_bodies:
+            print(
+                "[AMP-WALK WARN] 未在 robot.body_names 里找到 LL_FOOT/LR_FOOT —— "
+                "feet_lateral_sep 已退回 *_ankle_roll_link。sep_floor=0.145 是在 LL_FOOT 上"
+                "标定的；由于 LR_FOOT 相对 ankle_roll_link 的横向偏移为 0，两者数值几乎一致，"
+                "但建议核对一下 URDF 的 merge_fixed_joints 设置。"
+            )
