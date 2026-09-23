@@ -20,8 +20,12 @@
 
 | 组件 | 版本 / 提交 | 依据 |
 |---|---|---|
-| OS | Ubuntu 22.04 LTS x86_64 | Isaac Sim 5.1 官方支持矩阵 |
-| Python | **3.11** | `instinct_xu/README.md` §2 |
+| OS | **Ubuntu 22.04 或 24.04**（官方两者都支持）x86_64 | [Isaac Sim 5.1 系统要求](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/requirements.html) |
+| GLIBC | ≥ 2.35（`manylinux_2_35_x86_64`） | 同上（Ubuntu 22.04=2.35、24.04=2.39，均 ✔） |
+| **GPU 驱动（Linux）** | **≥ 580.65.06** | 同上（Isaac Sim 5.1 实测于 580.65.06）⚠️ 云主机驱动必须查! |
+| RAM / 存储 | 最低 32 GB / 50 GB；**建议 64 GB / 500 GB** | 同上 |
+| VRAM | 最低 16 GB（需带 RT Core 的卡） | 同上（4090 24 GB ✔） |
+| Python | **3.11** | `instinct_xu/README.md` §2 + Isaac Sim 5.1 文档 |
 | Isaac Sim（pip 包） | **`isaacsim[all,extscache]==5.1.0`** | `instinct_xu/README.md` §2 B |
 | Isaac Sim 包索引 | `https://pypi.nvidia.com`（额外索引） | 同上 |
 | PyTorch | **`torch==2.7.0`**（CUDA **12.8**） | 同上 |
@@ -30,8 +34,7 @@
 | **IsaacLab** | **源码提交 `f73c33173801f5f8afea4142482e47b7710c2b75`**（pip 显示版本号 **0.54.4**） | 同上 |
 | 原版 InstinctLab | `ChaoMingSanHua/InstinctLab` @ `8879c06d3f3ae376aa96988a58d2f7f3661ec12d` | `instinct_xu/README.md` §3 |
 | 原版 instinct_rl | `ChaoMingSanHua/instinct_rl` @ `5523e3847cfce578bfcee25a5334256d9cc53e0e` | 同上 |
-| GPU 驱动 | ⚠️ **按官方文档确认最低版本**，不要用 470/525 这类老驱动 | [Isaac Sim 5.1 安装说明](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_python.html) |
-| 参考文档 | Isaac Lab pip 安装（**v2.3.1** 分支文档） | [链接](https://isaac-sim.github.io/IsaacLab/v2.3.1/source/setup/installation/pip_installation.html) |
+| 参考文档 | Isaac Lab pip 安装 | [链接](https://isaac-sim.github.io/IsaacLab/v2.3.1/source/setup/installation/pip_installation.html) |
 
 **额外 pip 依赖**（README §2 B 末尾，`instinctlab` 的 `INSTALL_REQUIRES` 也要求这些）：
 
@@ -176,7 +179,89 @@ bash /path/to/llp/instinct/tools/cloud_smoke_amp_walk.sh
 
 ---
 
-## 6. 建议的执行顺序（含并行）
+## 6. 镜像/环境核对清单（已实操核验，2026-09-23）
+
+### 6.1 `IsaacLab 2.3.2` vs 我们的 pin —— **可用，但不是精确版本**
+
+这是**最容易搞混**的一点：IsaacLab 有**两套独立编号**——
+
+| 编号体系 | 值 | 说明 |
+|---|---|---|
+| GitHub release tag | `v2.3.x` | 镜像厂商说的“IsaacLab-2.3.2”就是这个 |
+| pip 包版本号 | `0.54.4` | 在提交 `f73c331738` 处 `pip show isaaclab` 显示的值 |
+
+**实测的 tag → commit 对应**（`git ls-remote --tags`）：
+
+```
+v2.3.0 = 3c6e67bb
+v2.3.1 = 5c2ec81c   (2025-12-03)
+v2.3.2 = 37ddf626   (2026-01-29)
+我们的 pin = f73c331738 (2026-06-02)   ← 不等于任何 tag
+```
+
+**祖先关系**（GitHub compare API，`f73c331738...37ddf626`）：
+
+```
+status = behind      ahead_by = 0      behind_by = 25
+=> v2.3.2 是我们的 pin 的**严格祖先**，落后 25 个提交
+```
+
+**那这 25 个提交会不会弄坏我们？** 实测了它们的改动文件（共 77 个），
+其中只有 **1 个**落在我们依赖的路径上（`envs/mdp/`、`managers/`、`terrains/`、
+`sensors/ray_caster/`、`assets/articulation/`）：
+
+```
+modified  2  source/isaaclab/isaaclab/envs/mdp/actions/joint_actions_to_limits.py
+```
+
+而它改的是 `JointPositionToLimitsAction` 的 `preserve_order` 标志 ——
+我们用的是 `JointPositionAction`（**不是** ToLimits 那个），所以连这一条都不影响。
+
+其余 24 个提交全是文档 / CI-changelog 自动化 / RSL-RL·skrl 集成配置 /
+依赖 pin / Franka 等其它任务的修复。
+
+**特别地**，我们最担心的两个东西**没有被触及**：
+
+| 我们依赖的 | 在 25 个提交里被改了吗 |
+|---|---|
+| `UniformVelocityCommand` / 其内部 `vel_command_b` | ❌ 未触及（`envs/mdp/commands/` 无改动） |
+| `CommandManager` / `ObservationManager` | ❌ 未触及 |
+| 射线传感器 / 地形 / 关节体 | ❌ 未触及 |
+
+**结论**：
+
+- ✅ **可以先用镜像自带的 2.3.2 开跑**，风险很小（上面的证据支持这个判断）；
+- ⚠️ 但若想 100% 复刻作者环境，在镜像里追加：
+  ```bash
+  cd <IsaacLab目录>
+  git fetch --all && git checkout f73c33173801f5f8afea4142482e47b7710c2b75
+  git submodule update --init --recursive
+  ./isaaclab.sh -i        # 重新装 editable；之后 pip show isaaclab 应为 0.54.4
+  ```
+  （前提：该目录是个 git 仓库。若是 pip 装的只读包，就直接用 2.3.2。）
+- 无论走哪条，都**先用 `cloud_smoke_amp_walk.sh` 跑一遍** —— 25 个提交的差异已被证明
+  无关，但「未跑过」才是真正的风险。
+
+### 6.2 Ubuntu 24.04 —— ✅ 官方支持
+
+Isaac Sim 5.1 系统要求写的是 `OS: Ubuntu 22.04/24.04`，两者都官方支持。
+只需 `GLIBC ≥ 2.35`（24.04 是 2.39，✔）。
+
+### 6.3 ⚠️ 必须核对的一项：GPU 驱动 ≥ 580.65.06
+
+Isaac Sim 5.1 的实测驱动是 **580.65.06 (Linux)**。这是唯一**外在于镜像**的东西——
+云平台宿主机驱动。**启动镜像后第一件事就是查**：
+
+```bash
+nvidia-smi   # 右上角 Driver Version 需 >= 580.65.06
+ldd --version | head -1   # 需 >= 2.35
+```
+
+驱动不达标的话，Isaac Sim 会在初始化阶段挂掉，且报错往往不直白。
+
+---
+
+## 7. 建议的执行顺序（含并行）
 
 ```
 [t0] 立刻：在云平台开始构建镜像 / 装环境   ← 长尾任务，今天就要启动
