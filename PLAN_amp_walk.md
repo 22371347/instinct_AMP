@@ -411,13 +411,33 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
                  instinct/tools/convert_amp_motion.py
                  （FK 校验全通过 ≤1e-6 m；四元数无需翻转；无需补 velocity_command；见 §5.1）
                  另：--stats 实测出数据集速度包络，已回填 §3.4/§3.5
-② 任务骨架       复制 OmniLoco → amp_walk_env_cfg（actor obs 加 base_lin_vel、保留高程图、先不加 AMP）
+② 任务骨架       【已完成】新增任务 Instinct-Amp-Walk-G1-v0 / -Play-v0
+                 amp_walk_env_cfg.py（actor obs 626 = 623 + base_lin_vel；保留 527 高程图）
+                 + agents/amp_walk_ppo_cfg.py；**复用**学长那套 fail-fast 契约校验器
+                 （只覆盖类属性期望值）；先不加 AMP，可独立训练
 ③ 速度指令       移植 DirectionalVelocityCommandCfg（§3.5），替掉 UniformVelocityCommand
 ④ AMP 观测组     构造 amp_policy / amp_reference（anchor-relative 13 body），校验同构
 ⑤ 奖励迁移       AMP_mjlab 奖励函数移植 + 权重对齐（§3.1）
 ⑥ 算法接线       WasabiPPO + WasabiPPOAmpMix（reward_mix_mode="lerp" + style_lerp），参数映射（§4.1）
 ⑦ 注册与冒烟     注册新任务 ID；小规模验证（motion_reference 采样 / 判别器前向 / 奖励量级）
 ```
+
+### 6.1 ⚠️ 本地验证的边界（重要）
+
+本机显存 4 GB，**跑不了 Isaac Sim**（最低 8 GB），所以本地**无法**做真实冒烟测试。
+因此每一阶段的验收方式定为：
+
+| 阶段 | 本地可做 | 必须上云才能做 |
+|---|---|---|
+| ① 数据转换 | ✅ 已全部完成（FK 误差 ≤1e-6 m，可数值验证） | — |
+| ②~⑥ 配置与算法 | ✅ **静态契约校验**（`instinct/tools/check_amp_walk_task.py`） | 真实 `gym.make()` + 前向 |
+| ⑦ 冒烟 | ⚠️ 只能静态 | ✅ 完整 |
+
+`check_amp_walk_task.py` 做 7 类检查（A 维度算术 / B 字段顺序 / C 符号真实性 /
+D 注册一致性 / E 契约继承 / F 配置接线 / G 射线数独立复算），其中 **C 类最有价值**：
+它用「该 `<module>.<name>` 必须在仓库其它文件中已出现过」来判定符号真实性，能抓住
+`instinct_mdp.base_lin_vel` 这种**看起来对、到 Isaac Sim 里才 `AttributeError`**
+的错误（`instinctlab.envs.mdp` 只转发了 `base_ang_vel`，**没有**转发 `base_lin_vel`）。
 
 ---
 
