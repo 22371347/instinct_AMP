@@ -34,8 +34,18 @@ REPO = Path(__file__).resolve().parent.parent.parent            # .../llp
 INSTINCTLAB = REPO / "instinct_xu/source/instinctlab/instinctlab"
 G1_DIR = INSTINCTLAB / "tasks/locomotion/config/g1"
 TARGET = G1_DIR / "amp_walk_env_cfg.py"
+COMMANDS_PY = INSTINCTLAB / "tasks/locomotion/mdp/commands.py"
+MOTION_DIR = G1_DIR / "motions/amp_walk"
 
 EXPECTED_SIZE = 626
+
+#: 允许“仓库中无先例”的符号，但必须已经在代码里用 try/except 显式守卫。
+#: 值 = 理由。这类符号会在输出里记 ⚠️ 而不是 ❌。
+ALLOWED_NEW_SYMBOLS = {
+    "isaaclab.envs.mdp.UniformVelocityCommand":
+        "仓库内只见过 mdp.UniformVelocityCommandCfg；类那一半无先例，已在 commands.py 用 "
+        "try/except ImportError 守卫并给出可读报错",
+}
 
 _errors: list[str] = []
 _warns: list[str] = []
@@ -305,10 +315,32 @@ def build_proven_symbols(exclude: Path) -> set[str]:
     return proven
 
 
+def self_authored_exports() -> set[str]:
+    """本次新增/修改的模块自身的导出，也应算作「已被证明」——但附带一个前提检查。
+
+    光“某个包下有文件定义了 X”并不能证明 `pkg.X` 可用；必须这个包的
+    `__init__.py` 真的转发了它（`from .<mod> import *`）。所以这里顺手把
+    转发关系一并验证，否则 C 类检查会退化成“宽松到没用”。
+    """
+    pkg_dir = COMMANDS_PY.parent
+    mod = COMMANDS_PY.stem
+    init_py = pkg_dir / "__init__.py"
+    if not init_py.is_file():
+        err(f"C: 缺少 {init_py.relative_to(INSTINCTLAB)}")
+        return set()
+    init_src = init_py.read_text(encoding="utf-8")
+    if f"from .{mod} import *" not in init_src:
+        err(f"C: {pkg_dir.name}/__init__.py 未转发 `from .{mod} import *` —— "
+            f"则 `...{pkg_dir.name}.{mod}` 里的符号（如 DirectionalVelocityCommandCfg）实际不可用")
+        return set()
+    pkg = f"instinctlab.tasks.locomotion.{pkg_dir.name}"
+    return {f"{pkg}.{n}" for n in top_level_names(parse(COMMANDS_PY))}
+
+
 def check_symbols() -> None:
     t = parse(TARGET)
     aliases = import_aliases(t)
-    proven = build_proven_symbols(TARGET)
+    proven = build_proven_symbols(TARGET) | self_authored_exports()
 
     used: dict[str, list[str]] = {}
     for node in ast.walk(t):
@@ -319,9 +351,12 @@ def check_symbols() -> None:
 
     print("C. 符号真实性（每个 <module>.<name> 必须在仓库其它处已出现过）")
     for sym in sorted(used):
-        mark = "✅" if sym in proven else "❌"
-        print(f"   {mark} {sym}")
-        if sym not in proven:
+        if sym in proven:
+            print(f"   ✅ {sym}")
+        elif sym in ALLOWED_NEW_SYMBOLS:
+            print(f"   ⚠️  {sym}  (已允许：{ALLOWED_NEW_SYMBOLS[sym]})")
+        else:
+            print(f"   ❌ {sym}")
             err(f"C: 符号 `{sym}` 在仓库其它文件中从未出现 —— 无法证明其存在")
 
     # 额外的高价值专项检查：instinctlab.envs.mdp 没有转发 base_lin_vel
@@ -339,6 +374,10 @@ def check_symbols() -> None:
         err("C: 使用了 instinct_mdp.base_lin_vel，但 instinctlab.envs.mdp 并未导出该名字")
     else:
         print("   ✅ base_lin_vel 取自 isaaclab 的 mdp（instinctlab 未转发，判断正确）")
+    if "instinct_mdp.base_lin_vel" in src:
+        err("C: 不应经 instinct_mdp 访问 base_lin_vel")
+    else:
+        print("   ✅ 未误用 instinct_mdp.base_lin_vel")
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +491,8 @@ def check_wiring(tree: ast.Module) -> None:
          "G1OmniLocoEnvCfg" in [ast.unparse(b) for b in env.bases]),
         ("env.observations -> G1AmpWalkObservationsCfg",
          _ann_fields(env).get("observations") == "G1AmpWalkObservationsCfg"),
+        ("env.commands     -> G1AmpWalkCommandsCfg",
+         _ann_fields(env).get("commands") == "G1AmpWalkCommandsCfg"),
         ("obs.policy  -> G1AmpWalkPolicyObsCfg",
          _ann_fields(obs).get("policy") == "G1AmpWalkPolicyObsCfg"),
         ("obs.critic  -> G1FlatCriticObsCfg（本就含 base_lin_vel）",
@@ -463,6 +504,21 @@ def check_wiring(tree: ast.Module) -> None:
         ("env 未覆盖 scene（必须继承 527 射线的高程图）",
          "scene" not in _ann_fields(env)),
     ]
+
+    # 速度指令：必须用方向分档类，而**不是** UniformVelocityCommandCfg
+    cmd_cls = classes.get("G1AmpWalkCommandsCfg")
+    if cmd_cls is None:
+        checks.append(("存在 G1AmpWalkCommandsCfg", False))
+    else:
+        bv = ""
+        for n in cmd_cls.body:
+            if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name) \
+                    and n.targets[0].id == "base_velocity":
+                bv = call_func_name(n.value)
+        checks.append(("base_velocity 用的是方向分档指令（非 UniformVelocityCommandCfg）",
+                       bv.endswith("DirectionalVelocityCommandCfg")))
+        checks.append(("G1AmpWalkCommandsCfg 继承 G1OmniLocoCommandsCfg",
+                       "G1OmniLocoCommandsCfg" in [ast.unparse(b) for b in cmd_cls.bases]))
     for name, ok in checks:
         print(f"   {'✅' if ok else '❌'} {name}")
         if not ok:
@@ -518,6 +574,117 @@ def terminal_value(node: ast.AST):
 
 
 # ---------------------------------------------------------------------------
+# H. 速度指令包络 vs 参考动作实测包络
+# ---------------------------------------------------------------------------
+
+def _defaults_of(path: Path, class_name: str) -> dict:
+    """取一个 configclass 里所有带字面量默认值的字段。"""
+    cls = class_defs(parse(path)).get(class_name)
+    if cls is None:
+        return {}
+    out = {}
+    for n in cls.body:
+        if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            v = literal(n.value)
+            if v is not None:
+                out[n.target.id] = v
+    return out
+
+
+def check_command_envelope(tree: ast.Module) -> None:
+    """命令范围必须落在**参考动作实测包络**内。
+
+    依据 AMP_mjlab 的实测教训（PLAN §3.4）：命令超出参考数据覆盖范围时，
+    该档位缺乏参考密度，判别器会把对应姿态判为「不像参考」而抑制。
+    这里直接拿①产出的 npz 重算包络，与②③的配置做数值对账。
+    """
+    print("H. 速度指令包络 vs 参考动作实测包络")
+
+    # --- 1) 分档概率 ---------------------------------------------------------
+    d = _defaults_of(COMMANDS_PY, "DirectionalVelocityCommandCfg")
+    if not d:
+        err(f"H: 未能解析 {COMMANDS_PY.name} 的默认值")
+        return
+    prob_keys = ("prob_low", "prob_side", "prob_lin", "prob_back")
+    probs = sum(float(d.get(k, 0.0)) for k in prob_keys)
+    print("   分档概率: " + ", ".join(f"{k}={d.get(k)}" for k in prob_keys))
+    print(f"   之和 = {probs:.2f}，剩余 {1 - probs:.2f} 为均匀斜向")
+    if probs > 1.0:
+        err(f"H: 分档概率之和 {probs:.2f} > 1")
+    elif probs <= 0.0:
+        err("H: 分档概率之和为 0，方向分档失效")
+
+    # --- 2) 数据集实测包络 ---------------------------------------------------
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import convert_amp_motion as cam  # noqa: PLC0415
+    except Exception as e:  # pragma: no cover
+        warn(f"H: 无法导入 convert_amp_motion（{e}），跳过包络对账")
+        return
+    files = sorted(MOTION_DIR.glob("*_retargeted.npz"))
+    if not files:
+        warn(f"H: {MOTION_DIR} 下没有 npz，跳过包络对账")
+        return
+    rows = [cam.body_frame_stats(f) for f in files]
+    axes = {
+        "lin_vel_x": [r["vx"] for r in rows],
+        "lin_vel_y": [r["vy"] for r in rows],
+        "ang_vel_z": [r["wz"] for r in rows],
+    }
+    env = {k: (min(v), max(v)) for k, v in axes.items()}
+    print(f"   实测包络（{len(files)} 个 clip）:")
+    for k, (lo, hi) in env.items():
+        print(f"     {k:12s} [{lo:+.3f}, {hi:+.3f}]")
+
+    # --- 3) 对账 ------------------------------------------------------------
+    ranges = assigned_dict(tree, "AMP_WALK_COMMAND_RANGES") or ()
+    to_check: list[tuple[str, str, tuple[float, float]]] = []
+    for key, rng in zip(("lin_vel_x", "lin_vel_y", "ang_vel_z"), ranges):
+        to_check.append((f"ranges.{key}", key, tuple(rng)))
+    # 分档专属范围：命名的轴是写死的，不做字符串猜测
+    for key, axis in (
+        ("straight_lin_vel_range", "lin_vel_x"),
+        ("straight_ang_vel_range", "ang_vel_z"),
+        ("back_lin_vel_range", "lin_vel_x"),
+        ("back_ang_vel_range", "ang_vel_z"),
+    ):
+        if key in d:
+            to_check.append((key, axis, tuple(d[key])))
+
+    print("   对账：")
+    for name, axis, (lo, hi) in to_check:
+        if lo > hi:
+            err(f"H: {name} 下界 {lo} > 上界 {hi}")
+            continue
+        dlo, dhi = env[axis]
+        mag = max(abs(dlo), abs(dhi))
+        inside_signed = lo >= dlo and hi <= dhi
+        inside_mag = max(abs(lo), abs(hi)) <= mag + 1e-9
+        if inside_signed:
+            print(f"   ✅ {name:24s} [{lo:+.2f}, {hi:+.2f}] 完全落在 {axis} 包络内")
+        elif inside_mag:
+            print(f"   ⚠️  {name:24s} [{lo:+.2f}, {hi:+.2f}] 略超出 {axis} 单向包络 "
+                  f"[{dlo:+.3f}, {dhi:+.3f}]，但未超幅值上限 {mag:.3f}")
+            warn(f"H: {name} 略超出 {axis} 单向包络（属轻度外插，可接受但应知晓）")
+        else:
+            err(f"H: {name} [{lo:+.2f}, {hi:+.2f}] 超出 {axis} 幅值上限 {mag:.3f}，"
+                f"该档位将缺乏参考密度")
+
+    # --- 4) 前提假设 ---------------------------------------------------------
+    src = COMMANDS_PY.read_text(encoding="utf-8")
+    for cond, why in (
+        ("heading_command=False", "heading_command 必须为 False，否则 wz 采样会被航向环重算"),
+        ("rel_standing_envs=0", "rel_standing_envs 必须为 0，否则两套站立语义冲突"),
+        ("vel_command_b", "必须依赖父类 vel_command_b 缓冲"),
+        ("UniformVelocityCommand", "必须继承 IsaacLab 的 UniformVelocityCommand"),
+    ):
+        if cond not in src:
+            err(f"H: {TARGET.name}/commands.py 缺少关键前提 “{cond}”（{why}）")
+        else:
+            print(f"   ✅ 包含前提 “{cond}”")
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     if not TARGET.is_file():
@@ -538,6 +705,8 @@ def main() -> int:
     check_wiring(tree)
     print("-" * 72)
     check_scan_rays(tree)
+    print("-" * 72)
+    check_command_envelope(tree)
     print("=" * 72)
 
     for w in _warns:

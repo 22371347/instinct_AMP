@@ -213,14 +213,42 @@ $$v_x \in [-1.07,\ +1.69]\ \text{m/s},\quad v_y \in [-0.48,\ +0.55]\ \text{m/s},
 
 **对我们的指导**：`DirectionalVelocityCommandCfg` 只是 `UniformVelocityCommandCfg` 的子类，**可直接移植**到 instinct_xu 的 mdp 里并替掉 Uniform。注意 OmniLoco 原任务断言了命令范围与 `rel_standing_envs=0`；新任务可自定，但建议保持 `rel_standing_envs=0`（“站立”交给 `prob_low` 分支，避免双重站立语义）。
 
-**具体数值按 §3.4 实测包络取**：
+**具体数值按 §3.4 实测包络取**（已实现于 `tasks/locomotion/mdp/commands.py` 与
+`amp_walk_env_cfg.py::AMP_WALK_COMMAND_RANGES`，并由 `check_amp_walk_task.py` 的 H 类检查
+自动对账）：
 
-| 参数 | 初版取值（依据） |
-|---|---|
-| `lin_vel_x` | ±1.2 m/s（数据集最高 1.69 但仅 1 段，留余量） |
-| `lin_vel_y` | ±0.5 m/s（**不得超过 0.55**，侧向参考仅 2 段） |
-| `ang_vel_z` | ±0.9 rad/s ≈ ±51°/s（**不得超过 57°/s**） |
-| `heading` | 保持开启（弧线半径固定 1.7 m，转向与前进耦合） |
+| 参数 | 实际取值 | 依据 |
+|---|---|---|
+| `lin_vel_x` | $(-1.0,\ +1.2)$ m/s | 数据集 $[-1.07, +1.69]$，完全在包络内 |
+| `lin_vel_y` | $(-0.5,\ +0.5)$ m/s | 数据集 $[-0.48, +0.55]$，✅未超幅值上限 0.55 |
+| `ang_vel_z` | $(-0.8,\ +0.8)$ rad/s | 数据集 $[-0.77, +0.99]$，✅未超幅值上限 0.99 |
+| `heading` | **`heading_command=False`** | ⚠️ 必须关。若开启，`_update_command` 会用航向误差**重算** $\omega_z$，把方向分档采样到的 $\omega_z$ 覆盖掉；且父类硬编码校验也禁止航向命令 |
+| `straight_lin_vel_range` | $(0.5,\ +1.2)$ m/s | 持续直线前向 |
+| `straight_ang_vel_range` | $(-0.1,\ +0.1)$ rad/s | ≈0，不转向 |
+| `back_lin_vel_range` | $(-1.0,\ -0.5)$ m/s | 持续直线后退 |
+| `back_ang_vel_range` | $(-0.1,\ +0.1)$ rad/s | ≈0，不转向 |
+| `prob_low / prob_side / prob_lin / prob_back` | 0.15 / 0.25 / 0.25 / 0.10 | 之和 0.75，剩余 0.25 为均匀斜向 |
+| `rel_standing_envs` / `rel_heading_envs` | `0.0` / `0.0` | 站立语义交给 `prob_low`，避免两套站立机制打架 |
+| `resampling_time_range` | $(10,\ 10)$ s | 与 OmniLoco / AMP_mjlab 一致 |
+
+### 3.6 实现上的最小假设设计（重要）
+
+`DirectionalVelocityCommand._resample_command` 的做法是：
+
+```
+super()._resample_command(env_ids)   # 父类先填好默认均匀命令 + 维护 standing/heading
+  ↓
+按抽签结果**覆盖** self.vel_command_b 中属于各模式的行
+```
+
+好处：只需依赖父类的**一个**内部名（`vel_command_b`）与 `cfg.ranges.*`，
+**不碰** `is_standing_env` / `is_heading_env` / `heading_target` / `self.robot`。
+即使 IsaacLab 版本对它们做改动，本类也不会失效。
+`__init__` 里另有 fail-fast 契约校验（检查 `vel_command_b` 是否存在 +
+`heading_command`/`rel_standing_envs` 是否满足前提），把问题变成**启动即报错**。
+
+**刻意不移植** AMP_mjlab 的两部分（均为 mjlab 专有 API）：
+`init_velocity_prob`（直接把命令速度写进 root state）与 `quat_apply` 世界系换算。
 
 ---
 
@@ -415,7 +443,9 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
                  amp_walk_env_cfg.py（actor obs 626 = 623 + base_lin_vel；保留 527 高程图）
                  + agents/amp_walk_ppo_cfg.py；**复用**学长那套 fail-fast 契约校验器
                  （只覆盖类属性期望值）；先不加 AMP，可独立训练
-③ 速度指令       移植 DirectionalVelocityCommandCfg（§3.5），替掉 UniformVelocityCommand
+③ 速度指令       【已完成】新增 `tasks/locomotion/mdp/commands.py`
+                 `DirectionalVelocityCommand`（继承 `UniformVelocityCommand`）+ Cfg
+                 参数实测对账通过（H 类检查：命令范围均在参考动作包络内）
 ④ AMP 观测组     构造 amp_policy / amp_reference（anchor-relative 13 body），校验同构
 ⑤ 奖励迁移       AMP_mjlab 奖励函数移植 + 权重对齐（§3.1）
 ⑥ 算法接线       WasabiPPO + WasabiPPOAmpMix（reward_mix_mode="lerp" + style_lerp），参数映射（§4.1）
@@ -433,11 +463,14 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
 | ②~⑥ 配置与算法 | ✅ **静态契约校验**（`instinct/tools/check_amp_walk_task.py`） | 真实 `gym.make()` + 前向 |
 | ⑦ 冒烟 | ⚠️ 只能静态 | ✅ 完整 |
 
-`check_amp_walk_task.py` 做 7 类检查（A 维度算术 / B 字段顺序 / C 符号真实性 /
-D 注册一致性 / E 契约继承 / F 配置接线 / G 射线数独立复算），其中 **C 类最有价值**：
+`check_amp_walk_task.py` 做 8 类检查（A 维度算术 / B 字段顺序 / C 符号真实性 /
+D 注册一致性 / E 契约继承 / F 配置接线 / G 射线数独立复算 /
+H **速度指令包络 vs 参考动作实测包络对账**），其中 **C 类最有价值**：
 它用「该 `<module>.<name>` 必须在仓库其它文件中已出现过」来判定符号真实性，能抓住
 `instinct_mdp.base_lin_vel` 这种**看起来对、到 Isaac Sim 里才 `AttributeError`**
 的错误（`instinctlab.envs.mdp` 只转发了 `base_ang_vel`，**没有**转发 `base_lin_vel`）。
+**H 类**则是唯一做跨产物数值对账的检查：拿①产出的 npz 重算速度包络，
+再验证②③配置里的命令范围有没有超出去。
 
 ---
 

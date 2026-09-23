@@ -14,6 +14,7 @@ actor 观测在 623 维基础上 **增加 3 维 `base_lin_vel`** → **626 维**
 | 执行器 | `beyondmimic_g1_29dof_actuators` | `G1OmniLocoEnvCfg.__post_init__` |
 | 奖励 / 事件 / 终止 | 与 OmniLoco 相同 | `G1FlatRewardsCfg` 等 |
 | Critic 观测 | 含 `base_lin_vel`（本就对称） | `G1FlatCriticObsCfg` |
+| 速度指令 | **方向分档**（`DirectionalVelocityCommand`） | `tasks/locomotion/mdp/commands.py` |
 
 为什么 actor 要加 `base_lin_vel`
 --------------------------------
@@ -24,11 +25,16 @@ actor 观测在 623 维基础上 **增加 3 维 `base_lin_vel`** → **626 维**
 3. `G1OmniLocoEnvCfg` 的 fail-fast 契约校验**只允许 623 维**，因此必须新建任务
    （`G1OmniLocoTeacherEnv._validate_teacher_contract` 会直接 `RuntimeError`）。
 
-本文件对应 `PLAN_amp_walk.md` §6 的**步骤②：任务骨架**——只改观测，**尚未接入 AMP**，
-因此这里的命令项仍是 OmniLoco 的 `UniformVelocityCommand`（步骤③ 才替换）。
+本文件对应 `PLAN_amp_walk.md` §6 的**步骤②③**：
+- ② 任务骨架（actor obs 626），
+- ③ 速度指令换成方向分档（否则「纯侧向」命令采不出来，见 `Plan` §3.5）。
+
+**尚未接入 AMP**（步骤⑥）。
 """
 
 from __future__ import annotations
+
+import math
 
 from isaaclab.envs import mdp
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -38,9 +44,11 @@ from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 import instinctlab.envs.mdp as instinct_mdp
+import instinctlab.tasks.locomotion.mdp as locomotion_mdp
 
 from .flat_env_cfg import G1FlatCriticObsCfg
 from .omni_loco_env_cfg import (
+    G1OmniLocoCommandsCfg,
     G1OmniLocoEnvCfg,
     G1OmniLocoSceneCfg,
     G1OmniLocoTeacherEnv,
@@ -66,6 +74,61 @@ AMP_WALK_OBSERVATION_TERMS = (
 AMP_WALK_OBSERVATION_DIMS = (527, 3, 3, 3, 3, 29, 29, 29)
 AMP_WALK_OBSERVATION_SIZE = sum(AMP_WALK_OBSERVATION_DIMS)     # == 626
 AMP_WALK_SCAN_RAYS = 527
+
+#: 速度指令范围 (vx, vy, wz)。上限取自 PLAN §3.4 实测的数据集包络并留余量：
+#: 数据集 vx∈[-1.07,1.69]、vy∈[-0.48,0.55]、wz∈[-44.2°,57.0°]。
+#: **不得超过包络**，否则该档位缺乏参考密度（判别器会抑制对应姿态）。
+AMP_WALK_COMMAND_RANGES = ((-1.0, 1.2), (-0.5, 0.5), (-0.8, 0.8))
+
+
+def apply_amp_walk_command_ranges(cmd_cfg) -> None:
+    """把速度指令范围与方向分档参数写回命令配置。
+
+    抽成函数是因为命令配置有**两个**构造入口（`G1AmpWalkCommandsCfg.__post_init__`
+    与 `G1AmpWalkEnvCfg.__post_init__`），而父类两处都会把 ranges 覆盖成 OmniLoco 的。
+    集中一处可保证无论哪个后执行，结果都一致。
+    """
+    cmd_cfg.resampling_time_range = (10.0, 10.0)
+    cmd_cfg.rel_standing_envs = 0.0      # 站立语义交给 prob_low 分支
+    cmd_cfg.rel_heading_envs = 0.0
+    cmd_cfg.heading_command = False      # 否则 wz 会被航向环重算，采样失效
+    cmd_cfg.ranges.lin_vel_x = AMP_WALK_COMMAND_RANGES[0]
+    cmd_cfg.ranges.lin_vel_y = AMP_WALK_COMMAND_RANGES[1]
+    cmd_cfg.ranges.ang_vel_z = AMP_WALK_COMMAND_RANGES[2]
+    cmd_cfg.ranges.heading = (-math.pi, math.pi)
+
+
+# ============================================================================
+# 速度指令配置（步骤③）
+# ============================================================================
+
+
+@configclass
+class G1AmpWalkCommandsCfg(G1OmniLocoCommandsCfg):
+    """用方向分档指令替换 OmniLoco 的 `UniformVelocityCommand`。
+
+    动机见 `tasks/locomotion/mdp/commands.py` 与 PLAN §3.5：三轴独立均匀采样下
+    $v_x$ 恰为 0 的概率为零 ⇒ 学不出「左右直移」。
+    """
+
+    base_velocity = locomotion_mdp.DirectionalVelocityCommandCfg(
+        asset_name="robot",
+        resampling_time_range=(10.0, 10.0),
+        rel_standing_envs=0.0,
+        rel_heading_envs=0.0,
+        heading_command=False,
+        debug_vis=True,
+        ranges=locomotion_mdp.DirectionalVelocityCommandCfg.Ranges(
+            lin_vel_x=AMP_WALK_COMMAND_RANGES[0],
+            lin_vel_y=AMP_WALK_COMMAND_RANGES[1],
+            ang_vel_z=AMP_WALK_COMMAND_RANGES[2],
+            heading=(-math.pi, math.pi),
+        ),
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        apply_amp_walk_command_ranges(self.base_velocity)
 
 
 # ============================================================================
@@ -127,13 +190,17 @@ class G1AmpWalkEnvCfg(G1OmniLocoEnvCfg):
     """AMP 行走教师训练配置。
 
     场景 / 动作 / 奖励 / 事件 / 终止 / 时序 **全部继承 OmniLoco**（= flat 基线），
-    只替换观测组。
+    只替换观测组与速度指令项。
     """
 
+    commands: G1AmpWalkCommandsCfg = G1AmpWalkCommandsCfg()
     observations: G1AmpWalkObservationsCfg = G1AmpWalkObservationsCfg()
 
     def __post_init__(self):
         super().__post_init__()
+        # ⚠️ 父类 G1OmniLocoEnvCfg.__post_init__ 会把命令 ranges 重新设成 OmniLoco 的值，
+        #    因此必须在其之后“再”写回我们的方向分档参数。
+        apply_amp_walk_command_ranges(self.commands.base_velocity)
         # 父类 __post_init__ 已经把 run_name 设成 OmniLoco 的，这里必须覆盖。
         self.run_name = "G1AmpWalkPlane_obs626_scale1"
 
@@ -164,12 +231,14 @@ class G1AmpWalkTeacherEnv(G1OmniLocoTeacherEnv):
     expected_policy_terms = AMP_WALK_OBSERVATION_TERMS
     expected_policy_dims = AMP_WALK_OBSERVATION_DIMS
     expected_scan_rays = AMP_WALK_SCAN_RAYS
-    # 命令范围 / 站立比例仍沿用 OmniLoco（步骤③ 换方向分档指令时再覆盖）
+    # 步骤③ 起用方向分档指令，命令范围不再是 OmniLoco 的，必须同步期望值
+    expected_command_ranges = AMP_WALK_COMMAND_RANGES
     allow_curriculum = False
 
     def _validate_teacher_contract(self):
         super()._validate_teacher_contract()
         print(
             f"[AMP-WALK PASS] policy={sum(self.expected_policy_dims)} "
-            f"(height_scan={self.expected_scan_rays} + base_lin_vel), action=29, scale=1.0"
+            f"(height_scan={self.expected_scan_rays} + base_lin_vel), action=29, scale=1.0, "
+            f"cmd_ranges={self.expected_command_ranges} (directional)"
         )
