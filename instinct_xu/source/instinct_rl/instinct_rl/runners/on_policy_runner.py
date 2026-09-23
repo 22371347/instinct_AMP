@@ -70,7 +70,15 @@ class OnPolicyRunner:
         ).to(self.device)
 
         alg_class_name = self.alg_cfg.pop("class_name")
-        alg_class = importlib.import_module() if ":" in alg_class_name else getattr(algorithms, alg_class_name)
+        # FIX: 这里原来是 `importlib.import_module()`（**调用时没传参数**），
+        # 只要算法 class_name 写成 "module:Class" 就立刻 TypeError。算法是三个
+        # `class_name` 里唯一坏掉的那个（policy / discriminator 的 "module:Class"
+        # 分支都正常），改成与 `modules.build_actor_critic` 一致的写法。
+        if ":" in alg_class_name:
+            module_name, class_name = alg_class_name.split(":")
+            alg_class = getattr(importlib.import_module(module_name), class_name)
+        else:
+            alg_class = getattr(algorithms, alg_class_name)
         self.alg: algorithms.PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]

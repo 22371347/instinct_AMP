@@ -161,13 +161,19 @@ bash /path/to/llp/instinct/tools/cloud_smoke_amp_walk.sh
 |---|---|---|
 | 1 | `import isaaclab.envs.mdp` 里 `UniformVelocityCommand` 类是否存在 | 步骤③ 的方向分档指令**依赖它**（本机无法验证，是最大风险点） |
 | 2 | `UniformVelocityCommand` 是否有 `vel_command_b` 缓冲 | 同上；`DirectionalVelocityCommand.__init__` 有 fail-fast 会直接报错 |
-| 3 | `--task Instinct-Amp-Walk-G1-v0 --num_envs 16 --max_iterations 2` | 端到端：G1 资产 + 高程图 527 射线 + 626 维观测 + 方向分档指令 + `motion_reference`/`robot_reference` 场景 + `amp_policy`/`amp_reference` 同构 + **步骤⑤ 的奖励集能被 `RewardManager` 实例化并跑通前向** |
+| 3 | `--task Instinct-Amp-Walk-G1-v0 --num_envs 16 --max_iterations 2` | 端到端：G1 资产 + 高程图 527 射线 + 626 维观测 + 方向分档指令 + `motion_reference`/`robot_reference` 场景 + `amp_policy`/`amp_reference` 同构 + **步骤⑤ 的奖励集能被 `RewardManager` 实例化并跑通前向** + **步骤⑥ 的 `WasabiPPOAmpMix`/判别器/奖励混合能跑完一个完整迭代** |
 | 4 | 契约校验器打印 `[AMP-WALK PASS]` | 说明动作空间/时序/执行器/命令范围全部符合预期 |
+| 5 | 日志里出现 `Discriminator Network Structure` | 说明步骤⑥ 的 `module:Class` 解析成了、判别器也建起来了（`init_storage` 跑到） |
+| 6 | 不出现 `is not found in the observation dictionary` | 这是 `WasabiAlgoMixin.process_env_step` 对 `amp_policy`/`amp_reference` 缺失的 fail-fast |
 
-> 第 3 项顺带覆盖步骤⑤：`RewardManager` 在 `load_managers()` 里**先于**契约校验构建，
-> 因此任一奖励项 `func` 不存在 / 参数名写错 / `asset.data.<attr>` 不存在，
-> 都会在 `[AMP-WALK PASS]` 之前就报错。跑起来后可顺带看 TensorBoard 里的
-> `Metrics/foot_sep_mean`（应≈0.19~0.25）与 `Metrics/foot_cross_frac`（直线段应≈0）。
+> 第 3 项顺带覆盖步骤⑤⑥：`RewardManager` 与判别器都在 `load_managers()` / `init_storage()` 里构建，
+> **先于**契约校验；因此任一奖励项 `func` 不存在 / 参数名写错 / `asset.data.<attr>` 不存在，
+> 或算法 `class_name` 解不出来 / `discriminator_kwargs` 漏 `hidden_sizes` / 两侧 AMP 状态不同构，
+> 都会在 `[AMP-WALK PASS]` 之前报错。跑起来后应顺带看 TensorBoard 里的：
+> - `Metrics/foot_sep_mean`（应≈0.19~0.25）、`Metrics/foot_cross_frac`（直线段应≈0）
+> - `Step/amp_style_reward`（判别器风格奖励，`"quad"` 形式，值域 [0,1]）
+> - `Step/discriminator_reward`（⚠️ lerp 模式下它是**修正量** `(1-λ)(r_amp - r_task/c)`，不是风格奖励）
+> - `Loss/discriminator_loss`、`Loss/discriminator_gradient_penalty`
 
 **已知会在云端首次暴露、本机无法验证的假设**（按风险排序）：
 
@@ -182,11 +188,14 @@ bash /path/to/llp/instinct/tools/cloud_smoke_amp_walk.sh
    （横向偏移为 0，两者数值几乎一致），但**日志里会少掉这个信号**，
    建议在冒烟输出里 `print` 一次 `robot.body_names` 确认。
 7. ⭐ **步骤⑤ 新增**：`root_ang_vel_b`（IsaacLab 标准属性，仓库里只是没直接用过）。
+8. ⭐ **步骤⑥ 新增**：`WasabiAlgoMixin` 的 `amp_storage` 与 `discriminator_update` 在
+   `num_steps_per_env=24`、`4096` envs 下的显存/耗时（判别器 1024/512，输入 670 维）。
+   先用 `--num_envs 16` 跑通，再爬规模。
 
 > 这些条每一条都已在本地用**静态契约检查**做过能做的部分
-> （`instinct/tools/check_amp_walk_task.py`，10 类检查 A–J 全过），
+> （`instinct/tools/check_amp_walk_task.py`，**11 类检查 A–K 全过**），
 > 但静态检查不能替代真实运行。**建议云环境一通就先跑第 3 层冒烟**，
-> 把 ②③④⑤ 四步积累的「未验证断言」一次性清掉，再继续写 ⑥。
+> 把 ②③④⑤⑥ 五步积累的「未验证断言」一次性清掉，再进 ⑦ 正式小规模训练。
 
 ---
 
@@ -278,7 +287,8 @@ ldd --version | head -1   # 需 >= 2.35
 [t0] 立刻：在云平台开始构建镜像 / 装环境   ← 长尾任务，今天就要启动
       └─ 下载 isaacsim[all]==5.1.0（数 GB）+ 编译 IsaacLab，通常 1~3 小时
 
-[t1] 同时：本地继续写 ⑤ 奖励迁移、⑥ 算法接线（纯代码，不依赖云）
+[t1] 同时：本地继续做 ⑦ 的训练前准备（纯代码，不依赖云）
+      └─ ⑤ 奖励迁移、⑥ 算法接线**已全部完成**（提交 c5139ec / 本次）
 
 [t2] 云环境就绪 → 跑 §3 第 1~3 层验收
       └─ 若第 3 层冒烟挂掉：说明 ②③④ 某处假设错，就地修（代价小）

@@ -41,6 +41,11 @@ MOTION_DIR = G1_DIR / "motions/amp_walk"
 FLAT_CFG = G1_DIR / "flat_env_cfg.py"
 REWARDS_AMP_PY = INSTINCTLAB / "tasks/locomotion/mdp/rewards_amp.py"
 FOOT_SEP_STATS = REPO / "instinct/tools/amp_walk_foot_sep_stats.json"
+#: 步骤⑥：算法接线相关文件
+AGENT_CFG = G1_DIR / "agents/amp_walk_ppo_cfg.py"
+RUNNER_PY = REPO / "instinct_xu/source/instinct_rl/instinct_rl/runners/on_policy_runner.py"
+ALGORITHMS_PY = INSTINCTLAB / "utils/wrappers/instinct_rl/algorithms.py"
+WRAPPERS_INIT = INSTINCTLAB / "utils/wrappers/instinct_rl/__init__.py"
 
 EXPECTED_SIZE = 626
 EXPECTED_AMP_STATE_SIZE = 670
@@ -106,6 +111,25 @@ CROSS_STEP_CLIPS = (
     "walk_sideway_left_loop_002__A021",
     "walk_sideway_right_loop_001__A022",
 )
+
+#: 步骤⑥：`WasabiPPOAmpMix` **只允许**覆盖这些方法。
+#: 其余一律不许碰 —— 那是「对 WASABI 判别器机制零侵入」的可执行定义。
+MIX_ALLOWED_OVERRIDES = {
+    "__init__",
+    "init_storage",
+    "process_env_step",
+    "compute_auxiliary_reward",
+}
+#: aux 的键名。`PPO.process_env_step` 会用 `getattr(self, f"{key}_coef", 1.0)`
+#: 去找系数 —— 所以**键名与 `WasabiAlgoMixin.__init__` 的参数名必须咬合**，
+#: 否则系数会静默退化成 1.0，lerp 公式整体差一个因子 c。
+AMP_AUX_KEY = "discriminator_reward"
+#: 只写日志、不进奖励的额外 aux 键（它的 `_coef` 必须显式为 0）。
+AMP_LOG_ONLY_AUX_KEY = "amp_style_reward"
+#: 判别器奖励形式：`"quad"` = `clamp(1 - 0.25*(d-1)^2, min=0)`，
+#: 与 AMP_mjlab 的 `amp_reward_coef * clamp(1 - (1/4)*(d-1)^2, min=0)` 一致。
+AMP_EXPECTED_DISCRIMINATOR_REWARD_TYPE = "quad"
+AMP_EXPECTED_DISCRIMINATOR_LOSS_FUNC = "MSELoss"
 
 #: `asset.data.<attr>` 中允许「本仓库无直接先例」的属性（值 = 理由）。
 #: 这道守卫防的是 `AttributeError` —— 与 C 类同一个思路，但针对数据容器属性
@@ -1212,6 +1236,269 @@ def check_reward_migration(tree: ast.Module) -> None:
 
 
 # ---------------------------------------------------------------------------
+# K. 算法接线对账（步骤⑥：WASABI / AMP + AMP_mjlab 风格的 lerp 奖励混合）
+# ---------------------------------------------------------------------------
+
+def _func_params(fn: ast.FunctionDef) -> list[str]:
+    """函数的所有参数名（含 `*args` / `**kwargs` 本身）。"""
+    a = fn.args
+    names = [x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)]
+    if a.vararg:
+        names.append(a.vararg.arg)
+    if a.kwarg:
+        names.append(a.kwarg.arg)
+    return names
+
+
+def _class_literals(path: Path, class_name: str) -> dict:
+    """取 configclass 里带「字面量或本文件模块常量」默认值的字段。
+
+    ⚠️ 必须同时接受**带注解**（`a: int = 1`）与**不带注解**（`a = 1`）两种写法：
+    本仓库大量使用不带注解的形式（如 `G1FlatSceneCfg.terrain`、`G1OmniLocoSceneCfg.height_scanner`、
+    `G1FlatPPORunnerCfg.num_steps_per_env`），它们都是**真的字段**
+    （IsaacLab 的 `@configclass` 会把类属性收成字段，`to_dict()` 也会带上）。
+    """
+    tree = parse(path)
+    consts = module_consts(tree)
+    cls = class_defs(tree).get(class_name)
+    if cls is None:
+        return {}
+    out: dict = {}
+    for n in cls.body:
+        target, value = None, None
+        if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            target, value = n.target.id, n.value
+        elif isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            target, value = n.targets[0].id, n.value
+        if target is None or value is None:
+            continue
+        try:
+            out[target] = ast.literal_eval(value)
+        except Exception:
+            try:
+                code = compile(ast.Expression(body=value), "<c>", "eval")
+                out[target] = eval(code, {"__builtins__": {}}, consts)  # noqa: S307
+            except Exception:
+                pass
+    return out
+
+
+def _has_empty_importlib_call(tree: ast.Module) -> bool:
+    """是否存在 `importlib.import_module()` 这种**没传参数**的调用。"""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if isinstance(f, ast.Attribute) and f.attr == "import_module" and not node.args:
+            return True
+    return False
+
+
+def _resolve_class_in_repo(module_path: str, class_name: str) -> tuple[bool, str]:
+    """按 `module:Class` 的形式在仓库里核实「模块存在 + 名字真的可导入」。
+
+    与 C 类同思路：不看「别处出现过」，直接看**定义 + 转发**是否真的成立。
+    """
+    if not module_path.startswith("instinctlab."):
+        return False, f"模块 {module_path} 不在本仓库（instinctlab.*）内，无法静态核实"
+    base = INSTINCTLAB / module_path[len("instinctlab."):].replace(".", "/")
+    py = base.with_suffix(".py")
+    if py.is_file():
+        ok = class_name in top_level_names(parse(py))
+        return ok, f"{py.relative_to(REPO)}" + ("" if ok else f" 里没有 {class_name}")
+    init = base / "__init__.py"
+    if not init.is_file():
+        return False, f"{module_path} 既不是 .py 也不是包（找不到 {init}）"
+    # 包：要求 __init__.py 显式转发这个名字（`from .x import Name` 或 `from .x import *`）
+    for node in ast.walk(parse(init)):
+        if not (isinstance(node, ast.ImportFrom) and node.level == 1 and node.module):
+            continue
+        sub = base / f"{node.module}.py"
+        if not sub.is_file():
+            continue
+        exported = {a.name for a in node.names}
+        if class_name in exported:
+            return True, f"{init.relative_to(REPO)} 显式转发 `from .{node.module} import {class_name}`"
+        if "*" in exported and class_name in top_level_names(parse(sub)):
+            return True, f"{init.relative_to(REPO)} 转发 `from .{node.module} import *`（其中定义了它）"
+    return False, f"{init.relative_to(REPO)} 没有转发 {class_name}"
+
+
+def check_algorithm_wiring(tree: ast.Module) -> None:
+    """把「步骤⑥ 算法接线」变成可执行契约。
+
+    覆盖四类真实会出事的地方：
+    1. `instinct_rl` 的 `module:class` 解析 bug 是否已修（不修则算法 cfg 直接 TypeError）；
+    2. 自定义算法类是否真的可被 runner 解析到（定义 + 转发，与 C 类同强度）；
+    3. **零侵入**：`WasabiPPOAmpMix` 是否只覆盖了允许的方法；
+    4. **数值对账**：把 cfg 里的 λ / c 代进「父类加法」与「AMP_mjlab 凸组合」两条公式，
+       验证两式恒等（这是「精确复刻 AMP_mjlab 公式」的可执行定义）。
+    """
+    print("K. 算法接线对账（步骤⑥：WASABI / AMP + lerp 奖励混合）")
+
+    # --- 1) instinct_rl 的 module:class 解析 bug ----------------------------
+    if not RUNNER_PY.is_file():
+        err(f"K: 找不到 {RUNNER_PY.relative_to(REPO)}")
+    else:
+        src = RUNNER_PY.read_text(encoding="utf-8")
+        tree_runner = parse(RUNNER_PY)
+        if _has_empty_importlib_call(tree_runner):
+            err("K: `on_policy_runner.py` 里仍有 `importlib.import_module()`（未传参）的调用 —— "
+                "算法 class_name 写成 'module:Class' 会直接 TypeError")
+        elif "alg_class = getattr(importlib.import_module(module_name), class_name)" not in src:
+            err("K: `on_policy_runner.py` 的算法类解析写法不认识（期望与 build_actor_critic 一致的形式）")
+        else:
+            print("   ✅ instinct_rl runner 已修：算法 class_name 支持 'module:Class'")
+
+    # --- 2) 自定义算法类可达性 ---------------------------------------------
+    cfg = _class_literals(AGENT_CFG, "AmpWalkAlgorithmCfg")
+    if not cfg:
+        err(f"K: 未能解析 {AGENT_CFG.name} 的 AmpWalkAlgorithmCfg")
+        return
+    class_name = cfg.get("class_name", "")
+    if not isinstance(class_name, str) or ":" not in class_name:
+        err(f"K: 算法 class_name 应为 'module:Class' 形式（实际 {class_name!r}）")
+        return
+    module_path, _, alg_name = class_name.partition(":")
+    ok, detail = _resolve_class_in_repo(module_path, alg_name)
+    if not ok:
+        err(f"K: 算法类 `{class_name}` 无法在仓库里解析到 —— {detail}")
+        return
+    print(f"   ✅ 算法类可达：{class_name}")
+    print(f"      （{detail}）")
+
+    if not ALGORITHMS_PY.is_file():
+        err(f"K: 缺少 {ALGORITHMS_PY.relative_to(REPO)}")
+        return
+    mix_cls = class_defs(parse(ALGORITHMS_PY)).get(alg_name)
+    if mix_cls is None:
+        err(f"K: {ALGORITHMS_PY.name} 里没有类 {alg_name}")
+        return
+    if "WasabiPPO" not in [ast.unparse(b).split(".")[-1] for b in mix_cls.bases]:
+        err(f"K: {alg_name} 必须直接继承 WasabiPPO（实际基类 {_bases_of(class_defs(parse(ALGORITHMS_PY)), alg_name)}）")
+
+    # --- 3) 零侵入：只允许覆盖白名单里的方法 --------------------------------
+    overrides = [n.name for n in mix_cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    illegal = sorted(set(overrides) - MIX_ALLOWED_OVERRIDES)
+    if illegal:
+        err(f"K: {alg_name} 覆盖了不允许的方法 {illegal} —— "
+            f"那会把逻辑耦合进 WASABI 判别器机制（白名单 {sorted(MIX_ALLOWED_OVERRIDES)}）")
+    else:
+        print(f"   ✅ {alg_name} 只覆盖白名单方法：{sorted(set(overrides))}")
+
+    # --- 4) 构造签名 ↔ 配置字段对账 -----------------------------------------
+    init_fn = next((n for n in mix_cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"), None)
+    init_params = set(_func_params(init_fn)) if init_fn else set()
+    mix_keys = ("reward_mix_mode", "style_lerp", "disable_style_on_stand", "stand_speed_threshold")
+    missing = [k for k in mix_keys if k not in init_params]
+    if missing:
+        err(f"K: {alg_name}.__init__ 缺少参数 {missing} —— cfg 里声明了但传不进去")
+    else:
+        print(f"   ✅ {alg_name}.__init__ 接收全部 {len(mix_keys)} 个混合参数")
+    absent_in_cfg = [k for k in mix_keys if k not in cfg]
+    if absent_in_cfg:
+        err(f"K: {AGENT_CFG.name} 的 AmpWalkAlgorithmCfg 未显式声明 {absent_in_cfg} —— "
+            f"`to_dict()` 不会带上它们（@configclass 是 dataclass）")
+
+    # --- 5) 判别器参数 ------------------------------------------------------
+    disc_kwargs = cfg.get("discriminator_kwargs", {}) or {}
+    if "hidden_sizes" not in disc_kwargs:
+        err("K: discriminator_kwargs 缺少 `hidden_sizes` —— "
+            "`Discriminator.build_model` 会直接 `MlpModel(input_size=..., output_size=..., **kwargs)`，"
+            "而 MlpModel 的 hidden_sizes 是必填参数 → init_storage 里 TypeError")
+    else:
+        print(f"   ✅ 判别器 hidden_sizes = {disc_kwargs['hidden_sizes']}，nonlinearity = {disc_kwargs.get('nonlinearity')}")
+    if cfg.get("discriminator_reward_type") != AMP_EXPECTED_DISCRIMINATOR_REWARD_TYPE:
+        err(f"K: discriminator_reward_type={cfg.get('discriminator_reward_type')!r} != "
+            f"{AMP_EXPECTED_DISCRIMINATOR_REWARD_TYPE!r}（AMP_mjlab 用的就是 quad 形式）")
+    if cfg.get("discriminator_loss_func") != AMP_EXPECTED_DISCRIMINATOR_LOSS_FUNC:
+        err(f"K: discriminator_loss_func={cfg.get('discriminator_loss_func')!r} != "
+            f"{AMP_EXPECTED_DISCRIMINATOR_LOSS_FUNC!r}（AMP_mjlab 用的是 MSE 形式）")
+    coef = cfg.get("discriminator_reward_coef")
+    if not isinstance(coef, (int, float)) or coef <= 0.0:
+        err(f"K: discriminator_reward_coef 必须为正数（实际 {coef!r}）")
+        return
+
+    # --- 6) coef 名咬合：`discriminator_reward` → `discriminator_reward_coef` --
+    wasabi_src = (REPO / "instinct_xu/source/instinct_rl/instinct_rl/algorithms/wasabi.py").read_text(
+        encoding="utf-8"
+    )
+    wasabi_tree = parse(REPO / "instinct_xu/source/instinct_rl/instinct_rl/algorithms/wasabi.py")
+    wasabi_mixin = class_defs(wasabi_tree).get("WasabiAlgoMixin")
+    wasabi_init = next(
+        (n for n in wasabi_mixin.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"), None
+    ) if wasabi_mixin else None
+    wasabi_params = set(_func_params(wasabi_init)) if wasabi_init else set()
+    needed_coef = f"{AMP_AUX_KEY}_coef"
+    if needed_coef not in wasabi_params:
+        err(f"K: `WasabiAlgoMixin.__init__` 里没有 `{needed_coef}` 参数 —— "
+            f"`PPO.process_env_step` 的 `getattr(self, '{needed_coef}', 1.0)` 会静默退化成 1.0，"
+            f"lerp 公式整体差一个因子 c")
+    else:
+        print(f"   ✅ aux 键 `{AMP_AUX_KEY}` 的系数名 `{needed_coef}` 与 WasabiAlgoMixin 参数咬合")
+
+    # `amp_style_reward` 只进日志：它的 `_coef` 必须显式为 0
+    log_only_attr = f"self.{AMP_LOG_ONLY_AUX_KEY}_coef"
+    if f"{log_only_attr} = 0.0" not in ALGORITHMS_PY.read_text(encoding="utf-8"):
+        err(f"K: 缺少 `{log_only_attr} = 0.0` —— 那么仅供日志的 `{AMP_LOG_ONLY_AUX_KEY}` 会被 "
+            f"`PPO.process_env_step` 以系数 1.0 **重复计入奖励**（静默的严重错误）")
+    else:
+        print(f"   ✅ `{AMP_LOG_ONLY_AUX_KEY}_coef = 0.0`：日志键不会重复计入奖励")
+
+    # --- 7) 奖励混合模式与权重 ----------------------------------------------
+    mode = cfg.get("reward_mix_mode")
+    lerp = cfg.get("style_lerp")
+    if mode != "lerp":
+        warn(f"K: reward_mix_mode={mode!r}（不是 'lerp'）→ 退化为父类的加法形式 R = r_task + c·r_amp")
+        return
+    if not isinstance(lerp, (int, float)) or not 0.0 <= lerp <= 1.0:
+        err(f"K: style_lerp 必须落在 [0, 1]（实际 {lerp!r}）")
+        return
+    aux_coefs = cfg.get("auxiliary_reward_per_env_reward_coefs")
+    if not isinstance(aux_coefs, list) or len(aux_coefs) != 1:
+        err(f"K: auxiliary_reward_per_env_reward_coefs 必须是长度为 1 的列表（实际 {aux_coefs!r}）——"
+            f"空列表会被 PPO 退化成标量 1.0，与 (num_envs, num_rewards) 的广播语义不一致")
+    else:
+        print(f"   ✅ auxiliary_reward_per_env_reward_coefs = {aux_coefs}")
+
+    # --- 8) 公式数值对账 ----------------------------------------------------
+    # 本仓库管线：aux = (1-λ)(r_amp - r_task/c)；R = r_task + c·aux·1.0
+    # AMP_mjlab  ：R = (1-λ)·c·r_amp + λ·r_task
+    worst = 0.0
+    probes = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (2.5, 0.3), (-1.0, 0.8), (10.0, -3.0)]
+    for r_task, r_amp in probes:
+        r_instinct = r_task + coef * ((1.0 - lerp) * (r_amp - r_task / coef)) * aux_coefs[0]
+        r_mjlab = (1.0 - lerp) * coef * r_amp + lerp * r_task
+        worst = max(worst, abs(r_instinct - r_mjlab))
+    print(f"   公式对账（λ={lerp}, c={coef}，{len(probes)} 个采样点）：")
+    print(f"     本仓库管线  R = r_task + c·(1-λ)(r_amp - r_task/c)")
+    print(f"     AMP_mjlab  R = (1-λ)·c·r_amp + λ·r_task")
+    print(f"     最大偏差 = {worst:.3e}")
+    if worst > 1e-9:
+        err(f"K: 两条公式不恒等（最大偏差 {worst:.3e}）—— lerp 混合的数值复刻失败")
+    else:
+        print(f"   ✅ 两式恒等 → AMP_mjlab 的 (1-λ)·风格 + λ·任务 被精确复刻")
+        style_w, task_w = (1.0 - lerp) * coef, lerp
+        print(f"   实际权重：风格项 {style_w:.4f}·r_amp，任务项 {task_w:.4f}·r_task "
+              f"（风格/任务 = {style_w / task_w:.3f}）")
+        if style_w > task_w:
+            warn(f"K: 风格项权重 {style_w:.3f} 已超过任务项 {task_w:.3f} —— "
+                 f"AMP_mjlab 的教训是强风格先验会压住任务奖励")
+
+    # --- 9) clip_min_std ↔ AMP_mjlab 的 min_normalized_std -------------------
+    policy = _class_literals(AGENT_CFG, "AmpWalkPolicyCfg")
+    init_std = policy.get("init_noise_std")
+    clip_min = cfg.get("clip_min_std")
+    if isinstance(clip_min, (int, float)) and isinstance(init_std, (int, float)) and init_std != 0:
+        print(f"   clip_min_std={clip_min}、init_noise_std={init_std} "
+              f"→ 归一化下限 = {clip_min / init_std:.4f}（AMP_mjlab 用 0.05）")
+        if abs(clip_min / init_std - 0.05) > 1e-9:
+            warn("K: 归一化 std 下限与 AMP_mjlab 的 min_normalized_std=0.05 不一致")
+    else:
+        warn("K: 未能解析 clip_min_std / init_noise_std，跳过 std 下限对账")
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     if not TARGET.is_file():
@@ -1240,6 +1527,8 @@ def main() -> int:
     check_amp_state_isomorphism(tree)
     print("-" * 72)
     check_reward_migration(tree)
+    print("-" * 72)
+    check_algorithm_wiring(tree)
     print("=" * 72)
 
     for w in _warns:

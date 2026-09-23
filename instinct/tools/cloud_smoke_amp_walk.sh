@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 云端冒烟验证：把 ②③④ 三步积累的「本机无法验证的断言」一次性清掉
+# 云端冒烟验证：把 ②③④⑤⑥ 积累的「本机无法验证的断言」一次性清掉
 # =============================================================================
 #
 # 为什么需要它
 # ------------
-# 本机显存 4 GB 跑不了 Isaac Sim（最低 8 GB），所以 ①~④ 的代码**从未真实运行过**。
+# 本机显存 4 GB 跑不了 Isaac Sim（最低 8 GB），所以 ①~⑥ 的代码**从未真实运行过**。
 # 其中若干条假设只能在这里验证（详见 CLOUD_ENV_SETUP.md §5）：
 #   1. isaaclab.envs.mdp.UniformVelocityCommand（类）能否导入
 #   2. 它的内部缓冲是否真的叫 vel_command_b
 #   3. robot_reference + motion_reference 叠加到平面场景后能否构建
 #   4. motion_reference 关节序与机器人是否对齐（AMP 两侧同构依赖它）
 #   5. isaaclab.envs.mdp.joint_vel_rel 是否存在
+#   6. 步骤⑤ 的奖励集能否被 RewardManager 实例化并跑通前向
+#      （任一 func 缺失 / 参数名写错 / asset.data.<attr> 不存在都会在这里暴露）
+#   7. LL_FOOT / LR_FOOT 是否真的在 robot.body_names 里（步宽量的参考点）
+#   8. 步骤⑥ 的 WasabiPPOAmpMix 能否被 runner 按 "module:Class" 解析到、
+#      判别器能否构建、amp_policy/amp_reference 能否送进判别器
 #
 # 用法（在云机器上、已激活 conda 环境后）：
 #   bash /path/to/llp/instinct/tools/cloud_smoke_amp_walk.sh
@@ -177,6 +182,21 @@ fi
 # 父类的 623 维契约标记出现则说明**用错了 env class**（应为本任务的新类）
 if grep -q "\[A1 PASS\]" "$LOG"; then
   bad "日志里出现 [A1 PASS]（OmniLoco 的 623 维契约）—— 可能注册到了旧 env class"
+fi
+
+# 步骤⑥：判别器是否真的被构建（`WasabiAlgoMixin.init_storage` 里会 print）
+if grep -q "Discriminator Network Structure" "$LOG"; then
+  ok "判别器已构建（步骤⑥ WASABI 接线生效）"
+  grep -m1 "Discriminator Network Structure" "$LOG" | sed 's/^/     /'
+else
+  bad "未看到 'Discriminator Network Structure' —— 算法可能不是 WasabiPPOAmpMix，或 init_storage 没跑到"
+fi
+# 步骤⑥：奖励混合是靠 `infos['observations']['amp_policy'/'amp_reference']` 喂判别器的，
+# 任一 key 缺失会在 `WasabiAlgoMixin.process_env_step` 里直接 ValueError。
+if grep -q "is not found in the observation dictionary" "$LOG"; then
+  bad "amp_policy / amp_reference 没出现在 infos['observations'] 里（检查观测组注册与展平）"
+else
+  ok "amp_policy / amp_reference 已被正确送入判别器"
 fi
 
 echo

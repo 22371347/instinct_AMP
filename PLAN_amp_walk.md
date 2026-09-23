@@ -127,16 +127,20 @@ IsaacLab 会自动实例化；它内部 `physx.create_simulation_view` 取重力
 | # | 文件 | 动作 | 说明 |
 |---|---|---|---|
 | 1 | `tasks/locomotion/config/g1/amp_walk_env_cfg.py` | **新增** | 继承 `G1OmniLocoEnvCfg`，覆盖：actor obs 加 `base_lin_vel`；新增 `amp_policy`/`amp_reference` 两组；替换为 AMP 奖励集；挂 `motion_reference` 场景实体 |
-| 2 | `tasks/locomotion/config/g1/agents/amp_walk_rl_cfg.py` | **新增** | `InstinctRlOnPolicyRunnerCfg` 子类；`algorithm.class_name = "WasabiPPO"` + WASABI 参数；`policy` 用 `InstinctRlActorCriticCfg`（hidden 建议 512/256/128） |
+| 2 | `tasks/locomotion/config/g1/agents/amp_walk_ppo_cfg.py` | ✅ **已完成** | `G1AmpWalkPPORunnerCfg` 子类；`algorithm` = `AmpWalkAlgorithmCfg`（`class_name = "instinctlab.utils.wrappers.instinct_rl:WasabiPPOAmpMix"` + WASABI 参数）；`policy` = 512/256/128 |
 | 3 | `tasks/locomotion/config/g1/__init__.py` | 修改 | 追加 `Instinct-Amp-Walk-G1-v0`(+ Play) 注册（**只加不删**） |
 | 4 | `tasks/locomotion/mdp/rewards_amp.py` | ✅ **已完成**（新增） | 从 AMP_mjlab v5 迁移的奖励函数（见 §3.1、§3.7） |
 | 5 | `tasks/locomotion/mdp/commands.py` | ✅ **已完成**（新增） | `DirectionalVelocityCommand(UniformVelocityCommand)` + Cfg（见 §3.5） |
 | 6 | `tasks/locomotion/mdp/observations_amp.py` | **新增**（可选） | 若需要 AMP_mjlab 那种 anchor-relative body 量 |
 | 7 | 参考动作 npz + selection yaml | **新增** | 行走参考动作（见 §3.4、§5.1） |
-| 8 | 算法子类 `WasabiPPOAmpMix` | **新增** | 实现 `additive`/`lerp` 两种奖励混合模式（见 §4.2）；**只 override 一个方法**。放置位置见 §4.2（runner 有 1 处 bug，需选 A 或 B） |
-| 9 | WASABI / 算法 `@configclass` 子类 | **新增** | 声明 WASABI 字段 + 混合模式字段（`@configclass` 是 dataclass，**额外字段必须显式声明**） |
+| 8 | 算法子类 `WasabiPPOAmpMix` | ✅ **已完成** | 实现 `additive`/`lerp` 两种奖励混合模式（见 §4.2）；**只覆盖 4 个方法**（`__init__`/`init_storage`/`process_env_step`/`compute_auxiliary_reward`）。落在 `instinctlab/utils/wrappers/instinct_rl/algorithms.py`，走**方案 A** |
+| 9 | WASABI / 算法 `@configclass` 子类 | ✅ **已完成** | `AmpWalkAlgorithmCfg(InstinctRlPpoAlgorithmCfg)` 显式声明 WASABI 字段 + 混合模式字段（`@configclass` 是 dataclass，**额外字段必须显式声明**） |
 
 **不需要改**：`wasabi.py`、`ppo.py`、`discriminator.py`、`amp_storage.py`、`OmniLoco` 三个原任务，以及**全部奖励函数与权重**。
+
+**`instinct_rl` 的唯一改动**：`runners/on_policy_runner.py` **1 行**（`importlib.import_module()`
+漏传参数 → 算法 `class_name` 写 `"module:Class"` 会 `TypeError`，见 §4.2）。
+除此之外**没有往 `instinct_rl` 里加任何文件**。
 
 ---
 
@@ -335,18 +339,46 @@ $$\text{sep}(t) = \Big[R_{\text{yaw}}\big(q_{\text{root}}\big)^{\top}\,\big(p_{\
 
 ## 4. AMP 算法接线的关键差异（⚠️ 最容易出错的地方）
 
-### 4.1 两套 AMP 实现不同，参数不能照搬
+### 4.1 两套 AMP 实现不同，参数不能照搬 —— **已实施（步骤⑥）**
 
-| AMP_mjlab（rsl_rl fork） | instinct_xu（WASABI） | 映射说明 |
+最终取值位于 `agents/amp_walk_ppo_cfg.py::AmpWalkAlgorithmCfg`：
+
+| AMP_mjlab（rsl_rl fork） | instinct_xu（WASABI） | 实际取值 |
 |---|---|---|
-| `class_name="AMPPPO"` | `class_name="WasabiPPO"` | 不同实现 |
-| `amp_reward_coef=0.1` | `discriminator_reward_coef`（默认 1.0） | 语义相近，**建议从 0.05~0.1 起**（弱风格先验） |
-| `amp_task_reward_lerp=0.75` | → 自建 `style_lerp` | ✅ 通过 `reward_mix_mode="lerp"` 复刻，见 §4.2 |
-| `amp_discr_hidden_dims=[1024,512,256]` | `discriminator_kwargs={"hidden_dims":[…]}` | 需查 `Discriminator` 支持的键名 |
-| `amp_body_names` + `amp_anchor_name` | `amp_policy`/`amp_reference` obs group 里选的 body 集合 | 概念对应 |
-| `amp_num_preload_transitions=200000` | 无 | 略 |
-| `amp_disable_style_on_stand` | → 自建同名开关 | ✅ 在 `compute_auxiliary_reward` 里做掩码（见 §4.2） |
-| `discriminator_loss_func` | `"BCEWithLogitsLoss"`（= 传统 AMP）/ `"MSELoss"`（= AMP_mjlab 用法） | ⚠️ **AMP_mjlab 用的是 MSELoss 形式**，见 §4.3 |
+| `class_name="AMPPPO"` | —— | `"instinctlab.utils.wrappers.instinct_rl:WasabiPPOAmpMix"`（自建子类，见 §4.2） |
+| `amp_reward_coef=0.1` | `discriminator_reward_coef`（默认 1.0） | **0.1**（AMP_mjlab v5 的值；刻意取弱，见下） |
+| `amp_task_reward_lerp=0.75` | 自建 `style_lerp` | **0.75**，`reward_mix_mode="lerp"`（§4.2） |
+| `amp_discr_hidden_dims=[1024,512,256]` | `discriminator_kwargs` | **`{"hidden_sizes": [1024, 512], "nonlinearity": "ReLU"}`** |
+| `amp_anchor_name` / `amp_body_names` | `amp_policy` / `amp_reference` obs group | 5 项 × 10 帧 = 670 维（§1.4） |
+| `amp_num_preload_transitions=200000` | 无 | 略（instinct_xu 逐步在线提供参考状态） |
+| `amp_disable_style_on_stand` | 自建同名开关 | 实现完成，**本任务默认关**（见下） |
+| `discriminator_loss_func` | `"BCEWithLogitsLoss"` / `"MSELoss"` | **`"MSELoss"`**（AMP_mjlab 用法，§4.3） |
+| （AMP_mjlab 的 `amp_reward` 形式） | `discriminator_reward_type` | **`"quad"`** |
+
+**两个关键核实结果**（也是与「照抄上游 parkour」不一致的地方）：
+
+1. **`discriminator_reward_type` 必须是 `"quad"`，不是 `"log"`**。
+   AMP_mjlab 的判别器奖励就是
+   `amp_reward_coef * clamp(1 - (1/4)*(d-1)^2, min=0)`
+   （`rsl_rl/modules/discriminator.py`），即 WASABI 里的 `"quad"`。
+   巧合的是**上游 parkour 也用 `"quad"`**，两边一致，不用取舍。
+2. **`discriminator_kwargs` 的键名是 `hidden_sizes`（复数），不是 `hidden_dims`**。
+   `Discriminator.build_model` 直接 `MlpModel(input_size=..., output_size=..., **kwargs)`，
+   而 `MlpModel.__init__(input_size, hidden_sizes, output_size=None, nonlinearity=ReLU)`
+   —— `hidden_sizes` 是**必填参数**，写错/漏掉会在 `init_storage` 里 TypeError。
+
+**几个有意取值的理由**
+
+- `discriminator_reward_coef = 0.1`（上游 parkour 用 0.25）：AMP_mjlab 的实测教训是
+  「风格先验必须先弱」——他们一度从 0.1 降到 0.05，因为强风格先验会压住任务奖励。
+  取弱之后实际权重是 `0.025·r_amp + 0.75·r_task`（风格/任务 = 0.033）；
+  跑起来后看 TensorBoard 的 `Step/amp_style_reward` 与任务奖励量级再决定是否上调。
+- `disable_style_on_stand` **默认关**：本任务的速度指令有 `prob_low` 档会给精确 `(0,0,0)`，
+  而 `track_default_pose_on_stand` 已经用 `gate_tau=0.25` 的平滑门控处理了低速回位；
+  两套机制叠加容易互相拉扯。需要时一个 bool 就能打开（实现已就绪）。
+- `clip_min_std = 0.05`：等价于 AMP_mjlab 的 `min_normalized_std=[0.05]*29`
+  （instinct_rl 的 `ActorCritic.std` 是绝对标准差，`init_noise_std=1.0` 时两者数值相同）。
+  防止策略过早塌成确定性策略、让判别器单方面主导。
 
 ### 4.2 奖励混合：用「模式 + 权重」两参复刻 AMP_mjlab（零侵入）
 
@@ -427,7 +459,7 @@ class WasabiPPOAmpMix(WasabiPPO):
 - **所有奖励函数与其权重一行不改** —— 混合只发生在算法侧的奖励合成
 - `additive` 模式 = 父类行为，可随时回归对照
 
-**放置位置（已核实，有个坑）**
+**放置位置（已核实，有个坑）—— 最终采用方案 A**
 
 我查了 `instinct_rl/runners/on_policy_runner.py`：
 ```python
@@ -437,13 +469,48 @@ alg_class = importlib.import_module() if ":" in alg_class_name else getattr(algo
 （`policy_class_name` 和 `discriminator_class_name` 的 `module:class` 分支都是正常的，**只有算法这一处坏了**。）
 
 两个选择：
-- **A（推荐，改动最小且更干净）**：把这一行修成与 `build_actor_critic` 一致的形式，`WasabiPPOAmpMix` 就能放在 instinctlab 侧，`instinct_rl` 只动这 1 行：
-  ```python
-  alg_class = getattr(importlib.import_module(n), c) if ":" in alg_class_name else getattr(algorithms, alg_class_name)
-  ```
-- **B**：把 `WasabiPPOAmpMix` 放进 `instinct_rl/algorithms/` 并加进 `__init__.py`，走 `getattr(algorithms, ...)`，**完全不碰 runner**
 
-> ⚠️ `auxiliary_reward_per_env_reward_coefs` 需显式设 `[1.0]`（单奖励组），否则默认 `list()` 可能不生效。
+- ✅ **A（已采用）**：把这一行修成与 `build_actor_critic` 一致的形式，`WasabiPPOAmpMix` 放在 instinctlab 侧 ——
+  `instinct_rl` 只动这 **1 行**，且**不新增任何文件**：
+  ```python
+  if ":" in alg_class_name:
+      module_name, class_name = alg_class_name.split(":")
+      alg_class = getattr(importlib.import_module(module_name), class_name)
+  else:
+      alg_class = getattr(algorithms, alg_class_name)
+  ```
+- **B（未采用）**：把 `WasabiPPOAmpMix` 放进 `instinct_rl/algorithms/` 并加进 `__init__.py`，完全不碰 runner ——
+  但它相当于承认那个 bug 一直存在，且「新增文件 + 改 `__init__.py`」的足迹并不比 A 小。
+
+**A 的落点**：`instinctlab/utils/wrappers/instinct_rl/algorithms.py::WasabiPPOAmpMix`，
+由该包的 `__init__.py` 显式转发，配置里写
+`class_name = "instinctlab.utils.wrappers.instinct_rl:WasabiPPOAmpMix"`。
+
+为什么落在这里：该包已经是「instinctlab ↔ instinct_rl 桥接层」，且**已经同时容纳配置类与运行时类**
+（`vecenv_wrapper.py::InstinctRlVecEnvWrapper`），放一个算法运行时类不引入任何新概念 ——
+比在 `instinctlab` 下新开一个与 `instinct_rl/algorithms` 平行的顶层包更保守。
+
+**最终实现与本节的伪代码有 3 处刻意不同**（以代码为准，均为了可调试性与 fail-fast）：
+
+1. `disable_style_on_stand` 的指令切片不是「运行时查 `_obs_format`」，而是
+   `init_storage` 里解析一次（`get_obs_slice`），且**只允许精确名 / 唯一含 `command` 的项**两级匹配 ——
+   更模糊的猜测会把别的观测当指令用，属于静默错误。
+2. 额外往 aux 里放一个**仅供日志**的 `amp_style_reward`（真正的 `r_amp`）。
+   因为 lerp 模式下 `discriminator_reward` 这个键承载的是「lerp 修正量」而不是风格奖励，
+   不给真值就没法在 TensorBoard 里判断风格项量级。
+   ⚠️ 关键点：`PPO.process_env_step` 是 `if coef != 0.0: 才加进奖励`，日志那行在 `if` **外面**，
+   所以只要把 `amp_style_reward_coef` 钉成 `0.0`，它就**只进日志、不进奖励**。
+3. `init_storage` 里加三条 fail-fast：`num_rewards != 1` / `discriminator_reward_coef == 0` /
+   定位不到指令项 —— 全部变成**启动即报错**。
+
+> ⚠️ `auxiliary_reward_per_env_reward_coefs` 必须显式设 `[1.0]`（单奖励组）。
+> `PPO.__init__` 收到**空列表**时会把系数退化成标量 `1.0`；显式 `[1.0]`（→ shape `(1,1)`）
+> 才与 `transition.rewards` 的 `(num_envs, num_rewards)` 严格广播。
+
+> ⚠️ 另一个咬合点：`PPO.process_env_step` 用 `getattr(self, f"{k}_coef", 1.0)` 找系数，
+> 其中 `k = "discriminator_reward"` → 必须命中 `WasabiAlgoMixin.__init__` 的
+> `discriminator_reward_coef` 参数。**若这个名字改了，系数会静默退化成 1.0，整套 lerp 差一个因子 c**
+> —— 所以检查器 K 类专门断言了这个咬合。
 
 ### 4.3 判别器损失形式
 
@@ -502,14 +569,15 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
 | 1 | **不要改 OmniLoco 任务** | 它有 fail-fast 契约校验，加 `base_lin_vel` 会直接 `RuntimeError` → 必须新建任务 |
 | 2 | **`amp_policy`/`amp_reference` 必须同构** | `get_subobs_size` 不等会在 `init_storage` 断言失败 |
 | 3 | **`Discriminator` 的构造键名** | `input_segment` 来自 `obs_format`（env 自动生成），隐藏层参数键名需查 `discriminator.py` 确认 |
-| 4 | **`@configclass` 额外字段** | WASABI 参数必须在算法 cfg 子类里显式声明，否则 runner 传不下去 |
+| 4 | **`@configclass` 额外字段** | WASABI 参数必须在算法 cfg 子类里声明，否则 runner 传不下去。**已核实**：本仓库大量使用**不带注解**的字段声明（`G1FlatSceneCfg.terrain`、`G1OmniLocoSceneCfg.height_scanner`、以及上游 parkour 的 `AmpAlgoCfg.discriminator_kwargs`），IsaacLab 的 `@configclass` 会把它们收成字段、`to_dict()` 也会带上 → 可以照抄上游风格（无需加类型注解） |
 | 5 | **参考动作采样窗口** | `motion_bin_length_s` / `motion_start_from_middle_range`：行走是循环步态，**不要用 RSI 随机起点**（会破坏步态相位连续性），建议整段连续播放 |
 | 6 | **AMP 状态不要含高程** | 否则判别器在判别地形而不是判别风格 |
 | 7 | **PPO hidden dims 不一致** | instinct_xu 行走用 [256,128,128]、越障用 [512,256,128]；AMP 行走建议 **512/256/128**（与 AMP_mjlab 一致） |
 | 8 | **License** | instinct_xu 继承了 InstinctLab 的 CC BY-NC 4.0 |
 | 9 | **数据集覆盖面决定 AMP 压制什么** | 参考 clip 缺某方向（侧向/后退）时，判别器会把该方向姿态判为“不像参考”而抑制。**改命令分布无法解决（已实测）**，只能补参考数据。见 §3.4 |
 | 10 | **`UniformVelocityCommand` 采不出纯侧向命令** | instinct_xu OmniLoco 用的就是 Uniform（三轴独立均匀）→ x 恰为 0 概率为零 → 左右直移学不出来。见 §3.5 |
-| 11 | **runner 没法用 `module:class` 指定算法** | `on_policy_runner.py` 里 `importlib.import_module()` 漏传参数 → 写 `"module:Class"` 会 `TypeError`。见 §4.2 的 A/B 方案 || 12 | **`feet_crossing` 的方向门控不能关** | 参考动作的侧移 clip 是交叉式侧步，21% 帧 sep<0（§3.7 实测）。关掉 `gate_lateral` 会与 AMP 风格先验对撞，压制侧移能力 |
+| 11 | **runner 没法用 `module:class` 指定算法** | ✅ **已解决（方案 A）**：`on_policy_runner.py` 那一行修成与 `build_actor_critic` 一致的形式；算法子类落在 `instinctlab/utils/wrappers/instinct_rl/algorithms.py`，于是**不需要往 `instinct_rl` 里加文件**。见 §4.2 |
+| 12 | **`feet_crossing` 的方向门控不能关** | 参考动作的侧移 clip 是交叉式侧步，21% 帧 sep<0（§3.7 实测）。关掉 `gate_lateral` 会与 AMP 风格先验对撞，压制侧移能力 |
 | 13 | **`sep_floor` 必须用本仓库实测值** | 参考 body / 基准帧 / 数据集都不同，用 AMP_mjlab 的 0.15 会误伤本仓库 1% 的健康步态帧。实测值见 §3.7 |
 ---
 
@@ -536,7 +604,13 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
                  + `G1AmpWalkRewardsCfg(G1FlatRewardsCfg)`（覆盖 3 项权重 + 新增 5 项）
                  步宽地板/交叉惩罚已用 `instinct/tools/calibrate_foot_sep.py` **实测重标定**（§3.7）
                  `self_collisions` 经核实**不可迁移**（PhysX 过滤限制，见 §3.1）
-⑥ 算法接线       WasabiPPO + WasabiPPOAmpMix（reward_mix_mode="lerp" + style_lerp），参数映射（§4.1）
+⑥ 算法接线       【已完成】
+                 - 修 `instinct_rl/runners/on_policy_runner.py` **1 行**（`importlib.import_module()`
+                   漏传参 → `"module:Class"` 形式的算法类会 TypeError）
+                 - 新增 `instinctlab/utils/wrappers/instinct_rl/algorithms.py::WasabiPPOAmpMix`
+                   （只覆盖 4 个方法；`reward_mix_mode` / `style_lerp` / `disable_style_on_stand`）
+                 - `agents/amp_walk_ppo_cfg.py`：`AmpWalkPolicyCfg`(512/256/128) +
+                   `AmpWalkAlgorithmCfg`（WASABI 判别器参数 + lerp 混合 + `clip_min_std`）
 ⑦ 注册与冒烟     注册新任务 ID；小规模验证（motion_reference 采样 / 判别器前向 / 奖励量级）
 ```
 
@@ -551,12 +625,15 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
 | ②~⑥ 配置与算法 | ✅ **静态契约校验**（`instinct/tools/check_amp_walk_task.py`） | 真实 `gym.make()` + 前向 |
 | ⑦ 冒烟 | ⚠️ 只能静态 | ✅ 完整 |
 
-`check_amp_walk_task.py` 做 10 类检查（A 维度算术 / B 字段顺序 / C 符号真实性 /
+`check_amp_walk_task.py` 做 11 类检查（A 维度算术 / B 字段顺序 / C 符号真实性 /
 D 注册一致性 / E 契约继承 / F 配置接线 / G 射线数独立复算 /
 H **速度指令包络 vs 参考动作实测包络对账** /
 I **AMP 两侧状态逐项同构** /
 J **奖励集迁移对账**：基类权重零改动、迁移表逐项落地、未偷改其它项、
-`sep_floor`/`walk_max_lin_vel` 与①产出实测数据数值对账、`asset.data.*` 属性有仓库先例），
+`sep_floor`/`walk_max_lin_vel` 与①产出实测数据数值对账、`asset.data.*` 属性有仓库先例 /
+K **算法接线对账**：runner 的 `module:class` bug 已修、自定义算法类可解析到、
+只覆盖白名单方法（零侵入）、cfg 字段 ↔ 构造参数咬合、`hidden_sizes` 必填、
+aux 系数名咬合、`amp_style_reward_coef=0`、以及**把 λ/c 代进两条公式做数值恒等对账**），
 其中 **C 类最有价值**：
 它用「本仓库模块**直接查定义**（跟随显式 `from .x import *` 转发）+ 外部模块查仓库先例」
 来判定符号真实性，能抓住 `instinct_mdp.base_lin_vel` 这种**看起来对、到 Isaac Sim 里才
@@ -580,5 +657,13 @@ J **奖励集迁移对账**：基类权重零改动、迁移表逐项落地、�
 > 实测后 `sep_floor` 从 0.15 改成 0.145，而且发现**参考动作的侧移 clip 本身就是交叉式侧步**
 > （21% 帧 sep<0）→ `feet_crossing` 必须加方向门控，否则奖励会和 AMP 风格先验正面对撞。
 > 这类「照抄一个数」的错误在静态检查里是看不出来的，只能靠**把参考数据算一遍**。
+>
+> 步骤⑥ 补上第五条：**先确认目标公式，再谈参数**。AMP_mjlab 的判别器奖励是
+> `clamp(1-0.25(d-1)², 0)`（= WASABI 的 `"quad"`）而不是默认的 `"log"`；
+> 而 `discriminator_kwargs` 的键名是 `hidden_sizes`（`MlpModel` 的**必填**参数），
+> 写错就会在 `init_storage` 里 TypeError。这两条都是「看源码/看常量」才能定的，
+> 不看就会静默地换一个目标函数、或直接崩在启动期。
+> lerp 混合那边更隐蔽：`PPO.process_env_step` 是用 `getattr(self, f"{key}_coef", 1.0)`
+> 去揀系数的 —— **键名与参数名一旦不咬合，系数会静默变成 1.0，整套公式差一个因子 $c$**。
 >
 > 原以为“最大的实际工作量在参考动作数据格式转换”——**实测后已被证伪**：转换器一天内写完并全部通过 FK 验证（误差 ≤1e-6 m），四元数无需翻转、速度无需手工补、关节序无需重排。真正的风险集中在**数据集速度包络**与**奖励混合的数值一致性**上。
