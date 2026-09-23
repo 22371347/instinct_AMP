@@ -275,3 +275,106 @@ ldd --version | head -1   # 需 >= 2.35
 
 [t3] ⑦ 正式小规模训练（先 512 env，确认显存后再上 4096）
 ```
+
+---
+
+## 8. 实测结果（2026-09-23，新云平台）
+
+> 平台：`root@183.147.142.40:30528`，镜像 = Ubuntu 24.04 + CUDA 12.8 + 4090×1
+> + IsaacSim 5.1.0 + IsaacLab 2.3.2
+> 调用方式：`python instinct/tools/instinct_ssh.py --env-check` 等
+
+### 8.1 结论：**可以用，但有 3 个坑已处理**
+
+| 项 | 实测值 | 判定 |
+|---|---|---|
+| OS / GLIBC | Ubuntu 24.04.4 LTS / GLIBC 2.39 | ✅ |
+| GPU / 驱动 | RTX 4090 24564 MiB / **580.126.09** | ✅ ≥ 580.65.06 |
+| 容器配额 | **14 核** / 50 GB RAM（宿主 128 核 503 GB） | ✅ |
+| Python | 3.11.15（`/opt/conda/envs/isaaclab`） | ✅ |
+| isaacsim | **5.1.0.0** | ✅ 精确匹配 |
+| torch / torchvision | **2.7.0+cu128** / **0.22.0+cu128** | ✅ 精确匹配 |
+| numpy | 1.26.0 | ✅（<2，IsaacLab 要求） |
+| isaaclab | **2.3.2.post1** | ⚠️ = release v2.3.2，落后 pin 25 个提交，但 §6.1 已证明差异无关 |
+| Kit headless 启动 | ✅ 10.9 s 到 `app ready` | ✅ |
+| CUDA 可用 | ✅ `torch.cuda.is_available()=True` | ✅ |
+
+### 8.2 坑 1：Kit 首次运行弹 EULA，非交互 SSH 下直接失败 ⚠️
+
+```
+Do you accept the EULA? (Yes/No): Unable to bootstrap inner kit kernel: EOF when reading a line
+```
+
+`ssh host "cmd"` **没有 TTY** → 必挂。修复（已固化进 `/root/.llp_env.sh`）：
+
+```bash
+export OMNI_KIT_ACCEPT_EULA=YES
+export ACCEPT_EULA=Y
+export PRIVACY_CONSENT=Y
+```
+
+### 8.3 坑 2（关键）：镜像里 `isaaclab` 被"外壳"遮蔽 ⚠️
+
+镜像把**整个 IsaacLab 仓库快照**装进了 site-packages：
+
+```
+site-packages/isaaclab/            ← 外壳（有 __init__.py / __main__.py / apps / source）
+site-packages/isaaclab/source/isaaclab/isaaclab/   ← 真正的库
+site-packages/isaaclab/source/isaaclab_{tasks,assets,mimic,rl,contrib}/
+```
+
+后果：`import isaaclab` **成功**，但 `import isaaclab.envs` 报
+`ModuleNotFoundError: No module named 'isaaclab.envs'` —— 因为外壳的
+`__init__.py` 把真库挡住了。
+
+**尝试过但无效**：往 site-packages 放 `.pth`
+（`.pth` 路径排在 site-packages **之后**，外壳仍然胜出）。
+**有效修复**：用 `PYTHONPATH`（它排在 site-packages **之前**）：
+
+```bash
+_LLP_SP=/opt/conda/envs/isaaclab/lib/python3.11/site-packages
+for _d in "$_LLP_SP"/isaaclab/source/*/; do
+    _d="${_d%/}"; _b=$(basename "$_d")
+    [ -d "$_d/$_b" ] && export PYTHONPATH="$_d${PYTHONPATH:+:$PYTHONPATH}"
+done
+```
+
+→ 已固化在 `/root/.llp_env.sh`，用 `instinct/tools/instinct_ssh.py --setup-remote` 生成。
+
+**顺带把步骤③ 的假设也验证了**（这是本次最有价值的收获）：
+
+```
+OK isaaclab.envs.mdp 属性: UniformVelocityCommand, UniformVelocityCommandCfg,
+                           joint_vel_rel, base_lin_vel, joint_pos_rel,
+                           height_scan, generated_commands
+--- UniformVelocityCommand 源码探测 ---
+     OK vel_command_b       ← 我的 DirectionalVelocityCommand 就依赖它
+     OK is_standing_env
+     OK is_heading_env
+     OK heading_target
+```
+
+### 8.4 坑 3：GitHub 不通
+
+| 目标 | 状态 |
+|---|---|
+| github.com | ❌ timeout |
+| pypi.org / pypi.nvidia.com | ✅ |
+| 清华 PyPI 镜像（`/etc/pip.conf` 已配好） | ✅ |
+| omniverse 资产服务器（S3） | ✅ 200 —— 高程图/材质能正常下载 |
+
+**影响**：README §3 的「git clone 原版 InstinctLab / instinct_rl」这一步做不了。
+**对策**：`instinct_xu/source/` 自带这两份源码（README §4 说它们会替换同名包），
+**跳过 §3 直接装 §4 即可**；真要参照原版，本地 `instinct/repos/` 已有副本可上传。
+
+### 8.5 磁盘布局（/ 只有 30 G，别装错地方）
+
+| 路径 | 容量 | 类型 |
+|---|---|---|
+| `/` | 30 G（overlay） | 容器可写层 —— **不要放代码/日志** |
+| `/root/gpufree-data` | **49 G** | 本地盘（快）→ 推荐放代码 + 日志 |
+| `/root/gpufree-share` | **500 G** | JuiceFS 网络盘 → 放大文件/归档 |
+
+`/root/.llp_env.sh` 里已导出 `LLP_DATA_ROOT=/root/gpufree-data`。
+（Isaac Sim 本体在只读镜像层里，不占这 30 G。）
+
