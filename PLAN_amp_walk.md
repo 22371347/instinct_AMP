@@ -80,13 +80,43 @@ critic   : 同上 + base_lin_vel(3)，且关闭噪声
 
 **两者必须同构**（`get_subobs_size` 必须相等，否则 `init_storage` 里断言失败）。
 
-| 组 | 内容 | 来源 |
-|---|---|---|
-| `amp_policy` | anchor 相对的各 body 位置 / 朝向 / 线速度 / 角速度 | 机器人当前状态 |
-| `amp_reference` | 同上，但取自参考动作 | `*_reference_as_state` 系列函数 |
+⚠️ **本节已修正**。原来的方案（2025-09-23 之前）打算照搬 AMP_mjlab 的 *「anchor 相对的 13 body 位姿」*
+表示法——那需要新写一批 link 级观测函数并自己处理 anchor 帧，工作量大、风险高。
 
-- anchor 建议 `torso_link`，body 集合沿用 AMP_mjlab 的 13 个（pelvis / 双髋 roll / 双膝 / 双踝 roll / 双臂 roll·elbow·腕）
+后来在本地发现 `instinct/repos/InstinctLab` 下有 **Hiking in the Wild 的官方实现**
+（`tasks/parkour/config/parkour_env_cfg.py` 的 `AmpPolicyStateObsCfg` / `AmpReferenceStateObsCfg`），
+它给出了 InstinctLab 生态里 AMP 状态向量的**权威写法**。现在改为完全采用它：
+
+| 项 | 单帧 | 历史 | flatten | scale |
+|---|---|---|---|---|
+| `projected_gravity` | 3 | 10 | ✗（所以维度是 (10,3)） | — |
+| `joint_pos_rel` | 29 | 10 | ✔ | — |
+| `joint_vel_rel` | 29 | 10 | ✔ | **0.05** |
+| `base_lin_vel` | 3 | 10 | ✔ | — |
+| `base_ang_vel` | 3 | 10 | ✔ | — |
+
+合计 **670 维**，两侧逐项同构（项名/形状/缩放全部一致，只换数据源）。
+
+**为什么这个选择更好**：
+1. `reference_as_state.py` 已经把这些项**全部**准备好了（机器人侧 ↔ 参考侧成对），零新代码；
+2. `WasabiPPO` + `wasabi.py` 就是围绕这套观测组写的（`actor_state_key="amp_policy"`/
+   `reference_state_key="amp_reference"` 就是它的默认值）；
+3. 与官方 parkour 实现保持一致，便于日后对照、排错。
+
+**两个 mdp 命名空间的分工（极易写错）**：
+
+| 符号 | 应取自 | 原因 |
+|---|---|---|
+| `base_lin_vel` / `joint_vel_rel`（机器人侧） | `isaaclab.envs.mdp` | `instinctlab.envs.mdp` **没有**转发这两个 |
+| `projected_gravity` / `base_ang_vel` / `joint_pos_rel` | 两边都有，沿用 OmniLoco 的 `instinct_mdp` | — |
+| `*_reference_as_state` 全家 | **`instinctlab.envs.mdp`** | 定义在 `envs/mdp/observations/reference_as_state.py`，isaaclab 里没有 |
+
+⚠️ `projected_gravity_reference_as_state` 是个 `ManagerTermBase` 子类（不是普通函数），
+IsaacLab 会自动实例化；它内部 `physx.create_simulation_view` 取重力方向。
+
 - **不要把高程图放进 AMP 状态**（会稀释风格判别）
+- `amp_policy` / `amp_reference` 保持 `enable_corruption=False`（判别器输入不应加噪）
+- 两个组**不参与** actor/critic，步骤⑥ 接入 WASABI 后才被使用
 
 ---
 
@@ -446,7 +476,11 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
 ③ 速度指令       【已完成】新增 `tasks/locomotion/mdp/commands.py`
                  `DirectionalVelocityCommand`（继承 `UniformVelocityCommand`）+ Cfg
                  参数实测对账通过（H 类检查：命令范围均在参考动作包络内）
-④ AMP 观测组     构造 amp_policy / amp_reference（anchor-relative 13 body），校验同构
+④ AMP 观测组     【已完成】`amp_policy` / `amp_reference`（5 项 × 10 帧 = 670 维，逐项同构）
+                 采用官方 parkour 的表示法（非 AMP_mjlab 的 13-body 位姿，见 §1.4）
+                 新增 G1AmpWalkSceneCfg：+ robot_reference + motion_reference 传感器
+                 行走循环步态：已关 RSI，motion_bin_length_s = None
+                 I 类检查自动验证两侧同构与维度算术
 ⑤ 奖励迁移       AMP_mjlab 奖励函数移植 + 权重对齐（§3.1）
 ⑥ 算法接线       WasabiPPO + WasabiPPOAmpMix（reward_mix_mode="lerp" + style_lerp），参数映射（§4.1）
 ⑦ 注册与冒烟     注册新任务 ID；小规模验证（motion_reference 采样 / 判别器前向 / 奖励量级）
@@ -463,14 +497,18 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
 | ②~⑥ 配置与算法 | ✅ **静态契约校验**（`instinct/tools/check_amp_walk_task.py`） | 真实 `gym.make()` + 前向 |
 | ⑦ 冒烟 | ⚠️ 只能静态 | ✅ 完整 |
 
-`check_amp_walk_task.py` 做 8 类检查（A 维度算术 / B 字段顺序 / C 符号真实性 /
+`check_amp_walk_task.py` 做 9 类检查（A 维度算术 / B 字段顺序 / C 符号真实性 /
 D 注册一致性 / E 契约继承 / F 配置接线 / G 射线数独立复算 /
-H **速度指令包络 vs 参考动作实测包络对账**），其中 **C 类最有价值**：
-它用「该 `<module>.<name>` 必须在仓库其它文件中已出现过」来判定符号真实性，能抓住
-`instinct_mdp.base_lin_vel` 这种**看起来对、到 Isaac Sim 里才 `AttributeError`**
-的错误（`instinctlab.envs.mdp` 只转发了 `base_ang_vel`，**没有**转发 `base_lin_vel`）。
-**H 类**则是唯一做跨产物数值对账的检查：拿①产出的 npz 重算速度包络，
+H **速度指令包络 vs 参考动作实测包络对账** /
+I **AMP 两侧状态逐项同构**），其中 **C 类最有价值**：
+它用「本仓库模块**直接查定义**（跟随显式 `from .x import *` 转发）+ 外部模块查仓库先例」
+来判定符号真实性，能抓住 `instinct_mdp.base_lin_vel` 这种**看起来对、到 Isaac Sim 里才
+`AttributeError`** 的错误（`instinctlab.envs.mdp` 只转发了 `base_ang_vel`，
+**没有**转发 `base_lin_vel` / `joint_vel_rel`）。
+**H 类**是唯一做跨产物数值对账的检查：拿①产出的 npz 重算速度包络，
 再验证②③配置里的命令范围有没有超出去。
+**I 类**防的是「改了 history/flatten/scale 导致两侧不同构 → WASABI `init_storage` 断言失败」
+这类隐式破坏。
 
 ---
 

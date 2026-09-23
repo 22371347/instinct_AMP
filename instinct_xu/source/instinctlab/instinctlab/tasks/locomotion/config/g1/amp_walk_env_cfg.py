@@ -35,6 +35,7 @@ actor 观测在 623 维基础上 **增加 3 维 `base_lin_vel`** → **626 维**
 from __future__ import annotations
 
 import math
+import os
 
 from isaaclab.envs import mdp
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -45,8 +46,11 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 import instinctlab.envs.mdp as instinct_mdp
 import instinctlab.tasks.locomotion.mdp as locomotion_mdp
+from instinctlab.motion_reference import MotionReferenceManagerCfg
+from instinctlab.motion_reference.motion_files.amass_motion_cfg import AmassMotionCfg as AmassMotionCfgBase
+from instinctlab.motion_reference.utils import motion_interpolate_bilinear
 
-from .flat_env_cfg import G1FlatCriticObsCfg
+from .flat_env_cfg import G1FlatCriticObsCfg, G1_CFG
 from .omni_loco_env_cfg import (
     G1OmniLocoCommandsCfg,
     G1OmniLocoEnvCfg,
@@ -132,6 +136,106 @@ class G1AmpWalkCommandsCfg(G1OmniLocoCommandsCfg):
 
 
 # ============================================================================
+# 参考动作传感器（步骤④）
+# ============================================================================
+
+MOTION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motions", "amp_walk")
+MOTION_SELECTION_FILE = os.path.join(MOTION_DIR, "amp_walk_motion_selection.yaml")
+MOTION_NAME = "amp_walk"
+
+#: AMP 判别器的状态历史长度（与官方 parkour 实现一致）。
+AMP_STATE_HISTORY = 10
+#: 判别器状态向量的**项名**。`amp_policy` 与 `amp_reference` 必须逐项同构。
+AMP_STATE_TERMS = (
+    "projected_gravity",   # (10, 3) —— 未 flatten
+    "joint_pos_rel",       # (290,)
+    "joint_vel_rel",       # (290,)
+    "base_lin_vel",        # (30,)
+    "base_ang_vel",        # (30,)
+)
+AMP_STATE_DIMS = ((AMP_STATE_HISTORY, 3), (290,), (290,), (30,), (30,))
+AMP_STATE_SIZE = sum(math.prod(d) for d in AMP_STATE_DIMS)     # == 670
+
+
+@configclass
+class AmpWalkMotionCfg(AmassMotionCfgBase):
+    """AMP 行走参考动作（① 转换产出的 instinctlab 格式 npz）。
+
+    ⚠️ 行走是**循环步态**，两项设置很关键：
+    - `motion_start_from_middle_range = (0.0, 0.0)`：**关闭 RSI 随机起点**。
+      随机起点会破坏步态相位连续性，对循环行走有害（官方 Vault 的 PLAY 配置
+      也正是这么关掉的）。
+    - `motion_bin_length_s = None`：不切 bin，整段连续播放。
+    """
+
+    path = MOTION_DIR
+    retargetting_func = None
+    filtered_motion_selection_filepath = MOTION_SELECTION_FILE
+    supported_file_endings = ["retargeted.npz"]
+    motion_start_from_middle_range = (0.0, 0.0)
+    motion_start_height_offset = 0.0
+    ensure_link_below_zero_ground = False
+    buffer_device = "output_device"
+    motion_interpolate_func = motion_interpolate_bilinear
+    motion_target_framerate = 50.0
+    # 参考集里既有前向也有后退 clip，故用 frontbackward 估计速度
+    velocity_estimation_method = "frontbackward"
+    motion_bin_length_s = None
+
+
+motion_reference_cfg = MotionReferenceManagerCfg(
+    prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+    robot_model_path=G1_CFG.spawn.asset_path,
+    reference_prim_path="/World/envs/env_.*/RobotReference/torso_link",
+    link_of_interests=[
+        "pelvis",
+        "torso_link",
+        "left_shoulder_roll_link",
+        "right_shoulder_roll_link",
+        "left_elbow_link",
+        "right_elbow_link",
+        "left_wrist_roll_link",
+        "right_wrist_roll_link",
+        "left_hip_roll_link",
+        "right_hip_roll_link",
+        "left_knee_link",
+        "right_knee_link",
+        "left_ankle_roll_link",
+        "right_ankle_roll_link",
+    ],
+    # 不做镜像增广：本任务的转身行为对称性未被验证，增广可能引入错误标签
+    symmetric_augmentation_link_mapping=None,
+    symmetric_augmentation_joint_mapping=None,
+    symmetric_augmentation_joint_reverse_buf=None,
+    frame_interval_s=0.0,
+    update_period=0.02,
+    num_frames=1,
+    visualizing_robot_offset=(0.0, 2.0, 0.0),
+    visualizing_robot_from="reference_frame",
+    motion_buffers={
+        MOTION_NAME: AmpWalkMotionCfg(),
+    },
+    mp_split_method="Even",
+)
+
+
+@configclass
+class G1AmpWalkSceneCfg(G1OmniLocoSceneCfg):
+    """OmniLoco 平面场景 + 参考机器人 + 运动参考传感器。
+
+    继承了 527 射线的高程图，并新增：
+    - `robot_reference`：可视化用的参考（真值）机器人，由传感器驱动；
+    - `motion_reference`：从 npz 提供参考状态（`*_reference_as_state` 观测项的来源）。
+
+    ⚠️ 参考机器人不参与碰撞/接触（`contact_forces` 的 prim_path 是
+    `{ENV_REGEX_NS}/Robot/.*`，不会匹配到 `RobotReference`）。
+    """
+
+    robot_reference = G1_CFG.replace(prim_path="{ENV_REGEX_NS}/RobotReference")
+    motion_reference: MotionReferenceManagerCfg = motion_reference_cfg
+
+
+# ============================================================================
 # 观测配置
 # ============================================================================
 
@@ -173,11 +277,119 @@ class G1AmpWalkPolicyObsCfg(ObsGroup):
 
 
 @configclass
+class AmpPolicyStateObsCfg(ObsGroup):
+    """判别器输入（**策略侧**）：真实机器人的状态（机器人本体系）。
+
+    与 `AmpReferenceStateObsCfg` **逐项同构**（项名 / 形状 / 缩放都一致），
+    否则 WASABI 在 `init_storage` 会因为两侧 `get_subobs_size` 不等而断言失败。
+
+    设计来源：上游 parkour（Hiking in the Wild）官方实现
+    `instinct/repos/InstinctLab/.../tasks/parkour/config/parkour_env_cfg.py`。
+    状态向量 = 投影重力 + 关节位置（相对 default）+ 关节速度（相对 default，0.05 缩放）
+    + base 线速度 + base 角速度，各 10 帧历史。
+
+    ⚠️ 两个 mdp 模块的**分工必须分清**（很容易写错，`check_amp_walk_task.py` 会查）：
+    - 机器人自身状态：`base_lin_vel` / `joint_vel_rel` **只能**从 `isaaclab.envs.mdp` 取
+      （`instinctlab.envs.mdp` 并没有转发这两个）；
+    - `projected_gravity` / `base_ang_vel` / `joint_pos_rel` 则两个模块都有，
+      这里沿用 OmniLoco 的写法（`instinct_mdp`）。
+
+    注意：**保持默认 `enable_corruption=False`** —— 判别器输入不应加噪声。
+    """
+
+    concatenate_terms = False
+
+    projected_gravity = ObsTerm(
+        func=instinct_mdp.projected_gravity,
+        history_length=AMP_STATE_HISTORY,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    joint_pos_rel = ObsTerm(
+        func=mdp.joint_pos_rel,
+        history_length=AMP_STATE_HISTORY,
+        flatten_history_dim=True,
+        params={"asset_cfg": SceneEntityCfg(name="robot", preserve_order=True)},
+    )
+    joint_vel_rel = ObsTerm(
+        func=mdp.joint_vel_rel,
+        scale=0.05,
+        history_length=AMP_STATE_HISTORY,
+        flatten_history_dim=True,
+        params={"asset_cfg": SceneEntityCfg(name="robot", preserve_order=True)},
+    )
+    base_lin_vel = ObsTerm(
+        func=mdp.base_lin_vel,
+        history_length=AMP_STATE_HISTORY,
+        flatten_history_dim=True,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    base_ang_vel = ObsTerm(
+        func=instinct_mdp.base_ang_vel,
+        history_length=AMP_STATE_HISTORY,
+        flatten_history_dim=True,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+
+
+@configclass
+class AmpReferenceStateObsCfg(ObsGroup):
+    """判别器输入（**参考侧**）：来自 `motion_reference` 的运动参考状态。
+
+    与 `AmpPolicyStateObsCfg` 项名、形状、缩放逐项一致，只把数据源
+    从 `robot` 换成 `motion_reference`。
+
+    ⚠️ `*_reference_as_state` 系列定义在 **`instinctlab.envs.mdp`**
+    （`envs/mdp/observations/reference_as_state.py`），**不在** `isaaclab.envs.mdp`。
+    注意 `projected_gravity_reference_as_state` 是个 `ManagerTermBase` 子类
+    （不是普通函数），IsaacLab 会自动实例化。
+    """
+
+    concatenate_terms = False
+
+    projected_gravity = ObsTerm(
+        func=instinct_mdp.projected_gravity_reference_as_state,
+        history_length=AMP_STATE_HISTORY,
+        params={"asset_cfg": SceneEntityCfg("motion_reference")},
+    )
+    joint_pos_rel = ObsTerm(
+        func=instinct_mdp.joint_pos_rel_reference_as_state,
+        history_length=AMP_STATE_HISTORY,
+        flatten_history_dim=True,
+        params={"asset_cfg": SceneEntityCfg("motion_reference")},
+    )
+    joint_vel_rel = ObsTerm(
+        func=instinct_mdp.joint_vel_rel_reference_as_state,
+        scale=0.05,
+        history_length=AMP_STATE_HISTORY,
+        flatten_history_dim=True,
+        params={"asset_cfg": SceneEntityCfg("motion_reference")},
+    )
+    base_lin_vel = ObsTerm(
+        func=instinct_mdp.base_lin_vel_reference_as_state,
+        history_length=AMP_STATE_HISTORY,
+        flatten_history_dim=True,
+        params={"asset_cfg": SceneEntityCfg("motion_reference")},
+    )
+    base_ang_vel = ObsTerm(
+        func=instinct_mdp.base_ang_vel_reference_as_state,
+        history_length=AMP_STATE_HISTORY,
+        flatten_history_dim=True,
+        params={"asset_cfg": SceneEntityCfg("motion_reference")},
+    )
+
+
+@configclass
 class G1AmpWalkObservationsCfg:
-    """actor = 626 维特权观测；critic 沿用 flat 的（本就含 base_lin_vel）。"""
+    """actor = 626 维特权观测；critic 沿用 flat 的（本就含 base_lin_vel）。
+
+    `amp_policy` / `amp_reference` 是为判别器准备的额外观测组，
+    **不参与 actor/critic 的输入**，在步骤⑥ 接入 WASABI 后才被使用。
+    """
 
     policy: G1AmpWalkPolicyObsCfg = G1AmpWalkPolicyObsCfg()
     critic: G1FlatCriticObsCfg = G1FlatCriticObsCfg()
+    amp_policy: AmpPolicyStateObsCfg = AmpPolicyStateObsCfg()
+    amp_reference: AmpReferenceStateObsCfg = AmpReferenceStateObsCfg()
 
 
 # ============================================================================
@@ -189,10 +401,11 @@ class G1AmpWalkObservationsCfg:
 class G1AmpWalkEnvCfg(G1OmniLocoEnvCfg):
     """AMP 行走教师训练配置。
 
-    场景 / 动作 / 奖励 / 事件 / 终止 / 时序 **全部继承 OmniLoco**（= flat 基线），
-    只替换观测组与速度指令项。
+    奖励 / 事件 / 终止 / 时序 / 动作 **全部继承 OmniLoco**（= flat 基线）；
+    替换的只有：场景（+参考机器人+运动参考传感器）、观测组、速度指令项。
     """
 
+    scene: G1AmpWalkSceneCfg = G1AmpWalkSceneCfg(num_envs=4096, env_spacing=2.5)
     commands: G1AmpWalkCommandsCfg = G1AmpWalkCommandsCfg()
     observations: G1AmpWalkObservationsCfg = G1AmpWalkObservationsCfg()
 
@@ -202,12 +415,16 @@ class G1AmpWalkEnvCfg(G1OmniLocoEnvCfg):
         #    因此必须在其之后“再”写回我们的方向分档参数。
         apply_amp_walk_command_ranges(self.commands.base_velocity)
         # 父类 __post_init__ 已经把 run_name 设成 OmniLoco 的，这里必须覆盖。
-        self.run_name = "G1AmpWalkPlane_obs626_scale1"
+        self.run_name = "G1AmpWalkPlane_obs626_directional"
 
 
 @configclass
 class G1AmpWalkEnvCfg_PLAY(G1AmpWalkEnvCfg):
-    scene: G1OmniLocoSceneCfg = G1OmniLocoSceneCfg(num_envs=1, env_spacing=2.5)
+    scene: G1AmpWalkSceneCfg = G1AmpWalkSceneCfg(
+        num_envs=1,
+        env_spacing=2.5,
+        motion_reference=motion_reference_cfg.replace(debug_vis=True),
+    )
 
     def __post_init__(self):
         super().__post_init__()

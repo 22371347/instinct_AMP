@@ -27,6 +27,7 @@ E. 契约继承：`G1AmpWalkTeacherEnv` 覆盖的三个期望值 == 对应常量
 from __future__ import annotations
 
 import ast
+import math
 import sys
 from pathlib import Path
 
@@ -38,6 +39,15 @@ COMMANDS_PY = INSTINCTLAB / "tasks/locomotion/mdp/commands.py"
 MOTION_DIR = G1_DIR / "motions/amp_walk"
 
 EXPECTED_SIZE = 626
+EXPECTED_AMP_STATE_SIZE = 670
+#: 判别器状态向量里每个项的“单帧”维度（29 = G1 关节数）
+AMP_BASE_DIMS = {
+    "projected_gravity": 3,
+    "joint_pos_rel": 29,
+    "joint_vel_rel": 29,
+    "base_lin_vel": 3,
+    "base_ang_vel": 3,
+}
 
 #: 允许“仓库中无先例”的符号，但必须已经在代码里用 try/except 显式守卫。
 #: 值 = 理由。这类符号会在输出里记 ⚠️ 而不是 ❌。
@@ -45,7 +55,12 @@ ALLOWED_NEW_SYMBOLS = {
     "isaaclab.envs.mdp.UniformVelocityCommand":
         "仓库内只见过 mdp.UniformVelocityCommandCfg；类那一半无先例，已在 commands.py 用 "
         "try/except ImportError 守卫并给出可读报错",
+    "isaaclab.envs.mdp.joint_vel_rel":
+        "IsaacLab 标准 API，且上游 parkour 官方实现用了它；但 instinctlab 未转发，本仓库内无先例",
 }
+
+#: 目标文件里模块级的字面量常量表（用于解析 `(AMP_STATE_HISTORY, 3)` 这类写法）
+_CONSTS: dict[str, object] = {}
 
 _errors: list[str] = []
 _warns: list[str] = []
@@ -68,11 +83,32 @@ def parse(path: Path) -> ast.Module:
 
 
 def literal(node: ast.AST):
-    """把 AST 字面量（含一元负号 / tuple）转成 Python 值。"""
+    """把 AST 字面量（含一元负号 / tuple）转成 Python 值。
+
+    先试 `literal_eval`；不成则在本模块的常量表 `_CONSTS` 下求值，
+    以支持 `AMP_STATE_DIMS = ((AMP_STATE_HISTORY, 3), ...)` 这种引用。
+    """
     try:
         return ast.literal_eval(node)
     except Exception:
+        pass
+    try:
+        code = compile(ast.Expression(body=node), "<const>", "eval")
+        return eval(code, {"__builtins__": {}}, dict(_CONSTS))  # noqa: S307 - 仅用于解析本仓库常量
+    except Exception:
         return None
+
+
+def module_consts(tree: ast.Module) -> dict[str, object]:
+    """树里模块级的字面量常量（供上面的常量表求值）。"""
+    out: dict[str, object] = {}
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            try:
+                out[n.targets[0].id] = ast.literal_eval(n.value)
+            except Exception:
+                pass
+    return out
 
 
 def import_aliases(tree: ast.Module) -> dict[str, str]:
@@ -337,6 +373,42 @@ def self_authored_exports() -> set[str]:
     return {f"{pkg}.{n}" for n in top_level_names(parse(COMMANDS_PY))}
 
 
+def module_exports(module_path: str) -> set[str] | None:
+    """若该模块属于本仓库（`instinctlab.*`），返回它**实际**导出的名字集合；否则 None。
+
+    这比早先“该符号在仓库别处出现过”的启发式更强：直接看定义/转发是否真的存在。
+    跟随子包时必须存在显式 `from .<sub> import *`，否则“某子目录里有定义”
+    并不能证明 `pkg.name` 可用。
+    """
+    if not module_path.startswith("instinctlab."):
+        return None
+    base = INSTINCTLAB / module_path[len("instinctlab."):].replace(".", "/")
+    if base.is_dir():
+        init = base / "__init__.py"
+        if not init.is_file():
+            return None
+        init_src = init.read_text(encoding="utf-8")
+        names: set[str] = set()
+        for py in base.glob("*.py"):
+            try:
+                names |= top_level_names(parse(py))
+            except SyntaxError:
+                pass
+        for sub in sorted(base.iterdir()):
+            if sub.is_dir() and (sub / "__init__.py").is_file() \
+                    and f"from .{sub.name} import *" in init_src:
+                for py in sub.glob("*.py"):
+                    try:
+                        names |= top_level_names(parse(py))
+                    except SyntaxError:
+                        pass
+        return names
+    py = base.with_suffix(".py")
+    if py.is_file():
+        return top_level_names(parse(py))
+    return None
+
+
 def check_symbols() -> None:
     t = parse(TARGET)
     aliases = import_aliases(t)
@@ -346,38 +418,48 @@ def check_symbols() -> None:
     for node in ast.walk(t):
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             mod = aliases.get(node.value.id)
-            if mod:
-                used.setdefault(f"{mod}.{node.attr}", []).append(node.value.id)
+            if not mod:
+                continue
+            # 只审视“模块.名字”。末段非全小写的多半是被导入的**对象**
+            # （如 `G1_CFG.spawn`），不属于“模块符号”范畴。
+            if not mod.rsplit(".", 1)[-1].islower():
+                continue
+            used.setdefault(f"{mod}.{node.attr}", []).append(node.value.id)
 
-    print("C. 符号真实性（每个 <module>.<name> 必须在仓库其它处已出现过）")
+    print("C. 符号真实性（本仓库模块直接查定义；外部模块查仓库先例）")
     for sym in sorted(used):
-        if sym in proven:
+        mod, _, name = sym.rpartition(".")
+        exports = module_exports(mod)
+        if exports is not None:
+            ok = name in exports
+            print(f"   {'✅' if ok else '❌'} {sym}   [直接定义检查]")
+            if not ok:
+                err(f"C: `{mod}` 并未导出 `{name}`")
+        elif sym in proven:
             print(f"   ✅ {sym}")
         elif sym in ALLOWED_NEW_SYMBOLS:
             print(f"   ⚠️  {sym}  (已允许：{ALLOWED_NEW_SYMBOLS[sym]})")
         else:
             print(f"   ❌ {sym}")
-            err(f"C: 符号 `{sym}` 在仓库其它文件中从未出现 —— 无法证明其存在")
+            err(f"C: 符号 `{sym}` 无法证明其存在")
 
-    # 额外的高价值专项检查：instinctlab.envs.mdp 没有转发 base_lin_vel
-    mdp_exports = set()
-    for py in (INSTINCTLAB / "envs/mdp").rglob("*.py"):
-        try:
-            mdp_exports |= top_level_names(parse(py))
-        except SyntaxError:
-            pass
-    inst_lin = "instinctlab.envs.mdp.base_lin_vel" in {
-        f"instinctlab.envs.mdp.{n}" for n in mdp_exports
-    }
-    src = TARGET.read_text(encoding="utf-8")
-    if "instinct_mdp.base_lin_vel" in src and not inst_lin:
-        err("C: 使用了 instinct_mdp.base_lin_vel，但 instinctlab.envs.mdp 并未导出该名字")
+    # 专项检查：不得经 instinct_mdp 访问它**没有**导出的名字。
+    # （以前这里用子串判断，会被 `instinct_mdp.base_lin_vel_reference_as_state`
+    #  这种正确用法误伤，所以改成基于 AST 的精确属性访问检查。）
+    not_in_instinctlab = {"base_lin_vel", "joint_vel_rel"}
+    misuse = sorted({
+        node.attr
+        for node in ast.walk(t)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and aliases.get(node.value.id) == "instinctlab.envs.mdp"
+        and node.attr in not_in_instinctlab
+    })
+    if misuse:
+        err(f"C: 不应经 instinct_mdp 访问 {misuse}（instinctlab.envs.mdp 未导出这些名字）")
     else:
-        print("   ✅ base_lin_vel 取自 isaaclab 的 mdp（instinctlab 未转发，判断正确）")
-    if "instinct_mdp.base_lin_vel" in src:
-        err("C: 不应经 instinct_mdp 访问 base_lin_vel")
-    else:
-        print("   ✅ 未误用 instinct_mdp.base_lin_vel")
+        names = ", ".join(f"instinct_mdp.{n}" for n in sorted(not_in_instinctlab))
+        print(f"   ✅ 未误用 {names}（二者应取自 isaaclab.envs.mdp）")
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +558,11 @@ def _ann_fields(cls: ast.ClassDef) -> dict[str, str]:
     return out
 
 
+def _bases_of(classes: dict[str, ast.ClassDef], name: str) -> list[str]:
+    cls = classes.get(name)
+    return [ast.unparse(b) for b in cls.bases] if cls else []
+
+
 def check_wiring(tree: ast.Module) -> None:
     print("F. 配置接线")
     classes = class_defs(tree)
@@ -493,16 +580,25 @@ def check_wiring(tree: ast.Module) -> None:
          _ann_fields(env).get("observations") == "G1AmpWalkObservationsCfg"),
         ("env.commands     -> G1AmpWalkCommandsCfg",
          _ann_fields(env).get("commands") == "G1AmpWalkCommandsCfg"),
+        ("env.scene        -> G1AmpWalkSceneCfg",
+         _ann_fields(env).get("scene") == "G1AmpWalkSceneCfg"),
         ("obs.policy  -> G1AmpWalkPolicyObsCfg",
          _ann_fields(obs).get("policy") == "G1AmpWalkPolicyObsCfg"),
         ("obs.critic  -> G1FlatCriticObsCfg（本就含 base_lin_vel）",
          _ann_fields(obs).get("critic") == "G1FlatCriticObsCfg"),
+        ("obs.amp_policy    -> AmpPolicyStateObsCfg",
+         _ann_fields(obs).get("amp_policy") == "AmpPolicyStateObsCfg"),
+        ("obs.amp_reference -> AmpReferenceStateObsCfg",
+         _ann_fields(obs).get("amp_reference") == "AmpReferenceStateObsCfg"),
         ("_PLAY 继承 G1AmpWalkEnvCfg",
          "G1AmpWalkEnvCfg" in [ast.unparse(b) for b in env_play.bases]),
         ("_PLAY.scene 已改为 num_envs=1",
          "num_envs=1" in _play_scene_src(env_play)),
-        ("env 未覆盖 scene（必须继承 527 射线的高程图）",
-         "scene" not in _ann_fields(env)),
+        ("G1AmpWalkSceneCfg 继承 G1OmniLocoSceneCfg（继承 527 射线高程图）",
+         _bases_of(classes, "G1AmpWalkSceneCfg") == ["G1OmniLocoSceneCfg"]),
+        ("scene 含 motion_reference 传感器",
+         _ann_fields(classes["G1AmpWalkSceneCfg"]).get("motion_reference")
+         == "MotionReferenceManagerCfg"),
     ]
 
     # 速度指令：必须用方向分档类，而**不是** UniformVelocityCommandCfg
@@ -685,12 +781,130 @@ def check_command_envelope(tree: ast.Module) -> None:
 
 
 # ---------------------------------------------------------------------------
+# I. AMP 判别器状态：amp_policy / amp_reference 必须逐项同构
+# ---------------------------------------------------------------------------
+
+def _obs_term_spec(cls: ast.ClassDef) -> dict[str, dict]:
+    """提取一个 ObsGroup 里每个 ObsTerm 的关键参数。"""
+    out: dict[str, dict] = {}
+    for name, call in child_assignments(cls):
+        if call_func_name(call) != "ObsTerm":
+            continue
+        spec: dict = {"func": "", "history": None, "flatten": False, "scale": None}
+        for kw in call.keywords:
+            if kw.arg == "func":
+                spec["func"] = call_func_name(kw.value) if isinstance(kw.value, ast.Call) else (
+                    kw.value.id if isinstance(kw.value, ast.Name) else ast.unparse(kw.value))
+            elif kw.arg == "history_length":
+                spec["history"] = literal(kw.value)
+            elif kw.arg == "flatten_history_dim":
+                spec["flatten"] = bool(literal(kw.value))
+            elif kw.arg == "scale":
+                spec["scale"] = literal(kw.value)
+        out[name] = spec
+    return out
+
+
+def check_amp_state_isomorphism(tree: ast.Module) -> None:
+    """校验判别器两侧状态向量**逐项同构**。
+
+    为什么必须查：WASABI 在 `init_storage` 会断言 `amp_policy` 与 `amp_reference`
+    两侧的 `get_subobs_size` 相等；不等就直接报错。而“不等”很容易因为
+    改了 history_length / flatten / scale 而惄悄发生。
+    """
+    print("I. AMP 判别器状态同构（amp_policy vs amp_reference）")
+    classes = class_defs(tree)
+
+    # 1) 契约常量自洽
+    terms = assigned_dict(tree, "AMP_STATE_TERMS")
+    dims = assigned_dict(tree, "AMP_STATE_DIMS")
+    size = assigned_dict(tree, "AMP_STATE_SIZE")
+    hist = assigned_dict(tree, "AMP_STATE_HISTORY")
+    if not terms or not dims:
+        err("I: 找不到 AMP_STATE_TERMS / AMP_STATE_DIMS")
+        return
+    if not isinstance(hist, int) or hist <= 0:
+        err(f"I: AMP_STATE_HISTORY 解析失败（{hist!r}）")
+        return
+    print(f"   AMP_STATE_TERMS = {terms}")
+    print(f"   AMP_STATE_DIMS  = {dims}   (history={hist})")
+    if len(terms) != len(dims):
+        err(f"I: AMP_STATE_TERMS({len(terms)}) 与 AMP_STATE_DIMS({len(dims)}) 长度不一致")
+        return
+    if isinstance(size, int) and size != EXPECTED_AMP_STATE_SIZE:
+        err(f"I: AMP_STATE_SIZE={size} 期望 {EXPECTED_AMP_STATE_SIZE}")
+
+    # 按声明独立复算维度
+    recomputed = []
+    for t, d in zip(terms, dims):
+        base = AMP_BASE_DIMS.get(t)
+        if base is None:
+            err(f"I: 未知状态项 `{t}`，请在 AMP_BASE_DIMS 中补充其单帧维度")
+            return
+        self_flat = (len(d) == 1)
+        recomputed.append((base * hist,) if self_flat else (hist, base))
+    if tuple(recomputed) != tuple(tuple(d) for d in dims):
+        err(f"I: 独立复算的维度 {tuple(recomputed)} != 声明 {tuple(tuple(d) for d in dims)}")
+    else:
+        total = sum(math.prod(d) for d in dims)
+        print(f"   ✅ 独立复算维度一致，合计 {total}")
+        if isinstance(size, int) and size != total:
+            err(f"I: AMP_STATE_SIZE={size} != 复算总和 {total}")
+
+    # 2) 两侧逐项同构
+    p_cls, ref_cls = classes.get("AmpPolicyStateObsCfg"), classes.get("AmpReferenceStateObsCfg")
+    if not (p_cls and ref_cls):
+        err("I: 找不到 AmpPolicyStateObsCfg / AmpReferenceStateObsCfg")
+        return
+    pol, ref = _obs_term_spec(p_cls), _obs_term_spec(ref_cls)
+
+    if tuple(pol) != tuple(terms):
+        err(f"I: amp_policy 声明项 {tuple(pol)} != AMP_STATE_TERMS {tuple(terms)}")
+    if tuple(ref) != tuple(terms):
+        err(f"I: amp_reference 声明项 {tuple(ref)} != AMP_STATE_TERMS {tuple(terms)}")
+    if tuple(pol) != tuple(ref):
+        err(f"I: 两侧项集/顺序不同：policy={tuple(pol)} reference={tuple(ref)}")
+        return
+
+    for name in pol:
+        p, r = pol[name], ref[name]
+        tag = f"{name}"
+        for key in ("history", "flatten", "scale"):
+            if p[key] != r[key]:
+                err(f"I: 项 `{tag}` 的 {key} 不一致：policy={p[key]} reference={r[key]}")
+            else:
+                print(f"   ✅ {tag:18s} {key}={p[key]!r}")
+        expected_ref = f"{p['func'].rsplit('.', 1)[-1]}_reference_as_state"
+        if r["func"].rsplit(".", 1)[-1] != expected_ref:
+            err(f"I: 项 `{tag}` 参考侧应使用 `{expected_ref}`，实际 `{r['func']}`")
+        else:
+            print(f"   ✅ {tag:18s} {p['func']}  ↔  {r['func']}")
+
+    # 3) 参考动作目录确实存在
+    n_npz = len(list(MOTION_DIR.glob("*_retargeted.npz")))
+    print(f"   参考动作目录: {MOTION_DIR.relative_to(REPO)} （{n_npz} 个 npz）")
+    if n_npz == 0:
+        err("I: 参考动作目录里没有 *_retargeted.npz")
+    src = TARGET.read_text(encoding="utf-8")
+    if "motion_start_from_middle_range = (0.0, 0.0)" not in src:
+        err("I: 行走是循环步态，必须关闭 RSI（motion_start_from_middle_range = (0.0, 0.0)）")
+    else:
+        print("   ✅ 已关闭 RSI 随机起点（循环步态必需）")
+    if "motion_bin_length_s = None" not in src:
+        err("I: 行走应设 motion_bin_length_s = None（不切 bin，整段连续播放）")
+    else:
+        print("   ✅ motion_bin_length_s = None")
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     if not TARGET.is_file():
         print(f"找不到 {TARGET}")
         return 1
     tree = parse(TARGET)
+    _CONSTS.clear()
+    _CONSTS.update(module_consts(tree))
     print(f"目标: {TARGET.relative_to(REPO)}\n" + "=" * 72)
     check_dims(tree)
     print("-" * 72)
@@ -707,6 +921,8 @@ def main() -> int:
     check_scan_rays(tree)
     print("-" * 72)
     check_command_envelope(tree)
+    print("-" * 72)
+    check_amp_state_isomorphism(tree)
     print("=" * 72)
 
     for w in _warns:
