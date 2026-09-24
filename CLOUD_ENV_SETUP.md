@@ -576,3 +576,74 @@ and is being merged into right_ankle_roll_link` —— URDF 导入器的 `merge_
 这是**镜像里缺 pip 元数据**，不是缺包、也**不影响本任务**——第 3 层端到端冒烟退出码为 0
 就是最直接的证据。已把它降级为提示项（真正的裁决看第 3 层）。
 
+---
+
+## 11. 规模试跑：显存/吞吐实测与 `num_envs` 决策（2026-09-25）
+
+工具：`instinct/tools/cloud_scale_probe.sh <num_envs> <iters> [device]`
+摘要落到 `/root/scale_probe_<N>_summary.log`（多次试跑按 N 分文件，不互相覆盖）；
+`cloud_chain_probe.sh <目标N> <iters> <等待N>` 可链式跑多点。
+
+### 11.1 实测数据
+
+| num_envs | 显存峰值 | 稳态 `Iteration time` | 吞吐 | 退出码 | `foot_sep_mean` |
+|---|---|---|---|---|---|
+| 512 | **4010 MiB** | 2.23 s | ≈ 5 500 步/秒 | 0 | 0.2669 → 0.2187 |
+| 2048 | **7030 MiB** | 3.09–3.38 s | ≈ 14 500–15 900 步/秒 | 0 | 0.2393 |
+| **4096** | **11578 MiB** | 3.89–4.32 s | ≈ 22 700–25 300 步/秒 | 0 | 0.2306 |
+
+三轮都是 30 轮全部跑完；`foot_sep_mean` 全部落在数据集直线走区间内
+（实测中位 0.2140 / p1 0.1455）→ 步宽没有塌，退路 body 选得对。
+4096 那轮 GPU 利用率 **69%** ⇒ **瓶颈是 CPU（Core Usage Quota 14），不是显存**。
+
+### 11.2 显存拟合与 `num_envs` 决策
+
+三点最小二乘：
+
+$$\text{显存} \approx \underbrace{2843\ \text{MiB}}_{\text{固定开销（Kit/模型/判别器）}} + 2.117\ \text{MiB} \times N_{\text{envs}}$$
+
+（只用前两点是 `3003 + 1.966N`；拿它预测 4096 得 11.0 GB，实测 11.3 GB，偏差 4.7%。）
+
+⚠️ **教训：规模决策必须至少两个点。** 只看 512 那一个点做线性外推会得到
+「4096 环境需要 32 GB，24 GB 装不下」—— 因为**固定开销占了 512 那点的 75%**，
+把固定开销错算成了「每环境成本」。
+
+**决策：正式训练用 `num_envs = 4096`**（= 镜像推荐的规模）：显存 11.6 GB / 24 GB，
+留 52% 余量；且 GPU 利用率已到 69%，再放大只会撞 CPU 配额。
+按 ~4 s/轮算，`G1OmniLocoPPORunnerCfg` 默认的 **5000 轮 ≈ 5.6 小时**。
+
+### 11.4 正式训练的两阶段策略
+
+不直接烧 5.6 小时，先跑短程确认学习信号健康：
+
+```bash
+# 阶段 1：健康检查（300 轮 ≈ 20 min）
+bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk.sh 4096 300 cuda:0' /root/train_stage1_driver.log
+# 阶段 2：确认健康后再跑满 5000 轮
+bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk.sh 4096 5000 cuda:0' /root/train_full_driver.log
+```
+
+阶段 1 要看的健康指标（全部在 `Step/*` / `Train/*` / `Episode_Reward/*` 里）：
+
+| 指标 | 期望 | 不健康的含义 |
+|---|---|---|
+| `Train/mean_reward_0` | **上升** | 不升 → 奖励符号/权重或混合公式错 |
+| `Step/foot_sep_mean` | 稳在 **0.15–0.30** | 掉向 0 或变负 → 步宽惩罚过猛 / 退路 body 错 |
+| `Step/discriminator_reward` | 由 2.7 缓降但**不为 0** | 迅速为 0 → 判别器碾压策略，需降 `discriminator_reward_coef` |
+| `Step/amp_style_reward` | 稳在 **[0,1]** 且缓升 | 恒为 0/1 → `reward_type` 或判别器输出饱和 |
+| `Episode_Reward/feet_lateral_width` | 接近 0（饱和到 `max_cost` 说明一直在被罚） | 长期贴 `max_cost=0.1` → `sep_floor` 偏高 |
+| `Loss/discriminator_*` | 不发散、不 NaN | NaN → 降 `discriminator_optimizer_kwargs.lr` |
+
+### 11.3 观测/统计的 5 个坑（共同点是**都会骗人**）
+
+| 坑 | 现象 | 对策 |
+|---|---|---|
+| **Python 块缓冲**（最耗时间） | `train.sh ... >> log 2>&1` 时 stdout 默认块缓冲，日志**滞后数分钟**才落盘 → 反复轮询看不到进展，误判"训练卡住" | `export PYTHONUNBUFFERED=1`（`cloud_scale_probe.sh` / `cloud_train_amp_walk.sh` 都已加）。修后实测 20 s 内落盘 113 行 |
+| **摘要块自污染** | `{ echo …; grep -c 'X' "$LOG"; } >> "$LOG"` 中块内命令**边跑边写**：前面 `grep -E 'X' "$LOG" \| head -3` 刚写进去的行会被后面的 `grep -c 'X' "$LOG"` 数到（实测 **3 张表被数成 9**）| 摘要写**独立文件**，统计在污染前算完 |
+| **「轮数」口径错误**（会直接误导规模决策） | runner **每 10 轮才打一次表**，所以 `grep -c 'Iteration time'` 数的是**表格数不是轮数**；且 `total_timesteps` **只在打表时累加**，比真实步数**少 10 倍**。上一轮据此得出「只跑了 3 轮」的结论是错的（实际 30 轮全跑完）| 稳态吞吐统一用**最后一次 `Iteration time`**（它确实是"一轮"的墙钟时间）；标签写明"表格数（非轮数）" |
+| **GPU 采样行带时间戳前缀** | 行是 `HH:MM:SS 7030 MiB, 50 %` → `awk -F', '` 取 `$1` 得 `00:23:53 7030 MiB`，`$1+0` 恒为 0 → 峰值打印成空 | `grep -oE '[0-9]+ MiB' \| awk '{…}'` |
+| **框架自身的提示文字被当成异常** | runner 会打印 ``NOTE: you may see a bunch of `NaN or Inf found in input tensor` once …``，含 "NaN" → 异常 grep 误报 | 排掉 `NOTE:` 行；异常检索只留 `Traceback\|KeyError\|RuntimeError\|out of memory\|CUDA error` |
+
+另：`pgrep -f <pattern>` / `pkill -f <pattern>` 会匹配到**自己也含该字符串**的进程
+（包括你当前这条 SSH 命令行），必须用 `[s]cale_probe.sh` 括号技巧。
+

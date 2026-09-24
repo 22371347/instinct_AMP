@@ -63,7 +63,11 @@ echo "=== 训练退出码 $RC  ($(date '+%F %T')) ===" >> "$LOG"
 {
   echo "======== 摘要 num_envs=$INST iters=$ITERS ========"
   echo "退出码: $RC   （0 才算跑完；非 0 看上方 traceback）"
-  echo "显存峰值: $(awk -F', ' '{gsub(/ MiB/,"",$1); if ($1+0>m) m=$1+0} END{print m" MiB"}' "$GPULOG")"
+  # ⚠️ GPU 采样行是 `HH:MM:SS <used> MiB, <util> %`（**带时间戳前缀**）。
+  # 前面用 awk -F', ' 取 $1 会得到 "00:23:53 7030 MiB"，$1+0 恒为 0 → 打印为空。
+  # 改成直接抽出 "<数字> MiB" 再取最大。
+  echo "显存峰值: $(grep -oE '[0-9]+ MiB' "$GPULOG" | awk '{if ($1+0 > m) m = $1+0} END{print m+0" MiB"}')"
+  echo "显存采样点数: $(wc -l < "$GPULOG")"
   echo
   echo "--- 每轮耗时（最后一次最接近稳态）---"
   grep -E 'Iteration time' "$LOG" | sed 's/^\s*/     /'
@@ -80,7 +84,10 @@ echo "=== 训练退出码 $RC  ($(date '+%F %T')) ===" >> "$LOG"
   grep -E '\[AMP-WALK PASS\]|Mean episode|Mean step foot_sep_mean|Mean step amp_style_reward|Mean step discriminator_reward' "$LOG" | tail -8 | sed 's/^\s*/     /'
   echo
   echo "--- 异常检索 ---"
-  grep -nE 'Traceback|KeyError|RuntimeError|out of memory|NaN' "$LOG" | head -5 | sed 's/^/     /' || echo "     无"
+  # ⚠️ 必须排掉框架自己那句 `NOTE: you may see a bunch of \`NaN or Inf found in input
+  # tensor\` once...`——它只是提示，但含 "NaN" 字样，会被当成异常误报。
+  _bad=$(grep -nE 'Traceback|KeyError|RuntimeError|out of memory|CUDA error' "$LOG" | head -5)
+  if [[ -n "$_bad" ]]; then echo "$_bad" | sed 's/^/     /'; else echo "     无"; fi
 } > "$SUM"
 
 # 摘要也附到主日志末尾，但并不影响 $SUM 里的计数（它们已算完）

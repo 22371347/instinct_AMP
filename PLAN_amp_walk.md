@@ -699,6 +699,64 @@ aux 系数名咬合、`amp_style_reward_coef=0`、以及**把 λ/c 代进两条�
 > 去揀系数的 —— **键名与参数名一旦不咬合，系数会静默变成 1.0，整套公式差一个因子 $c$**。
 >
 > 原以为“最大的实际工作量在参考动作数据格式转换”——**实测后已被证伪**：转换器一天内写完并全部通过 FK 验证（误差 ≤1e-6 m），四元数无需翻转、速度无需手工补、关节序无需重排。真正的风险集中在**数据集速度包络**与**奖励混合的数值一致性**上。
+
+---
+
+## 8. 实测结果与正式训练配置（步骤⑦⑧，2026-09-25）
+
+### 8.1 步骤⑦：云端端到端冒烟 —— **全绿**（commit `81de929`）
+
+`--num_envs 16 --max_iterations 2 --device cuda:0`：训练**退出码 0**、
+`[AMP-WALK PASS] policy=626 rewards=21`、判别器建成（670→1024/512→1）、
+`Step/foot_sep_mean = 0.2411`、`foot_cross_frac = 0`。
+
+冒烟抓到 **1 个真 bug**（会让训练在首轮迭代就崩）：诊断量原先写
+`env.extras["log"]`，而 IsaacLab 的 `ManagerBasedRLEnv._reset_idx` 会把它
+**整体替换**（且只在「本 step 有 env 终止」时执行），于是 `ep_infos` 各条 dict
+的 key 集合有的带、有的不带，而 `OnPolicyRunner.log()` 是拿 `ep_infos[0]` 的 key
+去索引**全部** dict → `KeyError`。改走 `env.extras["step"]`（同一 dict 对象、
+永不替换）。**细节与「Step/* 是瞬时值不是轮内均值」的副作用见
+`CLOUD_ENV_SETUP.md` §10.3。**
+
+### 8.2 规模试跑与 `num_envs` 决策
+
+| num_envs | 显存峰值 | 稳态迭代耗时 | 吞吐 |
+|---|---|---|---|
+| 512 | 4010 MiB | 2.23 s | ≈5 500 步/秒 |
+| 2048 | 7030 MiB | 3.09–3.38 s | ≈14 500–15 900 步/秒 |
+| **4096** | **11578 MiB** | 3.89–4.32 s | ≈22 700–25 300 步/秒 |
+
+拟合：$\text{显存} \approx 2843 + 2.117\,N$ MiB。
+⚠️ 只用 512 单点外推会得出「4096 要 32 GB 会爆」——**固定开销占 512 那点的 75%**，
+规模决策必须至少两个点（详见 `CLOUD_ENV_SETUP.md` §11.2）。
+
+**定档**：`num_envs = 4096`（11.6 GB / 24 GB，GPU 利用率 69% → 瓶颈是 CPU 配额 14 核）。
+按 ~4 s/轮，`G1OmniLocoPPORunnerCfg` 默认 **`max_iterations = 5000` ≈ 5.6 小时**。
+
+### 8.3 步骤⑨：正式训练（两阶段，避免白烧 5.6 小时）
+
+```bash
+# 阶段 1：健康检查 300 轮（≈20 min）
+bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk.sh 4096 300 cuda:0' /root/train_stage1_driver.log
+# 阶段 2：确认健康后跑满 5000 轮
+bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk.sh 4096 5000 cuda:0' /root/train_full_driver.log
+```
+
+阶段 1 的健康判据（阈值型/风格型两处最容易出问题的量都覆盖到了）：
+
+| 指标 | 期望 | 不健康的含义 |
+|---|---|---|
+| `Train/mean_reward_0` | **上升** | 不升 → 奖励符号/权重或混合公式错 |
+| `Step/foot_sep_mean` | 稳在 **0.15–0.30** | 掉向 0 或变负 → 步宽惩罚过猛 / 退路 body 错 |
+| `Step/discriminator_reward` | 由 2.7 缓降但**不为 0** | 迅速为 0 → 判别器碾压策略，降 `discriminator_reward_coef` |
+| `Step/amp_style_reward` | 稳在 **[0,1]** 且缓升 | 恒 0/1 → `reward_type` 或判别器输出饱和 |
+| `Episode_Reward/feet_lateral_width` | 接近 0 | 长期贴 `max_cost=0.1` → `sep_floor` 偏高 |
+
+### 8.4 步骤⑨ 之后（尚未开始）
+
+1. **看策略行为**：`play.sh --task Instinct-Amp-Walk-G1-Play-v0`（本地做不了，需云端 GUI/录像）。
+2. **越障奖励融合**：把 AMP 风格先验与感知越障任务合起来（用户总目标里的「单一固定越障 + 行走」）。
+3. **蒸馏**：本策略作教师 → 学生（参考 `VaePpoDistill` 那条链路）。
 >
 > 步骤⑦ 补上第六条：**「静态检查全过」和「真能训起来」之间还隔着一层框架约定**。
 > 我们写的诊断量在纯 Python 里怎么测都对，却因为 IsaacLab 的 `_reset_idx` 会把
