@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""G1 AMP 行走训练曲线（在**云端**生成 PNG，再由本地脚本拉回来看）。
+
+设计蓝本：`AMP_mjlab/tools/plot_rewards.py`，保留它几个真正好用的做法：
+  1. 参数化实验目录；**只认时间戳 run 目录**（`^\\d{8}_`），过滤 `_bak`/`params`/`git`
+     之类非训练目录 —— AMP_mjlab 曾因为 `_` 的 ASCII 比数字大、备份目录排到末尾
+     被当成 LATEST，画出一张完全不符实际的曲线。
+  2. 两种模式：`resume` = 只画最新 run（快，监控用）；`full` = 合并历史 run，
+     重叠 step 取较新者（跨 run 连续，避免续训造成断层）。
+  3. **逐子图独立容错**：缺某个 tag 就显示 "no data"，绝不让整张图失败。
+
+相对蓝本做的三处改进：
+  A. **EventAccumulator 按 run 缓存**（蓝本每次 `_series()` 都新建一个，90+ 个 tag
+     就要把整个 events 文件重读 90 遍）。
+  B. **先把 events 文件拷到 /tmp 再读**：训练正在写这个文件，
+     直接读偶发「最后一条记录被截断」的解析报错。
+  C. 新增第 04 张「步宽/交叉专项」图与文末文本摘要 —— 这两项是本次迁移最关键的
+     设计风险点（见 PLAN_amp_walk.md §3.7）。
+
+⚠️ **本仓库的奖励混合公式与 AMP_mjlab 不同**（见 PLAN §4.2）：
+      本仓库（`WasabiPPOAmpMix`，lerp 模式）:  R = λ·r_task + (1-λ)·c·r_amp
+      AMP_mjlab                            :  R = (1-lerp)·disc + lerp·task
+   形式同构，但**风格项额外乘一个 c**（`discriminator_reward_coef=0.1`），
+   所以实际风格权重是 (1-λ)·c = 0.025，**不是** (1-λ) = 0.25。
+   第 05 图按本仓库的口径拆解，并把 λ 与 c 都标在标题上，防止误读。
+
+环境变量（全都有默认值，按需覆盖）：
+  LLP_LOG_ROOT   日志根目录，默认 /root/gpufree-data/instinct_xu/logs/instinct_rl/g1_amp_walk
+  LLP_OUT        resume 模式输出目录
+  LLP_OUT_FULL   full 模式输出目录
+  LLP_LATEST     显式指定 run 目录（跳过自动取最新）
+  LLP_OLD_RUN    full 模式合并起点（run 目录名子串，可选）
+  LLP_SKIP_FULL  =1 时跳过 full 模式（跨 run 合并慢，监控循环建议开）
+  LLP_LERP       λ，默认 0.75
+  LLP_C          c，默认 0.1
+  LLP_EP_LEN_S   episode_length_s，默认 20.0（flat_env_cfg.py 里是 20.0）
+  LLP_NUM_REWARDS 奖励组数，默认 1（本任务没走 MultiRewardCfg）
+  LLP_SMOOTH     平滑窗，默认 100
+  LLP_DPI        出图 DPI，默认 130
+
+用法：
+  python plot_training.py                # 出全部图（resume + full）
+  python plot_training.py --list-tags    # 只列出「最新 run 里真实存在的 tag」再退出
+  LLP_SKIP_FULL=1 python plot_training.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import shutil
+import sys
+import tempfile
+
+import numpy as np
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# 配置
+# ---------------------------------------------------------------------------
+
+LOG_ROOT = os.environ.get(
+    "LLP_LOG_ROOT", "/root/gpufree-data/instinct_xu/logs/instinct_rl/g1_amp_walk"
+)
+OUT_RESUME = os.environ.get(
+    "LLP_OUT", "/root/gpufree-data/instinct_xu/logs/instinct_rl/plots"
+)
+OUT_FULL = os.environ.get(
+    "LLP_OUT_FULL", "/root/gpufree-data/instinct_xu/logs/instinct_rl/plots_full"
+)
+LATEST_OVERRIDE = os.environ.get("LLP_LATEST", "")
+OLD_RUN = os.environ.get("LLP_OLD_RUN", "")
+SKIP_FULL = os.environ.get("LLP_SKIP_FULL", "") != ""
+LERP = float(os.environ.get("LLP_LERP", "0.75"))
+C_COEF = float(os.environ.get("LLP_C", "0.1"))
+EP_LEN_S = float(os.environ.get("LLP_EP_LEN_S", "20.0"))
+NUM_REWARDS = int(os.environ.get("LLP_NUM_REWARDS", "1"))
+SMOOTH = int(os.environ.get("LLP_SMOOTH", "100"))
+DPI = int(os.environ.get("LLP_DPI", "130"))
+
+# `Episode_Reward/*` 全量候选（21 项 = 本任务 RewardManager 的 active_terms）。
+# 缺失项由 `available_reward_tags()` 动态过滤 —— 以后删/改奖励项不会打断绘图。
+REWARD_TAGS = [
+    "Episode_Reward/track_lin_vel_xy_exp",
+    "Episode_Reward/track_ang_vel_z_exp",
+    "Episode_Reward/track_base_height",
+    "Episode_Reward/body_ang_vel_xy",
+    "Episode_Reward/track_default_pose_on_stand",
+    "Episode_Reward/feet_lateral_width",
+    "Episode_Reward/feet_crossing",
+    "Episode_Reward/feet_slide",
+    "Episode_Reward/feet_air_time",
+    "Episode_Reward/flat_orientation_l2",
+    "Episode_Reward/stand_still",
+    "Episode_Reward/dof_pos_limits",
+    "Episode_Reward/joint_deviation_hip",
+    "Episode_Reward/joint_deviation_arms",
+    "Episode_Reward/joint_deviation_torso",
+    "Episode_Reward/joint_deviation_knee",
+    "Episode_Reward/lin_vel_z_l2",
+    "Episode_Reward/action_rate_l2",
+    "Episode_Reward/dof_acc_l2",
+    "Episode_Reward/dof_torques_l2",
+    "Episode_Reward/termination_penalty",
+]
+
+# 步宽标定值（来自 instinct/tools/calibrate_foot_sep.py 的实测，见 PLAN §3.7）
+SEP_FLOOR = 0.145
+SEP_DATASET_MEDIAN = 0.2140
+
+
+# ---------------------------------------------------------------------------
+# run 发现
+# ---------------------------------------------------------------------------
+
+
+def discover_runs() -> list[str]:
+    """只返回**训练 run** 目录（时间戳开头），已排序。"""
+    all_dirs = sorted(glob.glob(os.path.join(LOG_ROOT, "*", "")))
+    ts_re = re.compile(r"^\d{8}_")
+    runs = [d for d in all_dirs if ts_re.match(os.path.basename(os.path.normpath(d)))]
+    if not runs:
+        raise SystemExit(
+            f"未找到训练目录: {LOG_ROOT}\n"
+            f"  （目录下现有: {[os.path.basename(os.path.normpath(d)) for d in all_dirs]}）"
+        )
+    return runs
+
+
+# ---------------------------------------------------------------------------
+# TensorBoard 读取（带缓存 + 拷贝避免读写竞争）
+# ---------------------------------------------------------------------------
+
+_ACC_CACHE: dict[str, EventAccumulator] = {}
+_TMP_DIR = tempfile.mkdtemp(prefix="llp_tb_")
+
+
+def _accumulator(run_dir: str) -> EventAccumulator | None:
+    """读一个 run 的 EventAccumulator（缓存）。
+
+    ⚠️ 训练正在往这个 events 文件里写，直接读偶尔会碰到「最后一条记录只写了一半」
+    导致解析报错。所以先拷到 /tmp 再读 —— 快照一致，且不干扰训练。
+    """
+    key = os.path.normpath(run_dir)
+    if key in _ACC_CACHE:
+        return _ACC_CACHE[key]
+    files = sorted(glob.glob(os.path.join(run_dir, "events.out.tfevents.*")))
+    if not files:
+        _ACC_CACHE[key] = None  # type: ignore[assignment]
+        return None
+    src = files[-1]  # 取最新的一个 events 文件
+    dst = os.path.join(_TMP_DIR, os.path.basename(key) + "_" + os.path.basename(src))
+    try:
+        shutil.copy2(src, dst)
+    except OSError:
+        dst = src  # 拷不动就直接读原文件（降级，不是错误）
+    acc = EventAccumulator(dst, size_guidance={"scalars": 0})
+    try:
+        acc.Reload()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Reload 失败 {key}: {type(exc).__name__}: {exc}")
+        _ACC_CACHE[key] = None  # type: ignore[assignment]
+        return None
+    _ACC_CACHE[key] = acc
+    return acc
+
+
+def available_tags(run_dir: str) -> list[str]:
+    acc = _accumulator(run_dir)
+    return [] if acc is None else list(acc.Tags().get("scalars", []))
+
+
+def _series(run_dir: str, tag: str, clip: float | None = None):
+    """读单 run 一条标量曲线。缺 tag / 空数据都返回空数组，不抛异常。"""
+    acc = _accumulator(run_dir)
+    if acc is None:
+        return np.array([]), np.array([])
+    try:
+        evs = acc.Scalars(tag)
+    except KeyError:
+        return np.array([]), np.array([])
+    steps = np.array([e.step for e in evs], dtype=float)
+    vals = np.array([e.value for e in evs], dtype=float)
+    finite = np.isfinite(vals)
+    steps, vals = steps[finite], vals[finite]
+    if clip is not None and len(vals) > 0:
+        keep = np.abs(vals) < clip
+        steps, vals = steps[keep], vals[keep]
+    return steps, vals
+
+
+def _merge(run_dirs: list[str], tag: str, clip: float | None = None):
+    """合并多个 run 的同一条曲线；step 重叠时**取较新 run**（与蓝本一致）。"""
+    parts_s, parts_v, parts_i = [], [], []
+    for i, d in enumerate(run_dirs):
+        s, v = _series(d, tag, clip)
+        if len(s) == 0:
+            continue
+        parts_s.append(s)
+        parts_v.append(v)
+        parts_i.append(np.full(len(s), i))
+    if not parts_s:
+        return np.array([]), np.array([])
+    steps = np.concatenate(parts_s)
+    vals = np.concatenate(parts_v)
+    order = np.argsort(steps, kind="stable")
+    steps, vals = steps[order], vals[order]
+    # 同一 step 出现多次 → 只保留最后一次出现（即较新 run 覆盖旧的）
+    keep = np.ones(len(steps), dtype=bool)
+    seen = set()
+    for i in range(len(steps) - 1, -1, -1):
+        if steps[i] in seen:
+            keep[i] = False
+        else:
+            seen.add(steps[i])
+    steps, vals = steps[keep], vals[keep]
+    order = np.argsort(steps)
+    return steps[order], vals[order]
+
+
+def smooth_series(steps, vals, window: int):
+    if window <= 1 or len(vals) < 5:
+        return steps, vals
+    w = max(min(window, len(vals) // 5), 1)
+    if w <= 1:
+        return steps, vals
+    return steps[w - 1:], np.convolve(vals, np.ones(w) / w, mode="valid")
+
+
+def _align_to(steps_target, series_list):
+    """把多条 (steps, vals) 用线性插值对齐到 steps_target 后求和。"""
+    total = np.zeros(len(steps_target), dtype=float)
+    for s, v in series_list:
+        if len(v) == 0:
+            continue
+        total = total + np.interp(steps_target, s, v, left=v[0], right=v[-1])
+    return total
+
+
+# ---------------------------------------------------------------------------
+# 绘图
+# ---------------------------------------------------------------------------
+
+
+class Plotter:
+    def __init__(self, mode: str, outdir: str, runs: list[str], latest: str):
+        self.mode = mode
+        self.outdir = outdir
+        self.runs = runs          # full 模式要合并的 run 列表
+        self.latest = latest
+        self.tags_cache: list[str] | None = None
+        os.makedirs(outdir, exist_ok=True)
+
+    # --- 取数 ---
+    def get(self, tag: str, smooth: int | None = None, clip: float | None = None):
+        # ⭐ clip 默认 **不裁剪**。蓝本对每张图都传 clip=1000，结果把
+        # `Perf/total_fps`（真实值 ~24000）整个裁成空 → 图上显示 no data。
+        # 尖峰问题改用「_panel 里按分位数设 y 轴范围」解决（保留全部数据不丢）。
+        if self.mode == "resume":
+            s, v = _series(self.latest, tag, clip)
+        else:
+            s, v = _merge(self.runs, tag, clip)
+        return smooth_series(s, v, SMOOTH if smooth is None else smooth)
+
+    def tags(self) -> list[str]:
+        if self.tags_cache is None:
+            t = set()
+            for d in ([self.latest] if self.mode == "resume" else self.runs):
+                t.update(available_tags(d))
+            self.tags_cache = sorted(t)
+        return self.tags_cache
+
+    def find(self, substr: str, *, exclude: str | None = None) -> str | None:
+        """按子串找 tag（用于不确定精确名字的量）。"""
+        for t in self.tags():
+            if substr in t and (exclude is None or exclude not in t):
+                return t
+        return None
+
+    def latest_value(self, tag: str):
+        s, v = self.get(tag, smooth=1)
+        return (float(s[-1]), float(v[-1])) if len(v) else (None, None)
+
+    # --- 出图 ---
+    def save(self, fig, name: str):
+        path = os.path.join(self.outdir, name)
+        fig.savefig(path, dpi=DPI, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[INFO][{self.mode}] 已保存: {path}")
+
+    def _panel(self, ax, tag, title, *, smooth=None, hlines=(), color=None, clip=None):
+        s, v = self.get(tag, smooth=smooth, clip=clip) if tag else (np.array([]), np.array([]))
+        if len(v) == 0:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=10)
+        else:
+            ax.plot(s, v, lw=1.2, color=color)
+            # 尖峰不丢数据，但把 y 轴限在 0.5~99.5 分位内，否则一个异常值会把整图拉爆
+            # （比蓝本的 clip=1000 好：既能保护视图，又不会把 FPS 这类大值裁成空）
+            if len(v) > 10:
+                lo, hi = np.nanpercentile(v, [0.5, 99.5])
+                pad = 0.08 * (hi - lo) + 1e-9
+                ax.set_ylim(lo - pad, hi + pad)
+        for y, lab, sty in hlines:
+            ax.axhline(y, ls=sty, lw=0.9, color="0.45")
+            ax.text(0.99, y, " " + lab, transform=ax.get_yaxis_transform(),
+                    ha="right", va="bottom", fontsize=7, color="0.35")
+        ax.set_title(title)
+        ax.set_xlabel("iteration")
+        ax.grid(alpha=0.3)
+
+    def fig_overview(self):
+        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+        fig.suptitle(f"AMP Walk Training Overview [{'latest' if self.mode == 'resume' else 'full'}]"
+                     f"  {os.path.basename(os.path.normpath(self.latest))}", fontsize=13)
+        self._panel(axes[0, 0], f"Train/mean_reward_{0}", "Mean Reward (episode total)")
+        self._panel(axes[0, 1], "Train/mean_episode_length", "Episode Length (steps)")
+        self._panel(axes[1, 0], "Loss/amp_total_loss", "AMP Total Loss")
+        self._panel(axes[1, 1], "Policy/mean_noise_std", "Action Noise Std")
+        self.save(fig, "01_overview.png")
+
+    def fig_reward_terms(self):
+        tags = [t for t in REWARD_TAGS if self.latest_value(t)[1] is not None or
+                (self.mode == "full" and any(len(_series(d, t)[1]) for d in self.runs))]
+        n = max(len(tags), 1)
+        cols = 3
+        rows = (n + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, figsize=(16, 2.8 * rows), squeeze=False)
+        fig.suptitle(f"Per-Reward-Term Convergence (smooth={SMOOTH})", fontsize=13)
+        for i, tag in enumerate(tags):
+            self._panel(axes.flat[i], tag, tag.replace("Episode_Reward/", ""))
+            axes.flat[i].set_title(tag.replace("Episode_Reward/", ""), fontsize=9)
+        for j in range(len(tags), rows * cols):
+            axes.flat[j].axis("off")
+        if not tags:
+            axes[0, 0].text(0.5, 0.5, "no reward data", ha="center", va="center",
+                            transform=axes[0, 0].transAxes)
+        self.save(fig, "02_reward_terms.png")
+
+    def fig_amp_diagnostics(self):
+        fig, axes = plt.subplots(2, 3, figsize=(20, 9))
+        fig.suptitle("AMP Discriminator Diagnostics", fontsize=13)
+        for ax, (tag, title) in zip(axes.flat, [
+            ("Loss/discriminator_loss", "discriminator_loss"),
+            ("Loss/discriminator_gradient_penalty", "discriminator_gradient_penalty"),
+            ("Loss/discriminator_weight_decay", "discriminator_weight_decay"),
+            ("Loss/logit_weight_decay", "logit_weight_decay"),
+            ("Step/discriminator_reward", "discriminator_reward (aux, this repo)"),
+            ("Step/amp_style_reward", "amp_style_reward = r_amp (log only, quad in [0,1])"),
+        ]):
+            self._panel(ax, tag, title, smooth=50)
+        self.save(fig, "03_amp_diagnostics.png")
+
+    def fig_foot_diagnostics(self):
+        """⭐ 本任务最关键的设计风险点：步宽地板 / 交叉惩罚是否真的在起作用。
+
+        `foot_sep_mean` 是「脚距在 root 偏航系下的横向间距」，同时充当
+        **脚部参考 body 是否选对**的在线自检（退路是 *_ankle_roll_link）。
+        """
+        fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+        fig.suptitle("Foot Separation / Crossing Diagnostics  "
+                     f"(sep_floor={SEP_FLOOR}, dataset median={SEP_DATASET_MEDIAN})", fontsize=13)
+        self._panel(
+            axes[0, 0], "Step/foot_sep_mean",
+            "foot_sep_mean (expect 0.15~0.30)",
+            smooth=50,
+            hlines=[(SEP_FLOOR, f"sep_floor={SEP_FLOOR}", "--"),
+                    (SEP_DATASET_MEDIAN, f"dataset median {SEP_DATASET_MEDIAN}", ":")],
+        )
+        self._panel(axes[0, 1], "Step/foot_cross_frac",
+                    "foot_cross_frac (straight walk ~0; sideways may >0)", smooth=50)
+        self._panel(axes[1, 0], "Episode_Reward/feet_lateral_width",
+                    "Episode_Reward/feet_lateral_width (narrow-stance penalty)")
+        self._panel(axes[1, 1], "Episode_Reward/feet_crossing",
+                    "Episode_Reward/feet_crossing (true crossing penalty)")
+        self.save(fig, "04_foot_diagnostics.png")
+
+    def fig_terminations_perf(self):
+        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+        fig.suptitle("Terminations / Perf / Velocity Tracking", fontsize=13)
+        self._panel(axes[0, 0], "Episode_Termination/base_contact",
+                    "Termination: base_contact (should drop below 0.1)")
+        self._panel(axes[0, 1], "Episode_Termination/time_out", "Termination: time_out")
+        self._panel(axes[1, 0], "Perf/total_fps", "FPS (steps/s)")
+        self._panel(axes[1, 1], self.find("error_vel_xy") or "Episode/Metrics/base_velocity/error_vel_xy",
+                    "linear velocity tracking error (lower is better)")
+        self.save(fig, "05_terminations_perf.png")
+
+    def fig_amp_task_split(self):
+        """最终奖励里 task 与 AMP 风格各占多少。
+
+        本仓库：R = λ·r_task + (1-λ)·c·r_amp
+          - r_task（episode 总任务奖励）= ep_len_s × Σ Episode_Reward/*
+            （Episode_Reward/* 是"每秒平均"，与 Train/mean_reward 同口径需乘 ep_len_s）
+          - task 贡献 = λ · r_task
+          - 风格贡献 = R − λ·r_task           （= (1-λ)·c·r_amp）
+        ⚠️ λ=0.75 不代表风格占 25%：实际风格权重是 (1-λ)·c。
+        """
+        s_fin, v_fin = self.get(f"Train/mean_reward_{0}", smooth=1)
+        if len(v_fin) == 0:
+            print(f"[INFO][{self.mode}] 05 无 Train/mean_reward 数据，跳过")
+            return
+        parts = []
+        for t in REWARD_TAGS:
+            s, v = self.get(t, smooth=1)
+            if len(v):
+                parts.append((s, v))
+        v_task_raw = _align_to(s_fin, parts) * EP_LEN_S      # 每秒率 → episode 总奖励
+        task_contrib = LERP * v_task_raw
+        amp_contrib = v_fin - task_contrib
+
+        s_s, v_fin_s = smooth_series(s_fin, v_fin, 100)
+        _, v_task_s = smooth_series(s_fin, task_contrib, 100)
+        _, v_amp_s = smooth_series(s_fin, amp_contrib, 100)
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        fig.suptitle(
+            f"AMP vs Task Share in Final Reward   (λ={LERP}, c={C_COEF}"
+            f" → 风格权重 (1-λ)·c={ (1 - LERP) * C_COEF :.4f})", fontsize=13)
+
+        ax = axes[0]
+        ax.plot(s_s, v_fin_s, lw=1.5, color="k", label="final (Train/mean_reward_0)")
+        ax.plot(s_s, v_task_s, lw=1.2, color="tab:blue", label=f"task contrib (λ·r_task)")
+        ax.plot(s_s, v_amp_s, lw=1.2, color="tab:orange", label="AMP contrib (R − λ·r_task)")
+        ax.set_title("Contribution Magnitude (episode sum)")
+        ax.set_xlabel("iteration")
+        ax.set_ylabel("reward")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+
+        ax = axes[1]
+        denom = np.abs(v_fin_s)
+        valid = denom > 1e-6
+        p_task = np.where(valid, np.clip(v_task_s / np.maximum(denom, 1e-6), 0, 1), np.nan)
+        p_amp = np.where(valid, np.clip(v_amp_s / np.maximum(denom, 1e-6), 0, 1), np.nan)
+        ax.fill_between(s_s, 0, np.nan_to_num(p_task) * 100, color="tab:blue",
+                        alpha=0.6, label="task %")
+        ax.fill_between(s_s, np.nan_to_num(p_task) * 100,
+                        np.nan_to_num(p_task + p_amp) * 100, color="tab:orange",
+                        alpha=0.6, label="AMP %")
+        ax.set_ylim(0, 100)
+        ax.set_title("Share in Final Reward (%)")
+        ax.set_xlabel("iteration")
+        ax.set_ylabel("percent")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=9)
+        self.save(fig, "06_amp_task_split.png")
+
+    # --- 文本摘要 ---
+    def digest(self) -> list[str]:
+        rows = []
+        for tag, label, hint in [
+            (f"Train/mean_reward_{0}", "平均回报（episode 总）", "应上升"),
+            ("Train/mean_episode_length", "平均回合长度（步）", "应上升：几十→几百→上千"),
+            ("Train/median_episode_length", "中位回合长度（步）", ""),
+            ("Episode_Termination/base_contact", "触地终止比例", "应下降到 <0.1"),
+            ("Episode_Termination/time_out", "超时终止比例", "应上升（能站住）"),
+            ("Step/foot_sep_mean", "脚距均值", f"应稳在 0.15~0.30（floor={SEP_FLOOR}）"),
+            ("Step/foot_cross_frac", "真交叉帧占比", "直线走≈0（侧移允许>0）"),
+            ("Step/discriminator_reward", "判别器奖励（aux）", "缓降但不应为 0"),
+            ("Step/amp_style_reward", "r_amp（quad∈[0,1]）", ""),
+            ("Loss/discriminator_loss", "判别器损失", "不发散/不为 NaN"),
+            ("Policy/mean_noise_std", "动作噪声 std", "缓慢下降"),
+            ("Perf/total_fps", "FPS", ""),
+        ]:
+            step, val = self.latest_value(tag)
+            rows.append((label, tag, step, val, hint))
+        return rows
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--list-tags", action="store_true",
+                    help="只打印最新 run 里真实存在的 scalar tag 再退出")
+    args = ap.parse_args()
+
+    runs = discover_runs()
+    latest = os.path.normpath(LATEST_OVERRIDE) if LATEST_OVERRIDE else runs[-1]
+    if LATEST_OVERRIDE and os.path.normpath(LATEST_OVERRIDE) not in \
+            [os.path.normpath(r) for r in runs]:
+        print(f"[WARN] LLP_LATEST={LATEST_OVERRIDE} 不在时间戳 run 列表里，仍按它读")
+
+    print(f"[INFO] LOG_ROOT = {LOG_ROOT}")
+    print(f"[INFO] run 数 = {len(runs)}；最新 = {os.path.basename(os.path.normpath(latest))}")
+
+    if args.list_tags:
+        tags = available_tags(latest)
+        print(f"[INFO] 最新 run 的 scalar tag 共 {len(tags)} 个：")
+        for t in tags:
+            print("   ", t)
+        return 0
+
+    old_idx = 0
+    if OLD_RUN:
+        for i, r in enumerate(runs):
+            if OLD_RUN in r:
+                old_idx = i
+                break
+    full_runs = runs[old_idx:]
+    print(f"[INFO] full 模式合并 run 数 = {len(full_runs)}")
+
+    for mode, outdir, suffix in (("resume", OUT_RESUME, "(latest)"), ("full", OUT_FULL, "(full)")):
+        if mode == "full" and SKIP_FULL:
+            print("[INFO] LLP_SKIP_FULL=1，跳过 full 模式")
+            continue
+        if mode == "full" and len(full_runs) == 1:
+            print("[INFO] 只有 1 个 run，full 模式与 resume 等价，跳过")
+            continue
+        print(f"======== 生成 {mode} 曲线 -> {outdir} ========")
+        p = Plotter(mode, outdir, full_runs, latest)
+        for fn in (p.fig_overview, p.fig_reward_terms, p.fig_amp_diagnostics,
+                   p.fig_foot_diagnostics, p.fig_terminations_perf, p.fig_amp_task_split):
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001 单图失败不拖垮其余
+                print(f"[WARN][{mode}] {fn.__name__} 失败: {type(exc).__name__}: {exc}")
+
+        lines = [f"-------- 摘要 [{mode}]  run={os.path.basename(os.path.normpath(latest))} --------"]
+        for label, tag, step, val, hint in p.digest():
+            vs = "no data" if val is None else f"{val:,.4f}"
+            st = "-" if step is None else f"{int(step)}"
+            lines.append(f"  {label:<22} @{st:>6}  {vs:>14}   {hint}")
+        for ln in lines:
+            print(ln)
+        print("")
+        # 摘要落盘：本地 scp 回来看，不必开 SSH 就能知道训练健康度
+        digest_path = os.path.join(outdir, "digest.txt")
+        try:
+            with open(digest_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+            print(f"[INFO][{mode}] 已保存: {digest_path}")
+        except OSError as exc:
+            print(f"[WARN][{mode}] digest.txt 写入失败: {exc}")
+
+    print("[INFO] 全部图表生成完毕")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
