@@ -612,27 +612,68 @@ $$\text{显存} \approx \underbrace{2843\ \text{MiB}}_{\text{固定开销（Kit/
 留 52% 余量；且 GPU 利用率已到 69%，再放大只会撞 CPU 配额。
 按 ~4 s/轮算，`G1OmniLocoPPORunnerCfg` 默认的 **5000 轮 ≈ 5.6 小时**。
 
-### 11.4 正式训练的两阶段策略
+### 11.4 ⭐ 训练早期的「假失败」与 A/B 对照（重要方法论）
 
-不直接烧 5.6 小时，先跑短程确认学习信号健康：
+先跑了 300 轮做健康检查，迭代 40 时的读数是：
+
+```
+Mean reward: -4.12                ← 横盘不升
+Mean episode length: 6.96         ← 只有 0.14 秒！
+Episode_Termination/base_contact: 1.0000   ← 所有回合都因躯干触地终止
+Episode_Termination/time_out:     0.0000   ← 一个超时都没有
+```
+
+看上去像「环境/配置错了」。**但同参数的 A/B 对照把这个判断推翻了**：
 
 ```bash
-# 阶段 1：健康检查（300 轮 ≈ 20 min）
-bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk.sh 4096 300 cuda:0' /root/train_stage1_driver.log
-# 阶段 2：确认健康后再跑满 5000 轮
+# 跑学长原版任务（纯 PPO + 原奖励 + 原 623 维观测），参数完全一致
+bash /root/cloud_run_bg.sh 'bash /root/cloud_ab_baseline.sh 4096 50 cuda:0' /root/ab_driver.log
+```
+
+| 迭代 | 原版 OmniLoco 回合长度 / reward | 我们的 AMP 回合长度 / reward |
+|---|---|---|
+| 0 | 8.06 / −4.54 | 4.40 / −4.25 |
+| 10 | 19.27 / −5.45 | 13.09 / −4.97 |
+| 20 | 6.49 / −4.36 | 6.07 / −4.41 |
+| 30 | 4.03 / −4.18 | 3.83 / −4.12 |
+| 40 | — | 6.96 / −4.12 |
+
+**两条曲线几乎重合** ⇒ 我们的环境与 AMP 接线**没有坏**，40~50 轮本来就不够
+（原版 `max_iterations = 5000`）。工具：`instinct/tools/cloud_ab_baseline.sh`。
+
+⭐ **方法论：训练早期「看上去完全没学」时，先做同参数 A/B 对照，再怀疑自己的改动。**
+
+读数本身的陷阱（同一件事的另一面）：
+
+- `Mean reward ≈ −4` 几乎**全部**来自终止惩罚：`termination_penalty` 归一化后 −0.2
+  → episodic sum ≈ **−4.0**。而所有跟踪项归一化后只有 0.003~0.01 量级 ——
+  因为回合只有 7 步，分母却是 `max_episode_length_s = 20`。
+  **回合越短，`Episode_Reward/*` 越小，越不能据此判断奖励设计有问题。**
+- `Episode_Reward/feet_lateral_width ≈ −0.0001` 同理：只能说明这几步里 `sep > 0.145`，
+  **不能**据此认为 `sep_floor` 标定正确（真证据是 `Step/foot_sep_mean`）。
+- 判别器 `quad` 公式已核对源码（`wasabi.py`）：`clamp(1 − 0.25·(disc − 1)², min=0)`，
+  `disc` 是**线性层裸输出**（非 sigmoid）。实测反推一致：
+  `discriminator_reward = 0.25(r_amp − r_task/c)`，当 `r_amp=0.29`、`r_task=−0.96`、`c=0.1`
+  → `0.25×(0.29+9.6) = 2.47`，与打印的 2.48 吻合 ⇒ **换算管线是对的**。
+
+### 11.5 最终训练配置
+
+```bash
 bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk.sh 4096 5000 cuda:0' /root/train_full_driver.log
 ```
 
-阶段 1 要看的健康指标（全部在 `Step/*` / `Train/*` / `Episode_Reward/*` 里）：
+`num_envs=4096`、`max_iterations=5000`（继承 `G1OmniLocoPPORunnerCfg`）、
+`save_interval=500`（可中途看行为，也可 `--resume` 续训）。预计 ≈ 5.6 小时。
+
+途中建议在迭代 500 / 1000 / 2000 处抽查这几个量（**不要在几十轮时就下结论**）：
 
 | 指标 | 期望 | 不健康的含义 |
 |---|---|---|
-| `Train/mean_reward_0` | **上升** | 不升 → 奖励符号/权重或混合公式错 |
-| `Step/foot_sep_mean` | 稳在 **0.15–0.30** | 掉向 0 或变负 → 步宽惩罚过猛 / 退路 body 错 |
-| `Step/discriminator_reward` | 由 2.7 缓降但**不为 0** | 迅速为 0 → 判别器碾压策略，需降 `discriminator_reward_coef` |
-| `Step/amp_style_reward` | 稳在 **[0,1]** 且缓升 | 恒为 0/1 → `reward_type` 或判别器输出饱和 |
-| `Episode_Reward/feet_lateral_width` | 接近 0（饱和到 `max_cost` 说明一直在被罚） | 长期贴 `max_cost=0.1` → `sep_floor` 偏高 |
-| `Loss/discriminator_*` | 不发散、不 NaN | NaN → 降 `discriminator_optimizer_kwargs.lr` |
+| `Mean episode length` | 明显上升（几十→几百→上千） | 停滞在个位数 → 真的学不动 |
+| `Episode_Termination/base_contact` | 下降到 0.1 以下 | 恒为 1.0 → 站都站不住 |
+| `Train/mean_reward_0` | 上升（进 TensorBoard 看，控制台不打印） | 不升 → 奖励符号/混合公式错 |
+| `Step/foot_sep_mean` | 稳在 **0.15–0.30** | 掉向 0 或变负 → 步宽惩罚过猛 |
+| `Step/discriminator_reward` | 缓降但**不为 0** | 迅速为 0 → 降 `discriminator_reward_coef` |
 
 ### 11.3 观测/统计的 5 个坑（共同点是**都会骗人**）
 
@@ -646,4 +687,9 @@ bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk.sh 4096 5000 cuda:0'
 
 另：`pgrep -f <pattern>` / `pkill -f <pattern>` 会匹配到**自己也含该字符串**的进程
 （包括你当前这条 SSH 命令行），必须用 `[s]cale_probe.sh` 括号技巧。
+这条坑实测把**我自己的 SSH 会话**kill 掉两次（现象：命令毫无输出、后续步骤压根没执行）。
+
+| 坑 | 现象 | 对策 |
+|---|---|---|
+| **Kit 不响应普通 SIGTERM** | `pkill -f <训练>` 后 `nvidia-smi` 仍占着 ~5.9 GB，`pgrep` 里进程**还活着** → 和新任务抢显存、存在 OOM 风险 | 用 `pkill -9`（SIGKILL）；杀完务必 `pgrep -af train.py` + `nvidia-smi` 各确认一遍 |
 

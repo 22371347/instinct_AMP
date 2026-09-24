@@ -733,24 +733,54 @@ aux 系数名咬合、`amp_style_reward_coef=0`、以及**把 λ/c 代进两条�
 **定档**：`num_envs = 4096`（11.6 GB / 24 GB，GPU 利用率 69% → 瓶颈是 CPU 配额 14 核）。
 按 ~4 s/轮，`G1OmniLocoPPORunnerCfg` 默认 **`max_iterations = 5000` ≈ 5.6 小时**。
 
-### 8.3 步骤⑨：正式训练（两阶段，避免白烧 5.6 小时）
+### 8.3 步骤⑨：正式训练 —— 以及一个「假失败」的教训
+
+**先跑了 300 轮做健康检查，结果看起来是失败的**：`Mean reward ≈ −4.12` 横盘不升、
+`Mean episode length = 6.96`（0.14 秒）、`Episode_Termination/base_contact = 1.0000`
+（所有回合都因躯干触地终止）。看上去像环境配错了。
+
+**同参数 A/B 对照把这个判断推翻了**（`instinct/tools/cloud_ab_baseline.sh`，
+跑学长原版 `Instinct-Unified-OmniLoco-G1-v0`，纯 PPO + 原奖励）：
+
+| 迭代 | 原版 OmniLoco 回合长度 / reward | 我们的 AMP 回合长度 / reward |
+|---|---|---|
+| 0 | 8.06 / −4.54 | 4.40 / −4.25 |
+| 10 | 19.27 / −5.45 | 13.09 / −4.97 |
+| 20 | 6.49 / −4.36 | 6.07 / −4.41 |
+| 30 | 4.03 / −4.18 | 3.83 / −4.12 |
+| 40 | — | 6.96 / −4.12 |
+
+**两条曲线几乎重合** ⇒ 环境与 AMP 接线**没有坏**，40~50 轮本来就不够（原版 `max_iterations = 5000`）。
+
+> ⭐ **方法论：训练早期「看上去完全没学」时，先做同参数 A/B 对照，再怀疑自己的改动。**
+
+读数陷阱（同一件事的另一面）：`Mean reward ≈ −4` 几乎全部来自终止惩罚
+（`termination_penalty` 归一化后 −0.2 → episodic sum ≈ −4.0），而跟踪项归一化后只有
+0.003~0.01 —— 因为回合只有 7 步、分母却是 `max_episode_length_s=20`。
+**回合越短，`Episode_Reward/*` 越小，越不能据此判断奖励设计有问题。**
+`Episode_Reward/feet_lateral_width ≈ −0.0001` 同理，只能说明这几步里 `sep > 0.145`。
+
+顺带核对了判别器公式（`wasabi.py`）：`clamp(1 − 0.25·(disc−1)², min=0)`，`disc` 是线性层裸输出。
+实测反推 `0.25(r_amp − r_task/c)`：`r_amp=0.29`、`r_task=−0.96`、`c=0.1`
+→ `0.25×(0.29+9.6)=2.47`，与打印的 2.48 吻合 ⇒ **换算管线正确**。
+
+**最终配置与命令**：
 
 ```bash
-# 阶段 1：健康检查 300 轮（≈20 min）
-bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk.sh 4096 300 cuda:0' /root/train_stage1_driver.log
-# 阶段 2：确认健康后跑满 5000 轮
 bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk.sh 4096 5000 cuda:0' /root/train_full_driver.log
 ```
 
-阶段 1 的健康判据（阈值型/风格型两处最容易出问题的量都覆盖到了）：
+`num_envs=4096`、`max_iterations=5000`、`save_interval=500`（可 `--resume` 续训），预计 ≈5.6 h。
+
+**判据要放在迭代 500 / 1000 / 2000 处看，不要在几十轮时下结论**：
 
 | 指标 | 期望 | 不健康的含义 |
 |---|---|---|
-| `Train/mean_reward_0` | **上升** | 不升 → 奖励符号/权重或混合公式错 |
-| `Step/foot_sep_mean` | 稳在 **0.15–0.30** | 掉向 0 或变负 → 步宽惩罚过猛 / 退路 body 错 |
-| `Step/discriminator_reward` | 由 2.7 缓降但**不为 0** | 迅速为 0 → 判别器碾压策略，降 `discriminator_reward_coef` |
-| `Step/amp_style_reward` | 稳在 **[0,1]** 且缓升 | 恒 0/1 → `reward_type` 或判别器输出饱和 |
-| `Episode_Reward/feet_lateral_width` | 接近 0 | 长期贴 `max_cost=0.1` → `sep_floor` 偏高 |
+| `Mean episode length` | 明显上升（几十→几百→上千） | 停滞在个位数 → 真的学不动 |
+| `Episode_Termination/base_contact` | 降到 0.1 以下 | 恒为 1.0 → 站都站不住 |
+| `Train/mean_reward_0` | 上升（只进 TensorBoard，控制台不打印） | 不升 → 奖励符号/混合公式错 |
+| `Step/foot_sep_mean` | 稳在 **0.15–0.30** | 掉向 0 或变负 → 步宽惩罚过猛 |
+| `Step/discriminator_reward` | 缓降但**不为 0** | 迅速为 0 → 降 `discriminator_reward_coef` |
 
 ### 8.4 步骤⑨ 之后（尚未开始）
 
