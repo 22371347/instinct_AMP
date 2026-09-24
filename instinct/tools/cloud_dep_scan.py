@@ -109,9 +109,16 @@ def main() -> int:
               + ("" if r.returncode == 0 else f"  {(r.stderr or r.stdout)[-160:]}"))
 
     print("\n版本回归：")
-    importlib.reload(torch)
-    importlib.reload(numpy)
-    after = (torch.__version__, numpy.__version__)
+    # ⚠️ 绝对不要用 `importlib.reload(torch)`：torch 被 reload 时会重复注册
+    # TORCH_LIBRARY，直接 RuntimeError（"Only a single TORCH_LIBRARY can be used to
+    # register the namespace triton"）—— 实测踩过。
+    # 正确做法：起一个**全新子进程**打印版本，才能反映安装后的真实状态。
+    proc = subprocess.run(
+        [sys.executable, "-c", "import torch,numpy;print(torch.__version__);print(numpy.__version__)"],
+        capture_output=True, text=True,
+    )
+    after_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    after = tuple(after_lines[:2]) if len(after_lines) >= 2 else ("<读不到>", "<读不到>")
     print(f"  torch {before[0]} → {after[0]}   numpy {before[1]} → {after[1]}")
     if before != after:
         print("  ❌ 核心版本被改动了！需要立刻回滚")

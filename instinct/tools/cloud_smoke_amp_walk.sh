@@ -80,12 +80,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-hr; echo "第 2 层：★ 关键 API 假设探测（最高风险，本机完全无法验证）"
+hr; echo "第 2 层：★ 关键 API 假设探测（在 Kit 内跑）"
 # ---------------------------------------------------------------------------
-# 注意：这一步不启动 Isaac Sim，因此**导入失败有可能是假警报**
-#       （某些模块需要 SimulationApp 先起来）。所以失败只记为 ⚠️，并让第 3 层做裁决。
-python - <<'PY'
-import importlib, sys
+# ⚠️ 必须在 **Kit 内** 探测：`isaaclab.envs` / `instinctlab` 的导入链都要
+#    `pxr`(USD) / `omni` / `carb`，而这些只在 Kit 启动后才可用。
+#    第一版这一层用**普通 python** 跑 → 6 项全部假失败（`ModuleNotFoundError: pxr`），
+#    等于没验。现在改成：先生成「带 AppLauncher 前导」的脚本，再跑。
+cat > /tmp/llp_layer2_probe.py <<'PY'
+import argparse
+
+from isaaclab.app import AppLauncher
+
+_parser = argparse.ArgumentParser()
+AppLauncher.add_app_launcher_args(_parser)
+_args, _unknown = _parser.parse_known_args([])
+_args.headless = True
+_app = AppLauncher(_args).app
+
+import importlib  # noqa: E402
+
 problems = []
 
 def probe(desc, fn):
@@ -142,13 +155,18 @@ probe("instinctlab.envs.mdp 的 5 个 *_reference_as_state 齐全", _ref)
 
 print()
 if problems:
-    print("  ⚠️  有 %d 项探测失败。注意：未启动 Isaac Sim 时导入可能被拒，"
-          "**以第 3 层的训练结果为准**。" % len(problems))
+    print("  ⚠️  有 %d 项探测失败。**以第 3 层的训练结果为准**。" % len(problems))
     for p in problems:
         print(f"     - {p}")
 else:
     print("  ✅ 关键 API 假设全部成立")
+_app.close()
 PY
+# 落到文件再过滤，避免 pipe 缓冲导致全程看不到进度
+python /tmp/llp_layer2_probe.py > /tmp/llp_layer2.out 2>&1
+_layer2_rc=$?
+grep -vE "^\[[0-9.]+s\]|\[carb\]|\[omni|Warning: " /tmp/llp_layer2.out | tail -45
+[[ $_layer2_rc -eq 0 ]] && ok "第 2 层探测脚本退出码 0" || warn "第 2 层探测脚本退出码 $_layer2_rc"
 
 # ---------------------------------------------------------------------------
 hr; echo "第 3 层：★ 我们新任务的端到端冒烟（真正的裁决）"
