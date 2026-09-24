@@ -399,3 +399,85 @@ OK isaaclab.envs.mdp 属性: UniformVelocityCommand, UniformVelocityCommandCfg,
 `/root/.llp_env.sh` 里已导出 `LLP_DATA_ROOT=/root/gpufree-data`。
 （Isaac Sim 本体在只读镜像层里，不占这 30 G。）
 
+---
+
+## 9. **CPU-only 模式**（2026-09-24 实测）
+
+> 平台 GPU 资源紧张时以**仅 CPU** 形式开了：`nproc=128`、`free=503G`，
+> 但 `nvidia-smi -L` **无输出**（没有任何 GPU 可见）。
+
+### 9.1 结论速览
+
+| 能做什么 | 不能做什么 |
+|---|---|
+| ✅ 装环境（editable 安装两份源码） | ❌ 训练 / 跑迭代（PhysX GPU 求解器起不来） |
+| ✅ **读已装 IsaacLab 的源码**做 API 审计 | ❌ 任何需要真实物理步进的验证 |
+| ✅ **启动 Kit**（见 9.3，居然可行） | ❌ 渲染 / 相机类任务 |
+| ✅ Kit 内**实例化配置 + `to_dict()`** | ⚠️ 建环境/走 step：待验证（见 9.5） |
+| ✅ **纯算法侧单元测试**（不需要 Kit，见 9.4） | |
+
+### 9.2 不启动 Kit 时的导入边界（实测）
+
+`pxr`(USD) / `omni` / `carb` 都不在普通 python 进程里，于是：
+
+| 模块 | 结果 |
+|---|---|
+| `torch` / `numpy` / `gymnasium` / `instinct_rl` | ✅ 可导入 |
+| `isaaclab.utils.configclass` | ✅ 可导入（纯 python） |
+| `isaaclab.utils.math` / `isaaclab.managers` / `isaaclab.envs` | ❌ `No module named 'pxr'` / `'omni'` |
+| `instinctlab` / 任务配置包 | ❌ 同上 |
+
+⇒ **想 import 任务配置，必须先 `AppLauncher` 起 Kit**。别浪费时间在"用普通 python 验证配置"上。
+
+### 9.3 ⭐ Kit 在无 GPU 时**确实能启动**
+
+```
+AppLauncher(headless=True)  →  返回成功（~10 s）
+报错只有：Warp CUDA error: Could not open libcuda.so
+          PhysX error: Could not load libcuda.so.1: ... file too short
+```
+
+即：**Kit 框架层能起来，GPU 相关的插件（Warp/PhysX-GPU/渲染）起不来**。
+这足以做到「import 任务配置 + 实例化 + `to_dict()`」。
+
+### 9.4 ⭐ 纯算法侧可以在**本机**（4 GB 无 GPU）端到端测
+
+`instinct_rl` 是纯 PyTorch 的库，**奖励混合发生在算法侧**，所以步骤⑥ 的核心
+（`WasabiPPOAmpMix` / `PPO.process_env_step` / `OnPolicyRunner` 的类解析）
+根本不需要仿真器。工具 `instinct/tools/test_amp_pipeline.py`（需要
+`GitPython gymnasium tensorboardX regex`）走**真实**的 `process_env_step` 管线，
+读 `RolloutStorage.rewards` 与 AMP_mjlab 的目标公式逐点对账——**14 项全过**。
+
+### 9.5 环境缺口（镜像里漏装的依赖）—— 已在云上修掉
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| 连配置都 import 不了 | `motion_reference_manager.py` 顶层 `import pytorch_kinematics`，镜像没装 | ✅ 补装（连带 `lxml` / `arm_pytorch_utilities` / `pytorch_seed`） |
+| `check_install.py` 报 `Missing required package: isaaclab_assets` | 镜像只装了 `isaaclab`，`isaaclab_assets` **没有 pip 元数据** | ⚠️ 未修（见下） |
+| `torch.cuda.is_available()` 为假 | 本来就没 GPU | — |
+
+**安装纪律（铁律）**：一律 `pip install --no-deps`，然后**逐轮补传递依赖**，
+每一步都比对 `torch` / `numpy` 版本。实测装完后
+`torch 2.7.0+cu128` / `numpy 1.26.0` **一字未变**。
+（工具：`cloud_fix_deps.sh` → `cloud_fix_deps2.sh` → **`cloud_dep_scan.py`**，
+最后这个会**一次性扫完两棵源码树的全部顶层第三方 import**，别再一个一个撞。）
+
+> `check_install.py` 在 CPU-only 下**必然失败**（它自己就要求
+> `torch.cuda.is_available()`），所以第 1 层验收在 CPU 模式下要**拆开看**：
+> 能验的是「包位置 / 版本」，不能验的是 CUDA 那两行。
+
+### 9.6 由此新增的**云端只读审计**能力（不需要 GPU，价值很高）
+
+本机没有 IsaacLab 源码，所以一批 API 假设一直只能靠文档推断。云上直接读
+`site-packages/isaaclab/source/isaaclab/isaaclab/` 的源码就钉死了：
+
+| 问题 | 结论 |
+|---|---|
+| **`@configclass` 无类型注解的新字段算不算字段？** | **算**。`add_annotations` 会**从默认值推断类型并补注解**（源码注释原文见 `tools/cloud_api_audit.sh`）→ 步骤⑥ 的 WASABI 参数一定能透传到 `to_dict()` |
+| `RewardManager` 怎么遍历奖励项 | `cfg.__dict__.items()`，且 `if term_cfg is None: continue` → **把某项设成 `None` 就能关掉它** |
+| `ArticulationData` 有哪些属性 | `root_pos_w` / `root_quat_w` / `root_ang_vel_b` / `root_lin_vel_b` / `default_root_state` / `root_state_w` / `body_pos_w` / `body_quat_w` **全部存在** |
+| `SceneEntityCfg("robot")` 的 `joint_ids` | `joint_names=None` 时**整段跳过解析** → 保持 `slice(None)`（= 全部关节）；这版**有 `preserve_order` 字段**但默认 `False` |
+| `ContactSensorCfg` 过滤 | 源码原文确认**只支持一对多**（`contact_sensor.py:50`）→ 「不迁移 `self_collisions`」的决定成立 |
+
+审计工具：`instinct/tools/cloud_api_audit.sh`（`bash cloud_api_audit.sh Q1 Q3` 可只跑若干项）。
+
