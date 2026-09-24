@@ -675,6 +675,66 @@ bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk.sh 4096 5000 cuda:0'
 | `Step/foot_sep_mean` | 稳在 **0.15–0.30** | 掉向 0 或变负 → 步宽惩罚过猛 |
 | `Step/discriminator_reward` | 缓降但**不为 0** | 迅速为 0 → 降 `discriminator_reward_coef` |
 
+---
+
+## 12. 云端路径速查 + 训练监控（2026-09-25）
+
+### 12.1 关键路径
+
+| 用途 | 路径 |
+|---|---|
+| 云端登录 | `root@183.147.142.40:30528`（凭据在本地 `~/.llp_cloud_credentials`，chmod 600，**不入库**）|
+| 代码根 | `/root/gpufree-data/instinct_xu` |
+| 环境变量脚本 | `/root/.llp_env.sh`（`source` 它即可拿到 PATH / `PYTHONPATH`）|
+| 云端 python | `/opt/conda/envs/isaaclab/bin/python`（非交互 SSH **PATH 里没有 `python`**）|
+| 训练日志目录（TensorBoard）| `/root/gpufree-data/instinct_xu/logs/instinct_rl/g1_amp_walk/<时间戳>_<run_name>/` |
+| 曲线图输出（云端）| `/root/gpufree-data/instinct_xu/logs/instinct_rl/plots/` |
+| 曲线图（本地拉回）| `instinct/plots/`（工作区内，VS Code 直接看；已加 .gitignore）|
+| 本地工具 | `instinct/tools/`（SSH 助手 / 冒烟 / 试跑 / 训练 / 绘图 / 刷新）|
+| 本地 AMP_mjlab（参考实现）| `/home/leo/rsl_project/AMP_mjlab`（绘图脚本蓝本在 `tools/plot_rewards.py`）|
+
+### 12.2 训练监控工作流（对应 AMP_mjlab 那套）
+
+```bash
+# 1) 把绘图脚本传上云端 + 自检 tag（改过 plot_training.py 后跑一次）
+bash instinct/tools/upload_plot_tool.sh
+
+# 2) 出图并拉回本地（一次性）
+bash instinct/tools/refresh_plots.sh once
+
+# 3) 后台循环：每 600 s 自动重画 + 拉回
+bash instinct/tools/refresh_plots.sh          # 启动
+bash instinct/tools/refresh_plots.sh stop     # 停止
+```
+
+产物（`instinct/plots/`，全部由云端生成后 scp 拉回）：
+
+| 文件 | 内容 |
+|---|---|
+| `01_overview.png` | 平均回报 / 回合长度 / AMP 总损失 / 动作噪声 std |
+| `02_reward_terms.png` | 21 项 `Episode_Reward/*` 逐项收敛（缺项自动过滤） |
+| `03_amp_diagnostics.png` | 判别器 4 个损失项 + `Step/discriminator_reward` + `amp_style_reward` |
+| `04_foot_diagnostics.png` | ⭐ 步宽/交叉专项（**本次迁移最关键的设计风险点**） |
+| `05_terminations_perf.png` | 终止方式 / FPS / 速度跟踪误差 |
+| `06_amp_task_split.png` | 最终奖励里 task 与 AMP 风格各占多少 |
+| `digest_latest.txt` | ⭐ 文本摘要（不开 SSH 就能看健康度） |
+
+`plot_training.py` 支持 `--list-tags`：打印该 run 里**真实存在**的全部 scalar tag
+（我们这轮是 **210 个**）。写新图前先跑它，别猜 tag 名。
+
+### 12.3 ⚠️ 一个不能只看均值的设计陷阱（本仓库实测）
+
+`04_foot_diagnostics.png` 第一次出图就抓到：迭代 260 时 `foot_sep_mean` 从 0.27
+一路涨到 **0.41 并平台化** —— 远超数据集中位 0.214、也超出预期带 0.15~0.30，
+机器人形成了很宽的「牛仔站姿」。
+
+根因：`feet_lateral_width` 只惩罚**窄**步（`clamp(sep_floor − sep, 0)`），
+对**宽**步**没有任何约束**；而 AMP 风格权重只有 $(1-\lambda)c = 0.025$，
+不足以把站姿拉回参考分布。
+
+→ 这个量必须**专门画出来看**：它在控制台只以 `Mean step foot_sep_mean` 出现一行，
+  训练早期还容易误读成「正常」。**均值本身没越界检查，图上才看得见趋势。**
+
 ### 11.3 观测/统计的 5 个坑（共同点是**都会骗人**）
 
 | 坑 | 现象 | 对策 |
