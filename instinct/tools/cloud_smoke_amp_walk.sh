@@ -72,7 +72,18 @@ PY
 hr; echo "第 1 层：安装指向（交付包自带脚本）"
 # ---------------------------------------------------------------------------
 if [[ -f scripts/check_install.py ]]; then
-  python scripts/check_install.py || bad "check_install.py 报告问题"
+  # ⚠️ 降级为**提示**（warn），不是失败项：这是交付包自带的「pip 元数据」自检，
+  # 已知在本镜像里会因为 isaaclab_assets 没有 dist-info 而报
+  # `PackageNotFoundError: No package metadata was found for isaaclab_assets` ——
+  # 那是**缺元数据**，不是缺包，也**不影响本任务**：
+  # 第 3 层的端到端训练退出码 0 就是最直接的证据（CLOUD_ENV_SETUP.md §10.6）。
+  # 真正的裁决永远看第 3 层。
+  if python scripts/check_install.py; then
+    ok "check_install.py 通过"
+  else
+    warn "check_install.py 报告问题（提示项，见 CLOUD_ENV_SETUP.md §10.6；不影响本任务）"
+    python scripts/check_install.py 2>&1 | grep -E 'PackageNotFoundError|RuntimeError' | head -3 | sed 's/^/     /'
+  fi
   echo "  -- editable 安装 --"
   python -m pip list --editable 2>/dev/null | head -10
 else
@@ -197,9 +208,34 @@ if grep -q "\[AMP-WALK PASS\]" "$LOG"; then
 else
   bad "未看到 [AMP-WALK PASS] —— 契约校验没跑到或被跳过"
 fi
-# 父类的 623 维契约标记出现则说明**用错了 env class**（应为本任务的新类）
-if grep -q "\[A1 PASS\]" "$LOG"; then
-  bad "日志里出现 [A1 PASS]（OmniLoco 的 623 维契约）—— 可能注册到了旧 env class"
+# 父类校验器（OmniLoco 那套 fail-fast）也会打印 `[A1 PASS]`，而且**本来就该出现**：
+# `G1AmpWalkTeacherEnv._validate_teacher_contract()` 是先 `super()` 再补 AMP 专项检查。
+# 所以正确的判据不是「有没有 A1 PASS」，而是「A1 报的维度是不是本任务的 626」——
+# 若报 623 才说明注册到了旧 env class。
+_A1="$(grep -m1 "\[A1 PASS\]" "$LOG" || true)"
+if [[ -z "$_A1" ]]; then
+  bad "未看到 [A1 PASS] —— 父类契约校验没跑到（正常应由 super() 先执行）"
+elif grep -qE "\[A1 PASS\].*policy=626[ )]" <<<"$_A1"; then
+  ok "父类契约校验通过（[A1 PASS]，policy=626 与本任务一致）"
+  echo "     $_A1" | sed 's/^     //' | sed 's/^/     /'
+else
+  bad "父类校验器报的不是 626（可能用错了 env class）：$_A1"
+fi
+
+# 步骤⑤：脚距诊断量（`extras["step"]` 通道）——**在线自检脚部参考 body 是否选对**。
+# 数据集直线走实测中位 0.2140、p1 0.1455，所以训练时的均值应落在 0.05~0.6 区间。
+# 注意：`extras["step"]` 跨 step 始终是同一个 dict 对象，runner 里 `step_infos` 存的
+# 是一组同一对象的引用，因此这条曲线是「本轮最后一次 step 的瞬时值」，不是轮内均值。
+_SEP="$(grep -oE 'Mean step foot_sep_mean:[^0-9-]*[-0-9.]+' "$LOG" | tail -1 || true)"
+if [[ -z "$_SEP" ]]; then
+  warn "未找到 foot_sep_mean —— 步骤⑤ 的诊断量没走到 extras['step']（检查 _log_metric）"
+else
+  _V="$(grep -oE '[-0-9]+\.?[0-9]*$' <<<"$_SEP")"
+  if awk "BEGIN{exit !($_V > 0.05 && $_V < 0.6)}"; then
+    ok "脚距诊断量合理：$_SEP（数据集直线走中位 0.2140）"
+  else
+    warn "脚距诊断量超出合理区间 0.05~0.6：$_SEP —— 检查脚部参考 body（ankle_roll_link 退路）是否选错"
+  fi
 fi
 
 # 步骤⑥：判别器是否真的被构建（`WasabiAlgoMixin.init_storage` 里会 print）

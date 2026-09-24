@@ -170,12 +170,32 @@ def _command_or_raise(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor
 
 
 def _log_metric(env: ManagerBasedRLEnv, key: str, value: torch.Tensor) -> None:
-    """把诊断量写进 `extras["log"]`（`InstinctRlEnv` 会保留并在 reset 时交给 runner）。
+    """把诊断量写进 `extras["step"]`；runner 会以 `Step/<key>` 打到 TensorBoard，
+    并在每轮迭代的控制台里打印 `Mean step <key>`。
 
-    `extras["log"]` 由 `manager_based_rl_env.py` 用 `setdefault` 语义维护，
-    这里写入不会覆盖 monitor 的条目。
+    值必须是 0 维 tensor 或 python 标量（runner 会先 `unsqueeze(0)` 再 `cat`）。
+
+    ⚠️ **为什么不用 `extras["log"]`（踩过的坑，务必别改回去）**
+
+    IsaacLab 的 `ManagerBasedRLEnv._reset_idx`（`manager_based_rl_env.py`）里有
+    `self.extras["log"] = dict()`，是**整体替换**；而 reward 项的 `compute()` 发生在
+    `_reset_idx` **之前**。于是同一条日志通道出现两种 step：
+
+    - 本 step 有 env 终止 → log 被换成只含 `Episode_Reward/*` 的新 dict，本 step 写的
+      诊断量**被丢掉**；
+    - 本 step 无 env 终止 → `extras` 是持久的（只在 `manager_based_env.py` 的
+      `__init__` 里建过一次），上一 step 的 dict 还在，诊断量**侥幸留下**。
+
+    两类 step 交替出现，`ep_infos` 里各条 dict 就**有的带 key、有的不带**；而 runner 的
+    `OnPolicyRunner.log()` 是拿 `ep_infos[0]` 的 key 去索引**全部** dict：
+
+        KeyError: 'Metrics/foot_sep_mean'
+
+    改走 `extras["step"]`：`InstinctRlEnv.step()` 里只有
+    `self.extras["step"] = self.extras.get("step", {}).update(...)` —— **始终是同一个
+    dict 对象、永不替换**，因此 key 集合对所有 step 天然一致。
     """
-    env.extras.setdefault("log", {})[key] = value
+    env.extras.setdefault("step", {})[key] = value
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +350,10 @@ def feet_lateral_width_cost(
     if max_cost is not None:
         raw = raw.clamp(max=float(max_cost))
 
-    _log_metric(env, "Metrics/foot_sep_mean", sep.mean())
+    # 诊断量：真机值应落在数据集直线走区间（中位 0.2140、p1 0.1455）附近。
+    # 这条曲线同时是「脚部参考 body 退路是否选对」的**在线自检**：若误用错 body
+    # （例如把 root 系当脚），这个数会明显偏离 0.1~0.3。
+    _log_metric(env, "foot_sep_mean", sep.mean())
     return raw * w_act * w_dir * _walk_speed_gate(command, walk_max_lin_vel, walk_gate_width)
 
 
@@ -365,5 +388,6 @@ def feet_crossing_cost(
     if max_cost is not None:
         raw = raw.clamp(max=float(max_cost))
 
-    _log_metric(env, "Metrics/foot_cross_frac", (sep < 0).float().mean())
+    # 直线走应 ≈ 0；侧移（参考是交叉式侧步）允许 > 0，用来验证方向门控确实在起作用。
+    _log_metric(env, "foot_cross_frac", (sep < 0).float().mean())
     return raw * w_act * w_dir * _walk_speed_gate(command, walk_max_lin_vel, walk_gate_width)

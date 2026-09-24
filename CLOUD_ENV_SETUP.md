@@ -481,3 +481,98 @@ AppLauncher(headless=True)  →  返回成功（~10 s）
 
 审计工具：`instinct/tools/cloud_api_audit.sh`（`bash cloud_api_audit.sh Q1 Q3` 可只跑若干项）。
 
+---
+
+## 10. GPU 端到端冒烟：**步骤⑦ 实测通过**（2026-09-24 → 09-25）
+
+跑法（后台 + 日志，避免 SSH 断线丢输出）：
+
+```bash
+bash /root/cloud_run_bg.sh 'bash /root/cloud_chain_smoke.sh' /root/smoke.log
+# cloud_chain_smoke.sh = 环境快照 → cloud_dep_scan.py → cloud_smoke_amp_walk.sh（第 3 层是裁决）
+```
+
+### 10.1 本任务的检查项：**全绿**
+
+| 检查 | 结果 |
+|---|---|
+| 训练进程退出码 | ✅ 0（`--task Instinct-Amp-Walk-G1-v0 --num_envs 16 --max_iterations 2 --device cuda:0`）|
+| 契约校验 | ✅ `[AMP-WALK PASS] policy=626 … rewards=21` |
+| 判别器构建 | ✅ `Discriminator Network Structure` |
+| `amp_policy`/`amp_reference` | ✅ 两者都进了 `infos['observations']`，判别器拿到 670 维 |
+| 脚距诊断量 | ✅ `Mean step foot_sep_mean: 0.2411`（在数据集直线走区间内）|
+| 异常关键字 | ✅ 无 Traceback / KeyError / OOM |
+
+### 10.2 实测尺寸（与设计逐项对上，可省掉以后的猜测）
+
+```
+obs_format（train 启动时打印）
+  policy : height_scan(527) + velocity_command(3) + base_lin_vel(3)
+         + projected_gravity(3) + base_ang_vel(3) + joint_pos_rel(29)
+         + joint_vel(29) + last_action(29)              = 626 ✅
+  critic : base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3)
+         + velocity_commands(3) + joint_pos(29) + joint_vel(29) + actions(29) = 99 ✅
+  amp_policy / amp_reference : 两侧**完全同构**（wasabi 的 init_storage 断言要求）
+         projected_gravity(30) + joint_pos_rel(290) + joint_vel_rel(290)
+         + base_lin_vel(30) + base_ang_vel(30)                     = 670 ✅
+```
+
+⭐ **由 30/290 反推出一个重要事实**：AMP 观测组是 **10 帧堆叠**，
+单帧状态 = 3+29+29+3+3 = **67 维**，×10 = 670。以后调 AMP 输入维数时按这个来。
+
+网络：`Actor 626→512/256/128→29`、`Critic 99→512/256/128→1`、
+`Discriminator 670→1024/512→1`（ReLU）。16 环境 24 步/轮 → `Iteration time ≈ 3.3 s`。
+
+### 10.3 冒烟暴露并修掉的 **2 个真 bug**（都不是环境问题）
+
+**① 诊断量写进了会被清空的日志通道（真 bug，会让训练在首轮 log 时直接崩）**
+
+第一轮冒烟在 `OnPolicyRunner.log()` 里 `KeyError: 'Metrics/foot_sep_mean'`，
+训练**根本起不来**。根因：
+
+- `ManagerBasedRLEnv._reset_idx` 里有 `self.extras["log"] = dict()`（**整体替换**），
+  而 reward 的 `compute()` 在它**之前**跑；
+- 该替换只在「本 step 有 env 终止」时执行 ⇒ 终止步写的诊断量被丢掉、非终止步才留下；
+- `ep_infos` 里各条 dict 的 key 集合于是不一致，而 `log()` 是拿 `ep_infos[0]` 的 key
+  去索引**全部** dict → KeyError。
+
+✅ 修法：诊断量改走 **`env.extras.setdefault("step", {})[key] = value`**。
+`InstinctRlEnv.step()` 里 `extras["step"]` 始终是**同一个 dict 对象、永不替换**，
+key 集合天然一致；TB 里表现为 `Step/<key>`。
+⚠️ 副作用：`step_infos` 存的是同一对象的 N 个引用，所以 `Step/*` 曲线是
+**「本轮最后一个 step 的瞬时值」**，不是轮内均值 —— 看曲线时别误读。
+
+**② 冒烟脚本自己的检查项方向写反了（假警报）**
+
+`[A1 PASS]` 是**父类** `G1OmniLocoTeacherEnv._validate_teacher_contract` 打印的，
+而我们的子类是 **先 `super()` 再补 AMP 专项检查** ⇒ 它与 `[AMP-WALK PASS]`
+**同时出现属正常**，且报的是**当前类**的 626（不是 623）。
+判据已改为「A1 报的维度是否 = 626」，并新增 `foot_sep_mean` 的
+**在线自检**（不在 0.05~0.6 就告警 → 能自动发现脚部参考 body 选错）。
+
+### 10.4 ⭐ `LL_FOOT`/`LR_FOOT` 找不到是**预期**（数值上已自证）
+
+Kit 日志原文：`link LR_FOOT has body properties (mass, inertia, or collisions)
+and is being merged into right_ankle_roll_link` —— URDF 导入器的 `merge_fixed_joints`
+把固定脚连杆并进了 ankle roll 连杆，所以运行时 `body_names` 里没有脚连杆。
+因为 `sep` 只在 yaw 系取 y 分量、foot→ankle_roll 的横向偏移为 0，
+`sep_floor = 0.145`（在 LL_FOOT 上标定）**可原样使用**。
+**实测 `foot_sep_mean = 0.2411`**（数据集直线走中位 0.2140 / p1 0.1455）→ 退路正确。
+
+### 10.5 两个云端操作坑（新增）
+
+| 坑 | 表现 | 对策 |
+|---|---|---|
+| **URDF 导入器扩展是"首次使用才拉"** | 卡在 `UrdfConverter` → `registry_provider._pull_extension_async_impl` → `omni_client_copy`，**无任何日志输出**，极易误判为死锁 | 一次性成本（~1 min+），缓存到 `/root/.local/share/ov`；用 `du -sh /root/.local/share/ov` 和 `.../exts/v2/index/*/packages/*.json` 的 mtime 判断"在涨=在干活"；第二轮起秒过 |
+| **`pkill -f <pattern>` 会杀掉自己这条 SSH** | 命令行本身含该字符串 → 自己的 shell 被 kill，后续命令全不执行 | 用括号技巧：`pgrep -af '[c]loud_watch'` / `pkill -f '[c]loud_watch'` |
+
+配套工具：`instinct/tools/cloud_watch.sh`（远端心跳，每 20 s 记 CPU/RSS/日志字节/ov 缓存，
+一次轮询就能看出"慢"还是"卡死"）。
+
+### 10.6 唯一残留的非致命项
+
+`scripts/check_install.py`（**交付包自带**，README §5）报
+`PackageNotFoundError: No package metadata was found for isaaclab_assets`。
+这是**镜像里缺 pip 元数据**，不是缺包、也**不影响本任务**——第 3 层端到端冒烟退出码为 0
+就是最直接的证据。已把它降级为提示项（真正的裁决看第 3 层）。
+

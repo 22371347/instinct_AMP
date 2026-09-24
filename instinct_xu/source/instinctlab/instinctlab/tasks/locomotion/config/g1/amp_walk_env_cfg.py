@@ -603,9 +603,16 @@ class G1AmpWalkTeacherEnv(G1OmniLocoTeacherEnv):
             f"rewards={n_rewards}"
         )
         if not has_foot_bodies:
+            # 这是**预期**情况，不是异常：`LL_FOOT`/`LR_FOOT` 在 URDF 里是 ankle_roll_link
+            # 的固定子连杆，Isaac Sim 的 URDF 导入器（`merge_fixed_joints=True`）会把它们
+            # 合并进父连杆。云端 Kit 日志已直接印证：
+            #   "link LR_FOOT has body properties (mass, inertia, or collisions)
+            #    and is being merged into right_ankle_roll_link"
+            # 因此 `*_ankle_roll_link` 就是脚部参考点，`sep` 只在 yaw 系下取 y 分量，
+            # 而 LR_FOOT→ankle_roll_link 的横向偏移为 0 → `sep_floor=0.145`（在 LL_FOOT 上
+            # 标定）可以原样使用。真实数值由 `Step/foot_sep_mean` 在线自检。
             print(
-                "[AMP-WALK WARN] 未在 robot.body_names 里找到 LL_FOOT/LR_FOOT —— "
-                "feet_lateral_sep 已退回 *_ankle_roll_link。sep_floor=0.145 是在 LL_FOOT 上"
-                "标定的；由于 LR_FOOT 相对 ankle_roll_link 的横向偏移为 0，两者数值几乎一致，"
-                "但建议核对一下 URDF 的 merge_fixed_joints 设置。"
+                "[AMP-WALK INFO] robot.body_names 无 LL_FOOT/LR_FOOT（URDF 导入器已把固定"
+                "脚连杆合并进 ankle_roll_link，属预期）；feet_lateral_sep 使用 "
+                "*_ankle_roll_link。sep_floor=0.145 照旧，数值由 Step/foot_sep_mean 在线校验。"
             )

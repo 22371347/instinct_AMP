@@ -611,8 +611,40 @@ framerate, joint_names(29,), joint_pos(T,29), base_pos_w(T,3), base_quat_w(T,4)
                    （只覆盖 4 个方法；`reward_mix_mode` / `style_lerp` / `disable_style_on_stand`）
                  - `agents/amp_walk_ppo_cfg.py`：`AmpWalkPolicyCfg`(512/256/128) +
                    `AmpWalkAlgorithmCfg`（WASABI 判别器参数 + lerp 混合 + `clip_min_std`）
-⑦ 注册与冒烟     注册新任务 ID；小规模验证（motion_reference 采样 / 判别器前向 / 奖励量级）
+⑦ 注册与冒烟     【已完成，2026-09-25 云端 GPU 实测全绿】
+                 `bash /root/cloud_run_bg.sh 'bash /root/cloud_chain_smoke.sh' /root/smoke.log`
+                 --task Instinct-Amp-Walk-G1-v0 --num_envs 16 --max_iterations 2 --device cuda:0
+                 结果：训练退出码 0；[AMP-WALK PASS] rewards=21；Actor 626→512/256/128→29；
+                 Critic 99→512/256/128→1；Discriminator 670→1024/512→1；
+                 Step/foot_sep_mean = 0.2411（数据集直线走中位 0.2140）；
+                 Step/foot_cross_frac = 0.0000；amp_style_reward = 0.7583；
+                 奖励混合实测对账：r_task + c·disc = λ·r_task + (1-λ)c·r_amp ✅
+                 详见 CLOUD_ENV_SETUP.md §10（含冒烟暴露并修掉的 2 个真 bug）
 ```
+
+> ⚠️ **步骤⑦ 实测又清掉两个断言之外的东西**（都不是环境问题，而是我们自己的 bug）：
+>
+> **1) 诊断量写进了会被整体替换的日志通道** —— 第一轮冒烟在 `OnPolicyRunner.log()`
+> 里 `KeyError: 'Metrics/foot_sep_mean'`，**训练根本起不来**。根因是 IsaacLab 的
+> `ManagerBasedRLEnv._reset_idx` 里有 `self.extras["log"] = dict()`（整体替换），
+> 而 reward 的 `compute()` 在它**之前**；该替换只在「本 step 有 env 终止」时执行，
+> 于是 `ep_infos` 各条 dict 的 key 集合不一致，而 `log()` 是拿 `ep_infos[0]` 的 key
+> 去索引**全部** dict。
+> ✅ 改走 `env.extras.setdefault("step", {})[key] = value`（`extras["step"]`
+> 始终是同一个 dict 对象、永不替换），TB 里表现为 `Step/<key>`。
+> ⚠️ 副作用：`step_infos` 存的是同一对象的 N 个引用 ⇒ `Step/*` 是**本轮最后一个 step
+> 的瞬时值**，不是轮内均值。
+>
+> **2) 冒烟脚本自己的检查项方向写反了** —— `[A1 PASS]` 是**父类**校验器打的，
+> 我们的子类是「先 `super()` 再补 AMP 专项检查」⇒ 它与 `[AMP-WALK PASS]` 同时出现
+> **属正常**，且报的是**当前类**的 626（不是 623）。已把判据改成
+> 「A1 报的维度是否 = 626」，并新增 `foot_sep_mean` 在线自检（不在 0.05~0.6 就告警）。
+>
+> ⭐ 顺带被数值自证的一件事：**`LL_FOOT`/`LR_FOOT` 找不到是预期的**。Kit 日志原文
+> `link LR_FOOT ... is being merged into right_ankle_roll_link`（URDF 导入器的
+> `merge_fixed_joints`）⇒ 退路 `*_ankle_roll_link` 就是脚部参考点。
+> 实测 `foot_sep_mean = 0.2411` 落在数据集区间内 ⇒ **§3.7 里 `sep_floor=0.145`
+> 可以直接用，不用再重标定**。
 
 ### 6.1 ⚠️ 本地验证的边界（重要）
 
@@ -667,3 +699,10 @@ aux 系数名咬合、`amp_style_reward_coef=0`、以及**把 λ/c 代进两条�
 > 去揀系数的 —— **键名与参数名一旦不咬合，系数会静默变成 1.0，整套公式差一个因子 $c$**。
 >
 > 原以为“最大的实际工作量在参考动作数据格式转换”——**实测后已被证伪**：转换器一天内写完并全部通过 FK 验证（误差 ≤1e-6 m），四元数无需翻转、速度无需手工补、关节序无需重排。真正的风险集中在**数据集速度包络**与**奖励混合的数值一致性**上。
+>
+> 步骤⑦ 补上第六条：**「静态检查全过」和「真能训起来」之间还隔着一层框架约定**。
+> 我们写的诊断量在纯 Python 里怎么测都对，却因为 IsaacLab 的 `_reset_idx` 会把
+> `extras["log"]` **整体替换**、而 `OnPolicyRunner.log()` 又假设 `ep_infos` 里各条 dict
+> 的 key 集合完全相同，直接在**首轮迭代**崩掉。这类约定不看源码是猜不出来的，
+> 而且症状（`KeyError`）离原因（奖励函数里的一行日志）很远。
+> 教训：**往框架的共享字典里写东西前，先确认那个字典的生命周期是谁管的**。
