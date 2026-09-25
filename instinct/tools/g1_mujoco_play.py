@@ -25,12 +25,22 @@
     # 3) 回放（默认开 viewer）
     python tools/g1_mujoco_play.py --policy /path/to/policy.onnx --duration 15
     python tools/g1_mujoco_play.py --policy /path/to/policy.onnx --no-view --record out.mp4
+
+    # 4) ⭐ 键盘遥控（WASD/QE）——平地技能验证
+    #    开窗后先点一下窗口让它获得焦点，然后：
+    #      W/S = 前进/后退(vx)   A/D = 左移/右移(vy)   Q/E = 左转/右转(wz)
+    #      [ ] = 调增量         空格/X = 停止          R   = 复位
+    python tools/g1_mujoco_play.py --policy /path/to/policy.onnx --duration 0
+    python tools/g1_mujoco_play.py --policy /path/to/policy.onnx --duration 0 --cmd-step 0.2
+    #    指令会被夹在训练范围 `CMD_LIMITS` 内（超范围 = 分布外，摔了不代表策略差）。
+    #    离线单测（不开窗）：python tools/test_keyboard_teleop.py
 """
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -431,6 +441,168 @@ def onnx_info(path: str) -> None:
 # 回放
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 键盘遥控（WASD/QE）—— 平地技能验证
+# ---------------------------------------------------------------------------
+
+#: 训练时的速度指令范围，= `instinct_xu` 的 `AMP_WALK_COMMAND_RANGES`
+#: （`tasks/locomotion/config/g1/amp_walk_env_cfg.py:92`）。
+#: 键盘遥控**必须**夹在这个范围内：超出范围属于分布外指令，摔了不代表策略差。
+CMD_LIMITS: tuple[tuple[float, float], ...] = ((-1.0, 1.2), (-0.5, 0.5), (-0.8, 0.8))
+
+#: 键码 → 动作名。**两种键码语义都注册**：
+#:   · GLFW 键码：`glfw.KEY_W == 87`
+#:   · 字符码：   `ord('W') == 87`（恰好相同）、`ord('w') == 119`
+#: `mujoco.viewer.launch_passive(key_callback=...)` 只声明 `Callable[[int], None]`，
+#: 回传的到底是哪一种**没有文档保证**，所以两套都填，避免「按了没反应」。
+_KEY_ACTIONS: dict[int, str] = {}
+
+
+def _register_keys() -> None:
+    import glfw
+
+    spec = [
+        ("W", "vx+", "w"), ("S", "vx-", "s"),
+        ("A", "vy+", "a"), ("D", "vy-", "d"),
+        ("Q", "wz+", "q"), ("E", "wz-", "e"),
+        ("SPACE", "zero", " "), ("R", "reset", "r"), ("X", "zero", "x"),
+        ("LEFT_BRACKET", "step-", "["), ("RIGHT_BRACKET", "step+", "]"),
+    ]
+    for key_name, action, ascii_char in spec:
+        code = getattr(glfw, f"KEY_{key_name}", None)
+        if code is not None:
+            _KEY_ACTIONS[int(code)] = action
+        for ch in {ascii_char, ascii_char.upper()}:
+            _KEY_ACTIONS[ord(ch)] = action
+
+
+_register_keys()
+
+
+def reset_state(model, data) -> None:
+    """把机器人复位到 MJCF 的初始 keyframe（`R` 键与启动时**共用这一份逻辑**）。
+
+    ⚠️ **必须跟一次 `mj_forward`**：`mj_resetDataKeyframe` 只写了 `qpos`/`qvel`，
+    `data.xpos`（body 世界坐标）等派生量仍是**未初始化**的。`height_scan` 要用
+    torso 的 z，不 forward 就会拿到垃圾值（实测首帧 scan=0.5 而非 0.32）→
+    第一帧观测错 → 动作飙到 4 rad → 因为 `last_action` 是无裁剪反馈，
+    直接指数发散到 NaN。
+    """
+    import mujoco
+
+    if model.nkey > 0:
+        mujoco.mj_resetDataKeyframe(model, data, 0)
+    else:
+        mujoco.mj_resetData(model)
+    mujoco.mj_forward(model, data)
+
+
+class KeyboardCommandController:
+    """WASD/QE 键盘遥控器（线程安全）。
+
+    | 按键 | 作用 |
+    |---|---|
+    | `W` / `S` | vx += / -= step（前进 / 后退）|
+    | `A` / `D` | vy += / -= step（左移 / 右移）|
+    | `Q` / `E` | wz += / -= step（左转 / 右转）|
+    | `[` / `]` | 调小 / 调大 step |
+    | `空格` / `X` | 指令清零（原地站立）|
+    | `R` | 复位机器人到初始 keyframe |
+
+    设计取舍：**每次按键 = 一次指令增量**，而不是「按住才动」。因为
+    `key_callback` 没有任何文档保证会同时回传 RELEASE 事件，增量模式在
+    「只给 PRESS」和「PRESS + RELEASE 都给」两种情况下**都正确**。
+
+    线程安全：回调由 viewer 线程调用，主循环在另一条线程，故用锁保护。
+    """
+
+    STEP_PRESETS: tuple[float, ...] = (0.02, 0.05, 0.1, 0.2, 0.4, 0.8)
+
+    def __init__(self, cmd0, step: float = 0.1, limits=CMD_LIMITS, verbose: bool = True):
+        self._lock = threading.Lock()
+        self._limits = tuple(tuple(float(x) for x in pair) for pair in limits)
+        self._verbose = verbose
+        self._reset = False
+        # 初值先夹回训练范围内：`--cmd` 给了超范围的值也不至于一上来就摔。
+        self._cmd = [
+            float(np.clip(float(v), self._limits[i][0], self._limits[i][1]))
+            for i, v in enumerate(cmd0)
+        ]
+        # step 落到最近的预设上，便于 `[` / `]` 连续调整
+        self._step = min(self.STEP_PRESETS, key=lambda p: abs(p - float(step)))
+
+    # -- 由 viewer 线程调用 --------------------------------------------------
+    def on_key(self, keycode: int) -> None:
+        action = _KEY_ACTIONS.get(int(keycode))
+        if action is None:
+            return
+        with self._lock:
+            do_reset = action == "reset"
+            if do_reset:
+                self._reset = True
+            elif action == "zero":
+                self._cmd = [0.0, 0.0, 0.0]
+            elif action in ("step+", "step-"):
+                i = self.STEP_PRESETS.index(self._step)
+                i = min(len(self.STEP_PRESETS) - 1, i + 1) if action == "step+" else max(0, i - 1)
+                self._step = self.STEP_PRESETS[i]
+            else:
+                axis = {"vx": 0, "vy": 1, "wz": 2}[action[:2]]
+                sign = 1.0 if action.endswith("+") else -1.0
+                lo, hi = self._limits[axis]
+                self._cmd[axis] = float(np.clip(self._cmd[axis] + sign * self._step, lo, hi))
+            snapshot, step = tuple(self._cmd), self._step
+        if self._verbose:
+            if do_reset:
+                print("[teleop] R -> 请求复位", flush=True)
+            else:
+                print(f"[teleop] vx={snapshot[0]:+.2f} vy={snapshot[1]:+.2f} "
+                      f"wz={snapshot[2]:+.2f}   (step={step:.2f})", flush=True)
+
+    # -- 由主循环调用 --------------------------------------------------------
+    def poll(self):
+        """返回 `(cmd[3], 复位标志)`；复位标志读取后即清零。"""
+        with self._lock:
+            do_reset = self._reset
+            self._reset = False
+            return np.array(self._cmd, dtype=np.float64), do_reset
+
+    def hud(self):
+        """给 `viewer.set_texts()` 用的两个文本框。"""
+        import mujoco
+
+        with self._lock:
+            c, step, lim = tuple(self._cmd), self._step, self._limits
+        top = (
+            mujoco.mjtFontScale.mjFONTSCALE_150,
+            mujoco.mjtGridPos.mjGRID_TOPLEFT,
+            f"vx={c[0]:+.2f}  vy={c[1]:+.2f}  wz={c[2]:+.2f}",
+            f"step={step:.2f}",
+        )
+        bottom = (
+            mujoco.mjtFontScale.mjFONTSCALE_100,
+            mujoco.mjtGridPos.mjGRID_BOTTOMLEFT,
+            "W/S=vx  A/D=vy  Q/E=wz  [ ]=step  Space/X=stop  R=reset",
+            f"vx{lim[0]} vy{lim[1]} wz{lim[2]}",
+        )
+        return [top, bottom]
+
+    def help_text(self) -> str:
+        lim = self._limits
+        return (
+            "=============== WASD/QE 键盘遥控（先点一下 viewer 窗口让它获得焦点）===============\n"
+            "   W / S      前进 / 后退      (vx)\n"
+            "   A / D      左移 / 右移      (vy)\n"
+            "   Q / E      左转 / 右转      (wz)\n"
+            "   [ / ]      调小 / 调大 每次按键的增量\n"
+            "   空格 / X   指令清零（原地站立）\n"
+            "   R          复位到初始 keyframe\n"
+            f"   指令范围（= 训练范围）: vx{lim[0]}  vy{lim[1]}  wz{lim[2]}\n"
+            "   关闭窗口即退出；每 2 秒打印一次状态。\n"
+            "================================================================================"
+        )
+
+
 def play(args) -> int:
     import mujoco
 
@@ -443,21 +615,17 @@ def play(args) -> int:
 
     # 默认站姿：用 MJCF 的 keyframe（若有），否则用 qpos0
     if model.nkey > 0:
-        mujoco.mj_resetDataKeyframe(model, data, 0)
         default_qpos = model.key_qpos[0].copy()
         print(f"[init] 使用 keyframe 0：{mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_KEY, 0)}")
     else:
         default_qpos = model.qpos0.copy()
         print("[init] 无 keyframe，使用 qpos0")
+    # 复位到初始状态（含必须的 `mj_forward`，见 `reset_state` 的 docstring；
+    # `R` 键走的是同一个函数，逻辑只有一份）
+    reset_state(model, data)
 
     n_joint = model.nu
     default_joint_pos = default_qpos[7 : 7 + n_joint].copy()
-    # ⚠️ 必须 mj_forward 一次：`mj_resetDataKeyframe` 只写了 qpos/qvel，
-    #    `data.xpos`（body 世界坐标）等派生量还是**未初始化**的。
-    #    height_scan 要用 torso 的 z，不 forward 就会得到垃圾值（实测首帧
-    #    scan=0.5 而非 0.32）→ 第一帧观测错 → 动作飙到 4 rad → 因为 last_action
-    #    是无裁剪反馈，直接指数发散到 NaN。
-    mujoco.mj_forward(model, data)
     # ⚠️ action_scale 在下面（知道 obs_mode 之后）才能定 —— 两种任务的约定不同，
     #    见那里的注释（这是个能把机器人直接搞摔的坑）。
 
@@ -583,7 +751,9 @@ def play(args) -> int:
 
     dt = model.opt.timestep
     decimation = max(1, int(round((1.0 / args.policy_hz) / dt)))
-    n_steps = int(args.duration / (dt * decimation))
+    # `--duration 0`（或负数）= **无限运行**，直到手动关闭 viewer 窗口。
+    infinite = args.duration <= 0
+    n_steps = 10**9 if infinite else int(args.duration / (dt * decimation))
 
     renderer = None
     frames: list[np.ndarray] = []
@@ -591,14 +761,38 @@ def play(args) -> int:
         renderer = mujoco.Renderer(model, height=args.height, width=args.width)
 
     viewer_ctx = None
+    teleop: KeyboardCommandController | None = None
     if args.view:
         import mujoco.viewer
 
-        viewer_ctx = mujoco.viewer.launch_passive(model, data)
+        if args.teleop:
+            teleop = KeyboardCommandController(cmd, step=args.cmd_step, limits=CMD_LIMITS)
+            print("\n" + teleop.help_text())
+        viewer_ctx = mujoco.viewer.launch_passive(
+            model, data, key_callback=teleop.on_key if teleop is not None else None
+        )
 
-    print(f"[run] {n_steps} policy steps @ {args.policy_hz} Hz (decimation={decimation}, dt={dt})")
+    total_txt = "inf" if infinite else str(n_steps)
+    print(f"[run] {total_txt} policy steps @ {args.policy_hz} Hz (decimation={decimation}, dt={dt})")
     try:
         for step in range(n_steps):
+            # --- 键盘遥控：每步覆盖 cmd / 处理复位 / 关窗即退出 ---
+            if teleop is not None:
+                if viewer_ctx is not None and not viewer_ctx.is_running():
+                    print("\n[teleop] viewer 窗口已关闭，退出")
+                    break
+                cmd, do_reset = teleop.poll()
+                if do_reset:
+                    # ⚠️ 复位必须同时清 `last_action`：不清的话策略会把「上一段生命
+                    #    末期的大动作」当作第一帧输入，直接指数发散（见 §13 坑 2）。
+                    reset_state(model, data)
+                    last_action = np.zeros(n_joint, dtype=np.float64)
+                    print("[teleop] 已复位到初始 keyframe（last_action 已清零）")
+                if step % 25 == 0 and viewer_ctx is not None:
+                    viewer_ctx.set_texts(teleop.hud())
+                if step % 100 == 0:
+                    print(f"  [teleop] step {step:>6}  h={data.qpos[2]:.3f}  "
+                          f"cmd=({cmd[0]:+.2f}, {cmd[1]:+.2f}, {cmd[2]:+.2f})")
             # --- policy 推理 ---
             if policy is not None:
                 obs = obs_builder.build(cmd, last_action)
@@ -747,7 +941,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--policy-type", choices=["auto", "onnx", "torch"], default="auto")
     ap.add_argument("--cmd", nargs=3, type=float, default=[0.5, 0.0, 0.0], metavar=("VX", "VY", "WZ"),
                     help="速度指令 (默认 0.5 0.0 0.0)")
-    ap.add_argument("--duration", type=float, default=10.0, help="回放时长（秒）")
+    ap.add_argument("--duration", type=float, default=10.0,
+                    help="回放时长（秒）；**0 = 无限运行直到关闭窗口**（键盘遥控时用）")
     ap.add_argument("--policy-hz", type=float, default=50.0, help="策略频率（InstinctLab=50Hz）")
     ap.add_argument("--history", type=int, default=8, help="观测历史帧数（对齐训练配置）")
     ap.add_argument("--action-scale", type=float, default=0.25,
@@ -756,6 +951,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--kd", type=float, default=2.0, help="手动 PD 的 kd")
     ap.add_argument("--view", dest="view", action="store_true", default=True, help="打开 viewer（默认开）")
     ap.add_argument("--no-view", dest="view", action="store_false", help="不开 viewer（headless）")
+    ap.add_argument("--teleop", dest="teleop", action="store_true", default=True,
+                    help="开 viewer 时启用 WASD/QE 键盘遥控（默认开）")
+    ap.add_argument("--no-teleop", dest="teleop", action="store_false",
+                    help="关掉键盘遥控（指令固定为 --cmd）")
+    ap.add_argument("--cmd-step", type=float, default=0.1, help="键盘每次按键的指令增量（默认 0.1）")
     ap.add_argument("--record", help="录制到 mp4（需 imageio）")
     ap.add_argument("--record-every", type=int, default=1, help="每 N 个策略步录一帧")
     ap.add_argument("--width", type=int, default=640)

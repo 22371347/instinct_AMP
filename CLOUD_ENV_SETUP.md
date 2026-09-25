@@ -809,3 +809,97 @@ python instinct/tools/g1_mujoco_play.py --policy instinct/eval/actor_model_5000.
 |---|---|---|
 | **Kit 不响应普通 SIGTERM** | `pkill -f <训练>` 后 `nvidia-smi` 仍占着 ~5.9 GB，`pgrep` 里进程**还活着** → 和新任务抢显存、存在 OOM 风险 | 用 `pkill -9`（SIGKILL）；杀完务必 `pgrep -af train.py` + `nvidia-smi` 各确认一遍 |
 
+---
+
+## 14. 本地键盘遥控（WASD/QE）平地技能验证（2026-09-25）
+
+### 14.1 结论：本地**已支持**，且是"开窗交互 + 离屏录像"两种都在
+
+依赖逐项审计（`pip list` + `ctypes.util.find_library`，实测）：
+
+| 需要的东西 | 本地状态 | 用途 |
+|---|---|---|
+| `mujoco 3.13.0` | ✅ | 物理步进（**纯 CPU，不占显存**） |
+| `glfw 2.10.2` + `libglfw.so.3` | ✅ | 交互式开窗 |
+| `OpenGL 3.1.10`(PyOpenGL) + `libGL.so.1` | ✅ | 窗口渲染 |
+| `DISPLAY=:1` + `/tmp/.X11-unix/X1` | ✅ | X11 会话存在（`XDG_SESSION_TYPE=x11`） |
+| `libEGL.so.1` | ✅ | 离屏渲染（`--record` 用） |
+| `imageio 2.37.4` + `imageio_ffmpeg 0.6.0` | ✅ | 直出 mp4 |
+| `onnxruntime 1.30.0` | ✅ | 跑策略 |
+
+### 14.2 用法
+
+```bash
+source /home/leo/miniconda3/etc/profile.d/conda.sh && conda activate instinct
+
+# 键盘遥控（--duration 0 = 无限运行，关窗口退出）
+python instinct/tools/g1_mujoco_play.py \
+  --policy instinct/eval/actor_model_5000.onnx --duration 0
+
+# 调大每次按键的增量（默认 0.1）
+python instinct/tools/g1_mujoco_play.py --policy ... --duration 0 --cmd-step 0.2
+
+# 关掉遥控（固定指令）/ 不退窗口地录像
+python instinct/tools/g1_mujoco_play.py --policy ... --no-teleop --duration 15
+python instinct/tools/g1_mujoco_play.py --policy ... --no-view --record out.mp4
+```
+
+**开窗后必须先点一下窗口让它获得焦点**，否则按键不会送到 GLFW。
+
+| 按键 | 作用 |
+|---|---|
+| `W` / `S` | `vx` += / −= step（前进 / 后退）|
+| `A` / `D` | `vy` += / −= step（左移 / 右移）|
+| `Q` / `E` | `wz` += / −= step（左转 / 右转）|
+| `[` / `]` | 调小 / 调大 step（预设 `0.02/0.05/0.1/0.2/0.4/0.8`）|
+| `空格` / `X` | 指令清零（原地站立）|
+| `R` | 复位到初始 keyframe |
+
+窗口左上角 HUD 实时显示 `vx/vy/wz` 与 step，左下角显示键位表与训练范围。
+
+### 14.3 实现的 4 个关键取舍（都是踩过的点）
+
+1. **每次按键 = 一次指令增量**，而不是"按住才动"。
+   `launch_passive(key_callback=...)` 的签名只声明 `Callable[[int], None]`，
+   **没有任何文档保证会同时回传 RELEASE 事件**（实际转发在 C++ 扩展
+   `mujoco._simulate` 里）。增量模式在"只给 PRESS"和"PRESS+RELEASE 都给"
+   两种情况下**都正确**，所以选了它。
+2. ⭐ **两种键码语义都注册**。`glfw.KEY_W == 87 == ord('W')`（字母/空格/括号的
+   GLFW 码恰好等于**大写** ASCII），但**小写**字符码是 `ord('w') == 119`。
+   由于回传的到底是 GLFW 键码还是字符码没有官方保证，键位表里把
+   **GLFW 码 + 大写 ASCII + 小写 ASCII 三套都填上**，避免"按了没反应"。
+3. ⭐ **指令必须夹在训练范围内**。`CMD_LIMITS = ((-1.0,1.2), (-0.5,0.5), (-0.8,0.8))`
+   = `AMP_WALK_COMMAND_RANGES`（`amp_walk_env_cfg.py:92`）。
+   超范围的指令属于**分布外**，摔了**不代表策略差**，只是没训过 —— 不夹住会得出错误结论。
+4. ⭐ **`R` 复位必须同时清零 `last_action`**。否则策略会把"上一段生命末期的大动作"
+   当作第一帧输入 → 因为 `last_action` 是**无裁剪反馈**，直接指数发散到 NaN（§13 坑 2
+   的同一个机制）。复位逻辑统一收进 `reset_state()`，启动时和 `R` 键**共用一份**。
+
+### 14.4 能力边界（平地足够，越障不行）
+
+- ⭐ **平地回放是忠实的**：`height_scan` 在脚本里就是平地精确解
+  `np.full(527, torso_z − 0.5)`，与 IsaacLab 的 527 条真射线在**平地上逐位相同**。
+  实测 `height_scan[0] = 0.3200`（torso_z=0.82）✅
+- ❌ **越障无法本地验证**：需要 MJCF 里有地形 + 527 条**真实射线**扫描，
+  当前两者都没有。能力边界写在脚本 docstring 里，不装作能测。
+- 本项目当前策略也**只在 Plane 上训练**（`G1AmpWalkPlane…`），所以平地验证**正好是对口**的。
+
+### 14.5 验证记录（2026-09-25，全过）
+
+| 验证 | 手段 | 结果 |
+|---|---|---|
+| 键位表（两套键码语义） | `instinct/tools/test_keyboard_teleop.py` | ✅ 全过（含 `ord('w')=119` 与 `glfw.KEY_W=87` 双命中） |
+| 指令演进 / 夹范围 / step 预设 / 复位标志只生效一次 / 未知键安全忽略 | 同上（**30 项**） | ✅ `[KEYBOARD-TELEOP PASS]` |
+| `reset_state` + `mj_forward` | 同上（真实 MJCF，故意弄脏 qpos/qvel 再复位） | ✅ root z=0.82、qvel 归零、`xpos` 已初始化、幂等 |
+| 重构后的 reset 路径没破坏观测 | `--selftest-obs`（**不开窗口**） | ✅ 626 维、`height_scan=0.3200`、`projected_gravity=(0,0,-1)` |
+| 主循环改动没破坏闭环 | `--no-view --duration 2 --cmd 0.5 0 0` | ✅ 走完 100 步，高度稳在 0.79–0.82，`\|v\|≈0.42~0.50` |
+
+> 单测是**离线**的（不开窗口、不跑策略），所以可以随时跑；
+> 但「按键到底有没有送进 GLFW」这一点**只能人工开窗确认** —— 留给你。
+
+### 14.6 已知的非阻塞现象：动作幅度很大
+
+回放日志里 `[act] min=-8.155 max=16.988` —— 这不是 bug：策略把大部分目标角**推到关节限位**
+（bang-bang），与训练侧 `tracking_action/abs_max ≈ 29.7`、以及 §13.5 的结论一致。
+`scale=1.0` + `init_noise_std=1.0`（绝对 σ）是它的根源，见 `PLAN_amp_walk.md` §9。
+
