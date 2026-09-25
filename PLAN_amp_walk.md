@@ -1366,3 +1366,77 @@ v1 实测 7.2° ⇒ **−1.0 这个权重确实几乎没改变姿态**（与 §1
 且 `track_default_pose_on_stand` 是**门控**的（`exp(−cmd_speed/0.25)`），
 走路时对 70% 以上环境只剩 <20% 强度、对 vx>1 m/s 只剩 2%（`cmd_speed` 含 `|wz|`，
 所以原地转身也会把它关掉）。
+
+---
+
+### 11.8 ⭐ 诊断：为什么 `track_default_pose_on_stand` = −0.1 与"静止时单脚跳"**不矛盾**
+
+**背景**：MuJoCo 回放显示静止时仍维持**单脚跳跃**、左右完全不对称；用户据此怀疑
+−0.1 与现象矛盾。结论：**−0.1 小是因为门控关着，不是姿态好。**
+
+#### （a）`joint_error_rmse/<joint>` 就是「相对 default pose 的偏差」，且**不门控**
+
+`mdp/loco_metrics.py:24,52`：
+
+```python
+joint_error = robot.data.joint_pos - robot.data.default_joint_pos      # 逐关节偏差
+log[f"joint_error_rmse/{joint_name}"] = torch.sqrt(torch.mean(joint_error[:, index].square()))
+```
+
+⇒ 这才是判断姿态的正确指标（**已经在记录，只是没进 digest 汇总**）。
+
+#### （b）v3c_cont @5390 实测的数值构成
+
+| 量 | 值 |
+|---|---|
+| 平均关节偏差 RMS | **0.6636 rad = 38.0°**（@2180 是 0.512 rad = 29° ⇒ **在变差**）|
+| 位置项上界 `4·mean\|Δq\|` | **2.654 /步**（gate=1 时）|
+| TB `Episode_Reward/track_default_pose_on_stand` | **−0.0978 /秒** |
+| ⇒ **等效门控质量** | **0.0368** ← 该项 96% 的样本上不生效 |
+| `command_bins/vx_low_fraction` | 0.0835 |
+
+#### （c）偏差最大的是**手臂**，不是腿
+
+| 关节 | RMS(rad) | 度 |
+|---|---|---|
+| **right_shoulder_roll** | **2.0338** | **116.5** |
+| left_shoulder_roll | 1.5495 | 88.8 |
+| left_elbow / right_elbow | 1.4883 / 1.4860 | 85.3 / 85.1 |
+| right_wrist_roll | 1.3359 | 76.5 |
+| right_shoulder_yaw / pitch | 1.0356 / 1.0029 | 59.3 / 57.5 |
+| （最小）left_ankle_roll / waist_yaw | 0.19 ~ 0.20 | 11 |
+
+腿（相对好）：hip_pitch 0.615/0.294、knee 0.302/0.400、ankle_pitch 0.228/0.354（13~35°）
+
+#### （d）左右不对称：集中在**臂**，且**右臂更大**
+
+| 分组 | Σ(R−L) RMS | 每关节均值 |
+|---|---|---|
+| 臂 7 组 | **+1.739** | +0.248 |
+| 腿 6 组 | +0.159 | +0.026 |
+
+最大项：`shoulder_pitch` **R/L = 2.41**、`shoulder_roll` +0.484、`wrist_roll` +0.399、
+**`hip_pitch` −0.322（左>右）**。
+⇒ 左 hip_pitch 偏大 + 右 knee/ankle_pitch 偏大 = **一条腿屈/抬、另一条伸**的单脚支撑特征。
+
+#### （e）根因（四条，按重要性）
+
+1. **门控**：`active = exp(−cmd_speed/0.25)`，走路时 →0；实测等效门控质量仅 **0.037**。
+   ⇒ `Episode_Reward/track_default_pose_on_stand` 是一个**被关掉的量的平均值**，与姿态好坏几乎无关。
+2. **它是 29 关节的 mean，对"哪个关节"盲**：单关节偏 2.03 rad 只贡献 `2.03/29 = 0.070`
+   → 罚 `4×0.070 = 0.28`。**且左右互换后均值完全相同 ⇒ 对对称性完全盲目。**
+3. **整个任务奖励对镜像变换不变** ⇒ **对称步态与单脚跳在任务奖励上简并**，
+   梯度里没有任何破简并的信号。
+4. 唯一的破对称信号是 **AMP 判别器**，但它是**全局标量**
+   （`clamp(1 − 0.25(d−1)², 0)`，`d` 给**整条 transition** 打分）⇒ 无法定位到关节。
+   另外 `pos_joint_weights` 只给 `waist_yaw` ×3，腿/臂都没加权。
+
+#### （f）下一步候选
+
+1. **恢复 `joint_deviation_arms`（−0.1）** —— 无门控、覆盖 7 个手臂关节（L1 sum），
+   正对偏差最大的部位 ← **最直接、代价最小**
+2. 给 `track_default_pose_on_stand` 的腿/臂加 `pos_joint_weights`（仍受门控 ⇒ 走路时无效）
+3. 自写**不门控**的 per-joint 偏差项（唯一"走/站都生效"的做法）
+4. **对称性**：⚠️ **不要**直接罚 `|q_L − mirror(q_R)|` —— 正常步态本来就左右交替；
+   更稳的是提高 `discriminator_reward_coef` 或换一个能定位到关节的风格项
+5. 把「臂/腿/腰分组平均偏差 + 左右不对称度」加进 `digest.txt`，让姿态有可见指标
