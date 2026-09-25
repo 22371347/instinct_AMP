@@ -27,10 +27,12 @@ v1（`amp_walk_env_cfg.G1AmpWalkRewardsCfg`）的奖励集是
                                    amp_loco 奖励表无此项（只在其 velocity
                                    任务里有）。实测贡献仅 +0.018/s，但方向
                                    本身是错的。
-``joint_deviation_knee`` −0.05    把膝关节往 default（直腿）拽。走路需要
-``joint_deviation_hip``  −0.1     屈膝屈髋的腾空相，这 4 项与正常步态**正
-``joint_deviation_arms`` −0.1     面对抗**。AMP_mjlab 无这 4 项。
-``joint_deviation_torso``−0.1
+``joint_deviation_knee`` −0.05    ⚠️ **理由有错，见 `PLAN_amp_walk.md` §12**：
+``joint_deviation_hip``  −0.1     当时写的是「把关节往直腿 default 拽」，但
+``joint_deviation_arms`` −0.1     实测 default 是**屈膝**姿态（膝 0.669 rad
+``joint_deviation_torso``−0.1     ≈ 38°），所以这个理由站不住。真正的代价是：
+                                 这 4 项是**不带门控的“把关节拉住 default”罚”，
+                                 正是「关节漂到限位」的唯一持续刹车。
 ``flat_orientation_l2``  −1.0     与新增的 `body_ang_vel_xy` 语义重叠；
                                    AMP_mjlab 只保留后者。
 ``stand_still``          −0.8     与新增的 `track_default_pose_on_stand`

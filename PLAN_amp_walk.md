@@ -834,7 +834,7 @@ v1（5000 迭代）出现**单脚支撑 + 跳跃**的异常步态：回合 464/1
 | 被删项 | v1 权重 | 删除理由 |
 |---|---|---|
 | `feet_air_time` | +1.0 | `sum(in_contact)==1` 才给分 → **构造上奖励单脚支撑**；AMP_mjlab 无 |
-| `joint_deviation_knee/hip/arms/torso` | −0.05/−0.1/−0.1/−0.1 | 把关节往 default（直腿）拽，与屈膝屈髋的行走腾空相**正面对抗** |
+| `joint_deviation_knee/hip/arms/torso` | −0.05/−0.1/−0.1/−0.1 | ⚠️ **见 §12 的更正**：当时的理由是「把关节往直腿 default 拽、与行走腾空相对抗」，**实测 default 姿态是屈膝的**（膝 0.669 rad ≈ 38°），所以这个理由**站不住** |
 | `flat_orientation_l2` | −1.0 | 与新增的 `body_ang_vel_xy` 语义重叠 |
 | `stand_still` | −0.8 | 与新增的 `track_default_pose_on_stand`(−1.0) 语义重叠 |
 | `lin_vel_z_l2` | −0.1 | 抑制竖直速度 → **直接压制起跳/落地** |
