@@ -80,6 +80,17 @@ SKIP_FULL = os.environ.get("LLP_SKIP_FULL", "") != ""
 LERP = float(os.environ.get("LLP_LERP", "0.75"))
 C_COEF = float(os.environ.get("LLP_C", "0.1"))
 EP_LEN_S = float(os.environ.get("LLP_EP_LEN_S", "20.0"))
+#: 策略频率。⚠️ 两个口径换算倍数不同：
+#:   `Episode_Reward/*` = `episode_sum / max_episode_length_s` ⇒ **每秒速率** ⇒ ×EP_LEN_S
+#:   `Step/*`            = 每步瞬时值的均值             ⇒ **每步值**   ⇒ ×EP_LEN_S×HZ
+#: 搞混会整整差 50 倍。
+HZ = float(os.environ.get("LLP_POLICY_HZ", "50"))
+EP_LEN_STEPS = EP_LEN_S * HZ
+#: 原始风格奖励（= 判别器的 quad 奖励 r_amp ∈ [0,1]）。
+#: `algorithms.py` 里 `aux["amp_style_reward"] = r_amp`，**只写日志、不进奖励**
+#: （真的进奖励的是 lerp 混合后的 `discriminator_reward`）。
+STYLE_TAG_NAME = os.environ.get("LLP_STYLE_TAG", "Step/amp_style_reward")
+DISCRIMINATOR_TAG_NAME = os.environ.get("LLP_DISC_TAG", "Step/discriminator_reward")
 NUM_REWARDS = int(os.environ.get("LLP_NUM_REWARDS", "1"))
 SMOOTH = int(os.environ.get("LLP_SMOOTH", "100"))
 DPI = int(os.environ.get("LLP_DPI", "130"))
@@ -396,11 +407,16 @@ class Plotter:
         """最终奖励里 task 与 AMP 风格各占多少。
 
         本仓库：R = λ·r_task + (1-λ)·c·r_amp
-          - r_task（episode 总任务奖励）= ep_len_s × Σ Episode_Reward/*
-            （Episode_Reward/* 是"每秒平均"，与 Train/mean_reward 同口径需乘 ep_len_s）
+          - r_task（episode 总任务奖励）= `Episode_Reward_sum` × EP_LEN_S
+            （IsaacLab: `Episode_Reward/x = episode_sum / max_episode_length_s`
+             ⇒ 乘回 EP_LEN_S 就还原成 episode 总和）
           - task 贡献 = λ · r_task
-          - 风格贡献 = R − λ·r_task           （= (1-λ)·c·r_amp）
-        ⚠️ λ=0.75 不代表风格占 25%：实际风格权重是 (1-λ)·c。
+          - **风格贡献 = (1-λ)·c·r_amp，其中 r_amp 是实测值**
+            （TB 的 `Step/amp_style_reward`；它是 quad 形式 ∈ [0,1]，
+             ⇒ **风格贡献恒非负且 ∈ [0, (1-λ)·c]**）
+        ⚠️ 单位不同：`Episode_Reward/*` 是每秒速率 ⇒ ×EP_LEN_S（=max_episode_length_s）；
+           `Step/*` 是每步均值 ⇒ ×**该回合实际走了多少步**。搞混会差一个量级。
+        ⚠️ λ=0.75 不代表风格占 25%：实际风格权重是 (1-λ)·c = 0.025。
         """
         s_fin, v_fin = self.get(f"Train/mean_reward_{0}", smooth=1)
         if len(v_fin) == 0:
@@ -413,21 +429,54 @@ class Plotter:
                 parts.append((s, v))
         v_task_raw = _align_to(s_fin, parts) * EP_LEN_S      # 每秒率 → episode 总奖励
         task_contrib = LERP * v_task_raw
-        amp_contrib = v_fin - task_contrib
+
+        # ⭐ 风格贡献：**实测**（旧版用残差 `v_fin - λ·r_task`，那不是测量值，
+        #    它的零交叉是代数恒等式，会让人误判 AMP 退步）
+        s_amp, v_amp = self.get(STYLE_TAG_NAME, smooth=1)
+        # ⚠️ 乘的是**实测的平均回合步数**，不是最大步数 EP_LEN_STEPS：`Step/*` 是每步均值，
+        #    风格贡献的 episode 总和 = (1−λ)·c·r_amp × 该回合实际走了多少步。
+        #    用最大值（EP_LEN_STEPS = 20s×50Hz = 1000）会把不足整长的回合高估 2~3 倍
+        #    —— 实测平均回合只有 ~400~520 步，这就是之前残差 −1.40 的来源。
+        s_len, v_len = self.get("Train/mean_episode_length", smooth=1)
+        if len(v_len):
+            v_len_al = _align_to(s_fin, [(s_len, v_len)])
+        else:
+            v_len_al = np.full(len(s_fin), EP_LEN_STEPS)
+        if len(v_amp) == 0:
+            amp_contrib = v_fin - task_contrib
+            style_src = f"⚠️ 残差 v_fin−λ·r_task（TB 缺 {STYLE_TAG_NAME}，非实测）"
+        else:
+            amp_contrib = (1.0 - LERP) * C_COEF * _align_to(s_fin, [(s_amp, v_amp)]) * v_len_al
+            style_src = "实测 r_amp × (1−λ)·c × 实测回合步数"
+        # 自检：两项贡献之和应当 ≈ final，差值就是误差（含 env 平均口径差异）
+        resid = v_fin - task_contrib - amp_contrib
 
         s_s, v_fin_s = smooth_series(s_fin, v_fin, 100)
         _, v_task_s = smooth_series(s_fin, task_contrib, 100)
         _, v_amp_s = smooth_series(s_fin, amp_contrib, 100)
+        _, v_sum_s = smooth_series(s_fin, task_contrib + amp_contrib, 100)
+        _, v_res_s = smooth_series(s_fin, resid, 100)
 
         fig, axes = plt.subplots(1, 2, figsize=(16, 6))
         fig.suptitle(
-            f"AMP vs Task Share in Final Reward   (λ={LERP}, c={C_COEF}"
-            f" → 风格权重 (1-λ)·c={ (1 - LERP) * C_COEF :.4f})", fontsize=13)
+            f"Task vs AMP Contribution (both MEASURED)   "
+            f"(λ={LERP}, c={C_COEF} → 风格权重 (1-λ)·c={ (1 - LERP) * C_COEF :.4f})",
+            fontsize=13)
 
         ax = axes[0]
         ax.plot(s_s, v_fin_s, lw=1.5, color="k", label="final (Train/mean_reward_0)")
-        ax.plot(s_s, v_task_s, lw=1.2, color="tab:blue", label=f"task contrib (λ·r_task)")
-        ax.plot(s_s, v_amp_s, lw=1.2, color="tab:orange", label="AMP contrib (R − λ·r_task)")
+        ax.plot(s_s, v_task_s, lw=1.2, color="tab:blue", label="task contrib (λ·r_task)")
+        ax.plot(s_s, v_amp_s, lw=1.8, color="tab:orange", label=f"AMP contrib — {style_src}")
+        ax.plot(s_s, v_sum_s, lw=1.0, color="tab:green", ls="--", label="task + AMP")
+        ax.plot(s_s, v_res_s, lw=0.8, color="gray", alpha=0.7,
+                label="残差 final−(task+AMP)  ← 自检，应接近 0")
+        if len(s_s):
+            ax.annotate(
+                f"@last  final={v_fin_s[-1]:.2f}\n"
+                f"task={v_task_s[-1]:.2f}   AMP={v_amp_s[-1]:.4f}\n"
+                f"task+AMP={v_sum_s[-1]:.2f}   resid={v_res_s[-1]:.2f}",
+                xy=(0.02, 0.02), xycoords="axes fraction", fontsize=8, va="bottom",
+                bbox=dict(fc="w", ec="0.7", alpha=0.85))
         ax.set_title("Contribution Magnitude (episode sum)")
         ax.set_xlabel("iteration")
         ax.set_ylabel("reward")
@@ -435,22 +484,33 @@ class Plotter:
         ax.legend(fontsize=8)
 
         ax = axes[1]
-        denom = np.abs(v_fin_s)
-        valid = denom > 1e-6
-        p_task = np.where(valid, np.clip(v_task_s / np.maximum(denom, 1e-6), 0, 1), np.nan)
-        p_amp = np.where(valid, np.clip(v_amp_s / np.maximum(denom, 1e-6), 0, 1), np.nan)
-        ax.fill_between(s_s, 0, np.nan_to_num(p_task) * 100, color="tab:blue",
-                        alpha=0.6, label="task %")
-        ax.fill_between(s_s, np.nan_to_num(p_task) * 100,
-                        np.nan_to_num(p_task + p_amp) * 100, color="tab:orange",
-                        alpha=0.6, label="AMP %")
+        # 力比用**非负分母** |task|+|AMP|：两项符号相反时用 v_fin 作分母会出鬼数
+        denom = np.abs(v_task_s) + np.abs(v_amp_s)
+        valid = denom > 1e-9
+        p_task = np.where(valid, np.abs(v_task_s) / np.maximum(denom, 1e-9), np.nan) * 100.0
+        p_amp = np.where(valid, np.abs(v_amp_s) / np.maximum(denom, 1e-9), np.nan) * 100.0
+        ax.fill_between(s_s, 0, np.nan_to_num(p_task), color="tab:blue",
+                        alpha=0.6, label="|task| share")
+        ax.fill_between(s_s, np.nan_to_num(p_task),
+                        np.nan_to_num(p_task + p_amp), color="tab:orange",
+                        alpha=0.6, label="|AMP| share")
         ax.set_ylim(0, 100)
-        ax.set_title("Share in Final Reward (%)")
+        if len(s_s):
+            ax.annotate(f"@last  |task|={p_task[-1]:.1f}%   |AMP|={p_amp[-1]:.3f}%",
+                        xy=(0.02, 0.02), xycoords="axes fraction", fontsize=8, va="bottom",
+                        bbox=dict(fc="w", ec="0.7", alpha=0.85))
+        ax.set_title("Force Share  |task| vs |AMP|  (non-negative denominator)")
         ax.set_xlabel("iteration")
         ax.set_ylabel("percent")
         ax.grid(alpha=0.3)
         ax.legend(fontsize=9)
         self.save(fig, "06_amp_task_split.png")
+
+        # 控制台摘要（方便 grep 自检）
+        if len(s_s):
+            print(f"[INFO][{self.mode}] 06: @{int(s_s[-1])}  final={v_fin_s[-1]:.2f}  "
+                  f"task={v_task_s[-1]:.2f}  AMP={v_amp_s[-1]:.4f}  "
+                  f"sum={v_sum_s[-1]:.2f}  resid={v_res_s[-1]:.2f}  |AMP|占={p_amp[-1]:.3f}%")
 
     # --- 文本摘要 ---
     def digest(self) -> list[str]:
