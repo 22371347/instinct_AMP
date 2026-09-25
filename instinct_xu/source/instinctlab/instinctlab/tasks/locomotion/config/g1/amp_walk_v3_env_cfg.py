@@ -78,6 +78,7 @@ import os
 
 from isaaclab.envs import mdp
 from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
 from .amp_walk_env_cfg import (
@@ -93,8 +94,9 @@ from .amp_walk_v2_env_cfg import (
     G1AmpWalkV2RewardsCfg,
 )
 
-#: v3 的 run_name（= 日志目录前缀）。`ar` = action_rate，`ns` = noise std。
-AMP_WALK_V3_RUN_NAME = "G1AmpWalkV3Plane_obs626_rew12_ar0.02_ns0.3"
+#: v3 的 run_name（= 日志目录前缀）。`ar` = action_rate，`ns` = noise std，
+#: `rew14` = 奖励集项数（v2 的 12 项 + 恢复的 flat_orientation_l2 / joint_deviation_torso）。
+AMP_WALK_V3_RUN_NAME = "G1AmpWalkV3Plane_obs626_rew14_ar0.02_ns0.3"
 
 #: v3 的 AMP 参考数据集 = AMP_mjlab 精选 7 clip（6 行走 + 1 慢跑）。
 #: 动机与逐条对应见该 yaml 的注释；要恢复 17 clip 只需把本常量改回
@@ -102,6 +104,15 @@ AMP_WALK_V3_RUN_NAME = "G1AmpWalkV3Plane_obs626_rew12_ar0.02_ns0.3"
 AMP_WALK_V3_MOTION_SELECTION_FILE = os.path.join(
     MOTION_DIR, "amp_walk_v3_motion_selection.yaml"
 )
+
+#: ⭐ 恢复的躯干水平项权重。`flat_orientation_l2` 的 `func` 是
+#: `sum(projected_gravity_b[:, :2]²)` = **root/pelvis 相对重力方向倾斜的 sin²**。
+#: **用户选定 −1.0 = 基类（v1）原值**（最保守）。
+#: ⚠️ 实测提醒（保留供日后对比）：v1 用 −1.0 时该项贡献仅 **−0.016/s**
+#: （反推平均倾斜 ~7.2°），对照任务正向项 ~+1.6/s ⇒ **−1.0 几乎不构成约束**
+#: （歪 10° 才 −0.030、20° 才 −0.117 = 正向收益的 7%）。
+#: 若本轮姿态歪斜没改善，优先把它提到 **−5.0**（歪 20° → −0.585，占 36%）。
+AMP_WALK_V3_FLAT_ORI_WEIGHT = -1.0
 
 #: v3 的指令范围 = AMP_mjlab v4 的 `env_cfgs.py:285-290`。
 AMP_WALK_V3_COMMAND_RANGES = ((-0.7, 2.0), (-1.0, 1.0), (-1.57, 1.57))
@@ -183,6 +194,8 @@ class G1AmpWalkV3CommandsCfg(G1AmpWalkCommandsCfg):
 #: v3 相对 v2 的改动（唯一的事实来源，供日志/文档引用）
 AMP_WALK_V3_CHANGES: tuple[tuple[str, float, float], ...] = (
     ("rewards.action_rate_l2", -0.01, -0.02),
+    ("rewards.flat_orientation_l2", float("nan"), -1.0),  # 从「删除」恢复
+    ("rewards.joint_deviation_torso", float("nan"), -0.1),  # 从「删除」恢复
     ("policy.init_noise_std", 1.0, 0.3),
     ("algorithm.clip_min_std", 0.05, 0.015),
 )
@@ -190,9 +203,15 @@ AMP_WALK_V3_CHANGES: tuple[tuple[str, float, float], ...] = (
 
 @configclass
 class G1AmpWalkV3RewardsCfg(G1AmpWalkV2RewardsCfg):
-    """v2 的 12 项配方，只把 `action_rate_l2` 从 −0.01 提到 −0.02。
+    """v2 的 12 项配方 → **14 项**，共 4 处改动：
 
-    `func` 逐字沿用基类，只动 `weight`。动机见模块 docstring。
+    1. `action_rate_l2`：−0.01 → **−0.02**（补回密集梯度，抑制 σ 膨大）；
+    2. 从「删除」恢复 `flat_orientation_l2`：weight **−1.0**（基类原值）；
+    3. 从「删除」恢复 `joint_deviation_torso`：weight **−0.1**（覆盖 `waist_.*`）；
+    4. 其余 11 项（含 v2 的 `dof_pos_limits` −10.0 / `dof_acc_l2` −2.5e-7）原样保留。
+
+    `func` 逐字沿用基类，只动 `weight`；新增的两项连 `params` 也逐字沿用基类。
+    动机见模块 docstring。
     """
 
     def __post_init__(self):
@@ -201,13 +220,38 @@ class G1AmpWalkV3RewardsCfg(G1AmpWalkV2RewardsCfg):
         # 取中间值 −0.02，兼顾「足够密集的信号」与「不过度惩罚动作变化」。
         self.action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.02)
 
+        # ⭐ 恢复 `flat_orientation_l2`（v2 删掉的 9 项之一）。
+        #   用户实测：初次训练后模型**姿态歪斜** → 难以平衡、速度无法跟踪
+        #   （略改变姿态就棓倒）。该项惩罚躯干/骨盆非水平，鼓励直立。
+        #   ⚠️ 它读的是 **root/pelvis** 的 projected_gravity（不是 torso_link）：
+        #   如果歪斜来自腰部关节（waist_pitch/roll 行程只有 ±0.520 rad），
+        #   本项可能盖不住，那种情况要靠 `joint_deviation_torso` 或
+        #   躯干专用的 tilt 项（AMP_mjlab 有 `torso_posture`，但默认是注释掉的）。
+        #   ⚠️ 必须在 super() 之后写：v2 的 `__post_init__` 会把它置成 None。
+        self.flat_orientation_l2 = RewTerm(
+            func=mdp.flat_orientation_l2, weight=AMP_WALK_V3_FLAT_ORI_WEIGHT
+        )
+
+        # ⭐ 同时恢复 `joint_deviation_torso`（−0.1，覆盖 `waist_.*`）。
+        #   理由：`flat_orientation_l2` 读的是 **root/pelvis** 的 projected gravity，
+        #   而 `waist_pitch` / `waist_roll` 的行程只有 **±0.520 rad**（除踝外最挤的两个）
+        #   —— 腰部歪斜不会体现在骨盆倾角上，必须靠这一项。
+        #   另一个作用：它也是「腰关节漂到限位」的唯一专项刹车。
+        #   基类定义逐字沿用（func / weight / params 完全一致）。
+        self.joint_deviation_torso = RewTerm(
+            func=mdp.joint_deviation_l1,
+            weight=-0.1,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names="waist_.*")},
+        )
+
 
 @configclass
 class G1AmpWalkV3EnvCfg(G1AmpWalkV2EnvCfg):
     """训练用：场景 / 观测 / 事件 / 终止 / 时序 / 动作 **全部继承 v2**。
 
     本类替换三样：
-    1. `rewards` —— v2 的 12 项配方，`action_rate_l2` 提到 −0.02；
+    1. `rewards` —— v2 的 12 项配方 → **14 项**（`action_rate_l2` 提到 −0.02，
+       并恢复 `flat_orientation_l2` −1.0 与 `joint_deviation_torso` −0.1）；
     2. `commands` —— 指令分布换成 AMP_mjlab v4 的（含精选 7-clip 数据集）；
     3. 参考动作的选择清单 —— 17 clip → 精选 7 clip（在 `__post_init__` 里 deepcopy 后改）。
     """
@@ -258,6 +302,7 @@ __all__ = [
     "AMP_WALK_V2_RUN_NAME",
     "AMP_WALK_V3_CHANGES",
     "AMP_WALK_V3_COMMAND_RANGES",
+    "AMP_WALK_V3_FLAT_ORI_WEIGHT",
     "AMP_WALK_V3_MOTION_SELECTION_FILE",
     "AMP_WALK_V3_RUN_NAME",
     "G1AmpWalkV3CommandsCfg",

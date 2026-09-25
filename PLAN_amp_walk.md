@@ -1171,3 +1171,110 @@ RuntimeError: Unified OmniLoco teacher contract failed:
 
 启动：`--task Instinct-Amp-Walk-V3-G1-v0 --num_envs 4096 --max_iterations 5000`
 （**从零**，`--run_name amp_walk_v3b_4096`，日志 `/root/train_amp_walk_v3b_4096.log`）。
+
+---
+
+### 11.6 v3c：恢复 `flat_orientation_l2` + `joint_deviation_torso`（2026-09-25）
+
+#### （a）动机（用户实测反馈）
+
+v3b 训练后模型呈现**姿态歪斜** → 难以平衡、速度无法跟踪（**略改变姿态就会摔倒**）。
+用户判断应恢复 `flat_orientation_l2` 鼓励躯干水平。
+
+#### （b）先量化了「姿态项该给多大权重」
+
+`flat_orientation_l2` 的 IsaacLab 实现（云端 `envs/mdp/rewards.py:91-98`）：
+
+```python
+def flat_orientation_l2(env, asset_cfg=SceneEntityCfg("robot")):
+    """Penalize non-flat base orientation using L2 squared kernel."""
+    asset = env.scene[asset_cfg.name]
+    return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+```
+
+即 **`Σ projected_gravity_b[:, :2]² = sin²θ`**（θ = **root/pelvis** 相对重力方向的倾斜角）。
+v1 实测该项贡献只有 **−0.0160/s**（w = −1.0）⇒ 反推平均倾斜 ≈ **7.2°** ⇒ **−1.0 几乎不构成约束**：
+
+| 倾斜角 θ | sin²θ | w = −1.0（基类原值）| w = −5.0 | w = −10.0 |
+|---|---|---|---|---|
+| 5° | 0.0076 | −0.008 | −0.038 | −0.076 |
+| 10° | 0.0302 | −0.030 | −0.151 | −0.302 |
+| 15° | 0.0670 | −0.067 | −0.335 | −0.670 |
+| **20°** | 0.1170 | **−0.117** | **−0.585** | −1.170 |
+| 30° | 0.2500 | −0.250 | −1.250 | −2.500 |
+
+对照任务正向项合计约 **+1.6/s**：w = −1.0 时歪 20° 才罚 0.117（7%），w = −5.0 时 0.585（36%）。
+
+**用户选定 −1.0（基类原值，最保守）**。若本轮姿态歪斜未改善，第一优先是把
+`AMP_WALK_V3_FLAT_ORI_WEIGHT` 改成 **−5.0**（改一个常量即可）。
+
+#### （c）⚠️ 关键区分：它读 root，不读 torso_link
+
+`flat_orientation_l2` 用的是 **root/pelvis** 的 projected gravity。而 `waist_pitch` /
+`waist_roll` 的行程只有 **±0.520 rad**（除踝之外最挤的两个）—— **腰部歪斜不会体现在
+骨盆倾角上**。因此同时恢复 `joint_deviation_torso`（−0.1，覆盖 `waist_.*`）作为兜底。
+
+AMP_mjlab 有一个专门读 `torso_link` 四元数的 `torso_posture`
+（`cos_tilt = 1 − 2(qx² + qy²)`），但它**默认是注释掉的**，本轮未采用（需新写奖励函数）。
+
+#### （d）改了什么（v3b 的 12 项 → **14 项**）
+
+| # | 改动 | 说明 |
+|---|---|---|
+| 1 | `action_rate_l2`：−0.01 → **−0.02** | 不变（v3 已有）|
+| 2 | **恢复** `flat_orientation_l2` = **−1.0** | v2 删掉的 9 项之一，`func` 用基类 |
+| 3 | **恢复** `joint_deviation_torso` = **−0.1** | 同上，`func`/`weight`/`params` 逐字沿用基类 |
+| 4 | 其余 11 项 | 原样（含 v2 的 `dof_pos_limits` −10.0 / `dof_acc_l2` −2.5e-7）|
+
+⚠️ 这两项**必须写在 `super().__post_init__()` 之后** —— v2 的 `__post_init__` 会把它们
+置成 `None`（仓库既定的「删除」机制），写前面等于白写。
+
+`run_name` 由 `rew12` 改成 **`rew14`**。
+
+#### （e）v3c 启动核验：全绿
+
+```
+[AMP-WALK PASS] policy=626 (height_scan=527 + base_lin_vel), action=29, scale=1.0,
+                cmd_ranges=((-0.7, 2.0), (-1.0, 1.0), (-1.57, 1.57)) (directional), rewards=14
+Learning iteration 0/5000                      ← 确实从零
+日志 L273: |  4 | flat_orientation_l2   | -1.0 |
+日志 L275: |  6 | joint_deviation_torso | -0.1 |
+逐项记录已出现：Episode_Reward/flat_orientation_l2: -0.0001
+                Episode_Reward/joint_deviation_torso: -0.0001
+params/agent.yaml: init_noise_std: 0.3   clip_min_std: 0.015
+run 目录: 20260925_203531_G1AmpWalkV3Plane_obs626_rew14_ar0.02_ns0.3_amp_walk_v3c_4096
+```
+
+* 启动方式（新增 `instinct/tools/cloud_train_amp_walk_v3.sh`，避免嵌套引号踩坑）：
+  ```bash
+  bash /root/cloud_run_bg.sh \
+    'bash /root/cloud_train_amp_walk_v3.sh 4096 5000 cuda:0 amp_walk_v3c_4096' \
+    /root/train_amp_walk_v3c_4096.log
+  ```
+* 一轮 5.19 s ⇒ ETA ≈ 7.2 h；GPU 10884 MiB。
+
+> ⚠️ 探针验证被跳过：`cloud_probe_rewards.py` 两次卡在 Isaac Sim 启动上（本地没
+> `isaaclab`，只能云端跑）。**训练启动日志打印的是同一套 `[AMP-WALK PASS]` / 契约校验**，
+> 且额外给出逐项权重表 ⇒ 用训练日志做验证，覆盖面等价且更快。
+
+#### （f）本轮要看的指标
+
+| 指标 | 期望 | 说明 |
+|---|---|---|
+| `Episode_Reward/flat_orientation_l2` | **绝对值要小** | 若长期在 −0.02 以上 ⇒ 平均倾斜 >8°，说明 −1.0 果然不够，改 −5.0 |
+| `Episode_Reward/joint_deviation_torso` | 同样要小 | 反映腰部偏离 default 的程度 |
+| `Policy/mean_noise_std` | 不得从 0.3 单调上升 | 上轮 v2 从这里涨到 1.58 ⇒ 退步 |
+| 回合长度 / `base_contact` 终止比 | 改善 | v2 时 base_contact 0.5498 → 0.6772 |
+| 高速（vx > 1.2）与后向（vx ∈ −0.7..−0.4） | 学会交替步态 | |
+| `Step/foot_sep_mean` | 仍会偏差 | 站姿宽度惩罚**本次仍未加**（刻意保持单变量）|
+
+#### （g）已知的下一步候选（本轮未做）
+
+1. `AMP_WALK_V3_FLAT_ORI_WEIGHT` −1.0 → **−5.0**。
+2. **`dof_pos_limits` 作用域从「只有踝」扩到全身** —— 现在 hip/knee/waist/arms **完全不罚**。
+   按「到最近限位的余量」排序，最挤的 8 个关节里 **6 个**只由已被删除的
+   `joint_deviation_*` 覆盖（踝 0.262 / 腰 0.520 / hip_roll 0.524 / 膝 0.756）。
+   ⚠️ 但 `joint_pos_limits` 的语义是**越界惩罚**（`(q − limit).clip()`，软限位内恒为 0），
+   且 `soft_joint_pos_limit_factor` 默认 **1.0** ⇒ 软限位 = 硬限位。它是「撞上限才罚」，
+   **不是「靠近限位就罚」**；真要抑制贴限位得靠 `joint_deviation_*` 或自写 proximity 项。
+3. 站姿宽度惩罚（§10.4 的结构性缺口）。
