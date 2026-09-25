@@ -190,6 +190,12 @@ class G1OmniLocoTeacherEnv(InstinctRlEnv):
 
     expected_standing_ratio = 0.0
     expected_command_ranges = OMNI_LOCO_COMMAND_RANGES
+    #: 期望的「指令保持时长」(秒)。
+    #: ⚠️ 原先这个值**写死在 `_validate_teacher_contract` 里**，导致换了指令分布的
+    #: 任务（如 AMP-Walk v3 用 (6, 15)）会被契约校验直接拦下。改成类属性后
+    #: **默认值与原来逐位相同（(10.0, 10.0)）**，OmniLoco / v1 / v2 行为完全不变，
+    #: 而各任务可像 `expected_command_ranges` 那样自行声明期望值。
+    expected_command_hold = (10.0, 10.0)
     expected_policy_terms = OMNI_LOCO_OBSERVATION_TERMS
     expected_policy_dims = OMNI_LOCO_OBSERVATION_DIMS
     expected_scan_rays = 527
@@ -252,8 +258,11 @@ class G1OmniLocoTeacherEnv(InstinctRlEnv):
             errors.append(
                 f"standing-command ratio is {command_cfg.rel_standing_envs}, expected {self.expected_standing_ratio}"
             )
-        if tuple(command_cfg.resampling_time_range) != (10.0, 10.0):
-            errors.append(f"command hold is {command_cfg.resampling_time_range}, expected 10 seconds")
+        if tuple(command_cfg.resampling_time_range) != tuple(self.expected_command_hold):
+            errors.append(
+                f"command hold is {command_cfg.resampling_time_range}, "
+                f"expected {self.expected_command_hold}"
+            )
         if self.curriculum_manager.active_terms and not self.allow_curriculum:
             errors.append(f"curriculum terms are active: {self.curriculum_manager.active_terms}")
 

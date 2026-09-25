@@ -5,7 +5,7 @@ import gymnasium as gym
 from . import agents
 from .amp_walk_env_cfg import G1AmpWalkEnvCfg, G1AmpWalkEnvCfg_PLAY, G1AmpWalkTeacherEnv
 from .amp_walk_v2_env_cfg import G1AmpWalkV2EnvCfg, G1AmpWalkV2EnvCfg_PLAY
-from .amp_walk_v3_env_cfg import G1AmpWalkV3EnvCfg, G1AmpWalkV3EnvCfg_PLAY
+from .amp_walk_v3_env_cfg import G1AmpWalkV3EnvCfg, G1AmpWalkV3EnvCfg_PLAY, G1AmpWalkV3TeacherEnv
 from .omni_loco_env_cfg import G1OmniLocoEnvCfg, G1OmniLocoEnvCfg_PLAY, G1OmniLocoTeacherEnv
 
 for task_id, env_cfg in (
@@ -69,7 +69,8 @@ for task_id, env_cfg in (
 ):
     gym.register(
         id=task_id,
-        entry_point=G1AmpWalkTeacherEnv,
+        # ⚠️ 用 v3 自己的校验器：指令范围与保持时长与 v1 不同，其余期望值逐字相同
+        entry_point=G1AmpWalkV3TeacherEnv,
         disable_env_checker=True,
         kwargs={
             "env_cfg_entry_point": env_cfg,

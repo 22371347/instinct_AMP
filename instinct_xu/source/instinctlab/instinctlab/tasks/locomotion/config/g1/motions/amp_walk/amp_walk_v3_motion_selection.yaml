@@ -1,0 +1,51 @@
+# ============================================================================
+# v3 的 AMP 参考数据集：AMP_mjlab 的精选 7 个 clip（6 行走 + 1 慢跑）
+# ============================================================================
+# 来源：`~/rsl_project/AMP_mjlab/motion_data_csv/amp_selected.txt` 里**取消注释**
+# 的 7 行（该文件 v4 版头写着「6 行走 + 1 慢跑 = 7 个 clip 做 AMP 判别」）。
+#
+# ⚠️ 为什么从 17 个减到 7 个：按 AMP_mjlab 的实测经验，**运动数据过多会导致风格混乱**
+#    —— 判别器的风格分布在过大的参考集上被摊平，反而拉不住步态。
+#    这 7 个是他们在 AMP_mjlab 上跑出来的精选组合，直接沿用。
+#
+# 与 amp_selected.txt 的对应关系（逐条核过）：
+#   ✅ walk_forward_loop_002__A022       前进（~0.6-1.0 m/s）
+#   ⚠️ walk_backward_loop_001__A022      **代替** amp_selected.txt 里的
+#                                        `walk_backward_loop_003__A143`
+#      替代理由（实测，不是猜）：那个 clip 在 `WalkandRun/` 里**只有 CSV、没有 npz**，
+#      补齐它需要跑 AMP_mjlab 的 `scripts/csv_to_npz.py`（**仿真式重定向**，属于
+#      另一个工程）。而本 clip 用同一套方法实测 **vx = −0.62 m/s**，
+#      正好落在 AMP_mjlab 给后退档设的 `back_lin_vel_range = (−0.7, −0.4)` 区间内，
+#      对该命令带**功能等价**。
+#   ✅ walk_sideway_left_loop_002__A021  左侧移
+#   ✅ walk_sideway_right_loop_001__A022 右侧移
+#   ✅ jog_forward_loop_003__A022        慢跑前进（巡航 ~1.7-1.9）★
+#   ✅ arc_walk_left_loop_001__A029      左弧行走
+#   ✅ walk_arc_cw_loop_002__A046        右弧行走
+#
+# ⚠️ amp_selected.txt 里被**注释掉**、我们同样不选的重要一组：「原地」（`idle_turn_270`、
+#    `idle_turn_360`、`step_rotate_idle_000_002`）。静止/原地转的风格由
+#    `prob_low` 档（20%，其中 60% 给精确 (0,0,0)）+ `track_default_pose_on_stand`
+#    奖励负责，**不靠参考动作**。这与 AMP_mjlab v4 的做法一致。
+#
+# ⚠️ 覆盖面提醒（用 `instinct/tools/analyze_amp_motions.py` 实测这 7 个的极值）：
+#    vx 上限 ≈ +1.95、|vy| ≈ ±1.05、|wz| ≈ ±1.13 —— 而 v3 的指令范围是
+#    vx(−0.7, 2.0) / vy(±1.0) / wz(±1.57)。
+#    ⇒ vx 与 vy **刚好覆盖**；**wz 的命令范围超出风格集**（1.57 > 1.13），
+#      这是照搬 AMP_mjlab v4 的结果（他们也只有 2 个弧线 clip 却设 ±1.57）。
+#      如果大角速度命令下步态劣化，优先怀疑这里。
+selected_files:
+  - file: walk_forward_loop_002__A022_retargeted.npz
+    weight: 1.0
+  - file: walk_backward_loop_001__A022_retargeted.npz
+    weight: 1.0
+  - file: walk_sideway_left_loop_002__A021_retargeted.npz
+    weight: 1.0
+  - file: walk_sideway_right_loop_001__A022_retargeted.npz
+    weight: 1.0
+  - file: jog_forward_loop_003__A022_retargeted.npz
+    weight: 1.0
+  - file: arc_walk_left_loop_001__A029_retargeted.npz
+    weight: 1.0
+  - file: walk_arc_cw_loop_002__A046_retargeted.npz
+    weight: 1.0

@@ -7,6 +7,7 @@
   python cloud_probe_rewards.py --task Instinct-Amp-Walk-V2-G1-v0
 """
 import argparse
+import os
 
 from isaaclab.app import AppLauncher
 
@@ -37,6 +38,39 @@ live_in_cfg = sorted(k for k, v in cfg_terms.items() if v is not None)
 print(f"\n[配置层] rewards 字段总数 = {len(cfg_terms)}")
 print(f"[配置层] 被删除(None) {len(none_names)} 项: {none_names}")
 print(f"[配置层] 保留        {len(live_in_cfg)} 项")
+
+# --- 1b. 指令分布（分档概率 + 范围）-----------------------------------------
+try:
+    c = cfg.commands.base_velocity
+    tot = float(c.prob_low) + float(c.prob_side) + float(c.prob_lin) + float(c.prob_back)
+    print("\n[cmd] resampling_time_range =", c.resampling_time_range)
+    print(f"[cmd] prob_low={c.prob_low}  prob_side={c.prob_side}  prob_lin={c.prob_lin}  "
+          f"prob_lin_fwd={c.prob_lin_fwd}  prob_back={c.prob_back}")
+    print(f"[cmd] 分档和 = {tot:.2f}（余 {1.0 - tot:.2f} 为均匀斜向）")
+    print(f"[cmd] low_vel={c.low_vel}  zero_frac_in_low={c.zero_frac_in_low}")
+    print(f"[cmd] straight_lin_vel_range={c.straight_lin_vel_range}  "
+          f"back_lin_vel_range={c.back_lin_vel_range}")
+    print(f"[cmd] ranges: vx={c.ranges.lin_vel_x}  vy={c.ranges.lin_vel_y}  wz={c.ranges.ang_vel_z}")
+    print(f"[cmd] rel_standing_envs={c.rel_standing_envs}  heading_command={c.heading_command}")
+except Exception as exc:  # noqa: BLE001
+    print(f"\n[cmd] ⚠️ 读取失败: {type(exc).__name__}: {exc}")
+
+# --- 1c. 参考动作数据集 ------------------------------------------------------
+try:
+    import yaml as _yaml
+
+    for name, buf in cfg.scene.motion_reference.motion_buffers.items():
+        path = getattr(buf, "filtered_motion_selection_filepath", None)
+        n_sel = -1
+        if path and os.path.isfile(path):
+            with open(path) as fh:
+                n_sel = len((_yaml.safe_load(fh) or {}).get("selected_files", []))
+        print(f"\n[motion] buffer='{name}'")
+        print(f"[motion] 选择清单 = {path}")
+        print(f"[motion] selected_files = {n_sel} 个（-1 = 读不到文件）")
+        print(f"[motion] supported_endings={getattr(buf, 'supported_file_endings', None)}")
+except Exception as exc:  # noqa: BLE001
+    print(f"\n[motion] ⚠️ 读取失败: {type(exc).__name__}: {exc}")
 
 # --- 2. 运行层面：RewardManager 实际加载了哪些 -------------------------------
 env = gym.make(args.task, cfg=cfg).unwrapped
