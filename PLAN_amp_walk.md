@@ -1309,8 +1309,9 @@ run 目录: 20260925_203531_G1AmpWalkV3Plane_obs626_rew14_ar0.02_ns0.3_amp_walk_
 
 | 事实 | 证据 |
 |---|---|
-| `--max_iterations` 是**绝对**上限 | `train.py:127` 覆盖 `agent_cfg.max_iterations`，传给 `num_learning_iterations` |
-| `runner.load()` 恢复 `current_learning_iteration` | `train.py:173-211`；learn 循环是 `range(current, max_iterations)` ⇒ 写 10000 才是"再训 5000 轮" |
+| ⭐ `--max_iterations` 是**相对**语义 | `OnPolicyRunner.learn()`：`tot_iter = current_learning_iteration + num_learning_iterations`，`while current < tot_iter` ⇒ 传入值 = **还要再训多少轮**，不是绝对终点 |
+| 实测确认 | v2 那次 `--resume`(from 5000) + `max_iterations=5000` 显示的就是 `7410/10000`；v3c_cont 传 10⁹ 显示 `5000/1000005000` |
+| `runner.load()` 恢复 `current_learning_iteration` | `train.py:173-211` |
 | LR **不**随 `max_iterations` 变化 | `amp_walk_ppo_cfg.py` 里**没有 `schedule` 字段** ⇒ 固定学习率 |
 | ⚠️ 续训会重置 AMP 参考动作的播放游标 | 它不在 checkpoint 里 ⇒ 所有环境从参考 clip 第 0 帧重开（小不连续）|
 

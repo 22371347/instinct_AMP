@@ -21,14 +21,16 @@
 #
 # 参数：
 #   $1 num_envs   (默认 4096)
-#   $2 max_iters  (默认 **1000000000 = 实质无上限**)  —— ⚠️ 是**绝对**上限：
-#                                rsl_rl 的 `learn()` 是
-#                                `for it in range(current_learning_iteration, max_iterations)`，
-#                                `runner.load()` 会恢复 `current_learning_iteration`，
-#                                所以给个天文数字就是“一直跑”。
-#                                LR 是固定 schedule（cfg 里无 `schedule` 字段），
-#                                不随此值变化（已验证）。
-#                                想设上限就显式传，例如 `... 4096 20000 ...`。
+#   $2 max_iters  (默认 **1000000000 = 实质无上限**)  —— ✅ 语义是**相对**的：
+#                                `OnPolicyRunner.learn(num_learning_iterations)` 里是
+#                                `tot_iter = current_learning_iteration + num_learning_iterations`
+#                                `while current_learning_iteration < tot_iter:`
+#                                ⇒ 传入值 = **从当前点还要再训多少轮**（不是绝对终点）。
+#                                `runner.load()` 已恢复 `current_learning_iteration`，
+#                                所以续训想“再训 5000 轮”就传 5000（**不是** 10000）。
+#                                ⚠️ 实测：v2 那次 `--resume`(from 5000) + 5000 显示的就是
+#                                `7410/10000`；v3c_cont 传 10⁹ 显示 `5000/1000005000`。
+#                                LR 是固定 schedule（cfg 里无 `schedule` 字段），不受影响。
 #   $3 device     (默认 cuda:0)
 #   $4 run_name   (默认 amp_walk_v3c_<num_envs>) —— 拼在 AMP_WALK_V3_RUN_NAME 后面
 #   $5 load_run   (可选) 要续训的 run 目录名；**非空即自动加 --resume**
