@@ -903,3 +903,74 @@ python instinct/tools/g1_mujoco_play.py --policy ... --no-view --record out.mp4
 （bang-bang），与训练侧 `tracking_action/abs_max ≈ 29.7`、以及 §13.5 的结论一致。
 `scale=1.0` + `init_noise_std=1.0`（绝对 σ）是它的根源，见 `PLAN_amp_walk.md` §9。
 
+### 14.7 两个实测修复：「看不到地面」与「播放太快」（2026-09-25）
+
+#### ① 看不到地面 —— 根因是 geom group（不是 MJCF 缺地面）
+
+实测证据：
+
+```
+mjvOption.geomgroup 默认 = [1, 1, 1, 0, 0, 0]     ← group 3 根本不渲染
+MJCF <default>: <geom group="3" contype="1" conaffinity="1"/>
+floor geom: id=0 group=3 contype=1 conaffinity=1
+各 group geom 数: {2: 35, 3: 30}                  ← floor + 29 个碰撞胶囊都在 group 3
+```
+
+⇒ **地面存在且碰撞正常**（`contype=1`，所以机器人站得住），只是 `<default>` 把它的
+渲染组设成了 **3**，而 **MuJoCo 默认不渲染 group 3**（该组约定用于"仅碰撞/非可视"几何）。
+
+**修法**（只改**加载时的 XML 文本副本**，不碰磁盘文件 —— 那文件由 `build_g1_mjcf.py`
+生成，手改会被覆盖）：
+
+1. 给 floor 追加 `group="2"`（可见）；
+2. 注入一个 **棋盘材质** `<texture builtin="checker">` + `<material texrepeat="8 8">`。
+
+⭐ 第 2 步不是"顺手美化"：**纯色地面看不出机器人有没有位移/打滑**，
+而这两件事恰好是评估行走策略最关心的。
+
+验证（补丁**只影响渲染**）：
+
+| 检查 | 结果 |
+|---|---|
+| floor 组 / 材质 | ✅ `group=2`、`material=llp_groundplane` |
+| floor 碰撞 | ✅ `contype=1` **未变** |
+| geom 分布 | ✅ group 2: 35→36、group 3: 30→29（floor 搬了一格） |
+| 物理量 | ✅ `timestep=0.002`、`nq=36`、`nu=29` **全未变** |
+| 观测 | ✅ `--selftest-obs` 仍 626 维、`height_scan=0.3200` |
+
+⚠️ 顺带纠正一个**我自己的算术错误**：`grep -c '<geom'` 得 66，但其中一行是
+`<default>` 里的**原型 geom**（不是真实几何体），真实 geom 是 **65** 个（35+30）。
+
+#### ② 播放太快 —— 根因是**完全没有实时节拍**（不是帧率不匹配）
+
+原代码 `for step in range(n_steps): ... mj_step × decimation` **中间没有任何 sleep**，
+所以仿真以 CPU 全速推进。客观测量：
+
+| 模式 | 仿真时间 / 墙上时间 | 实际倍速 |
+|---|---|---|
+| **修复前**（无节拍） | 4.00 s / **0.12 s** | **33.69× 实时** ← 就是"太快" |
+| **修复后**（默认实时） | 4.00 s / 4.00 s | **1.00×** ✅ |
+| `--speed 0.5` | 2.00 s / 4.00 s | **0.50×** 慢放 ✅ |
+
+**修法**：按墙上时钟对齐 —— 每个策略步应占 `wall_dt = sim.dt × decimation / speed`
+（默认 = 0.002 × 10 / 1.0 = **20 ms** = 50 Hz），用 `time.perf_counter()` 基准累加、
+`time.sleep()` 补足；**落后超过 5 步就重置基准**，避免"追赶式暴走"。
+
+新增开关：
+
+| 开关 | 作用 |
+|---|---|
+| `--speed`（默认 1.0） | 实时倍速；`0.5` 慢放看清细节 |
+| `--no-realtime` | 关掉节拍，全速跑（扫参数时用；帧率不匹配的问题在**录像**里本来就没有——录像是按 `fps=policy_hz` 写帧的） |
+| `--cam-distance`（默认 3.0） | 初始相机距离 |
+| `--show-collision` | 显示 group 3 的碰撞胶囊（排查接触用） |
+| `--no-checkered-floor` | 不给地面补棋盘（保持 MJCF 原样） |
+
+另外补了**初始相机** `lookat=(0,0,0.5), distance=3.0, azimuth=145, elevation=-18`，
+否则默认视角偏高偏远，第一眼容易看不到地面和脚。
+
+> 参考项目 `~/g1_ws/unitree_rl_mjlab` 也查了：它的场景 XML
+> （`src/assets/robots/unitree_g1/xmls/scene_g1.xml:556`）的 floor 同样不设 group ——
+> 差别在于**它的 `<default>` 没给 geom 设 `group="3"`**，所以 floor 默认落在
+> group 0（可见）。它的实时节拍在 C++ 仿真器里（`simulate/src`），Python 侧只有策略配置。
+

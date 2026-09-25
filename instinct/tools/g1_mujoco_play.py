@@ -41,6 +41,7 @@ import argparse
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -479,6 +480,66 @@ def _register_keys() -> None:
 _register_keys()
 
 
+#: 给地面补的棋盘材质（
+#: 重要：MJCF 的 `<default>` 里写了 `<geom group="3" .../>`，而
+#: `mjvOption.geomgroup` 默认是 `[1,1,1,0,0,0]` —— **group 3 根本不渲染**，
+#: 所以 floor 在 viewer 里完全看不见，机器人像站在空气上（碰撞照常发生，
+#: 因为 floor 的 `contype=1`，仿真本身没错，只是看不见）。
+_FLOOR_ASSETS = """
+    <texture name="llp_grid" type="2d" builtin="checker" width="512" height="512"
+             rgb1="0.30 0.34 0.38" rgb2="0.18 0.21 0.24"/>
+    <material name="llp_groundplane" texture="llp_grid" texrepeat="8 8" reflectance="0.05"/>
+"""
+
+
+def _patch_xml_for_floor(xml_text: str) -> str:
+    """给 MJCF 文本补上「可见的地面」：棋盘材质 + `group="2"`。
+
+    改的是**加载时的文本副本**，不碰磁盘上的 XML（那文件由
+    `build_g1_mjcf.py` 生成，手改会被下次重生覆盖）。
+    棋盘化不是好看而已 —— 纯色地面**看不出机器人有没有位移/打滑**，
+    而这两件事恰好是评估行走策略最关心的。
+    """
+    if "<asset>" not in xml_text:
+        raise ValueError("MJCF 里没有 <asset>，无法注入材质")
+    xml_text = xml_text.replace("<asset>", "<asset>" + _FLOOR_ASSETS, 1)
+    lines = xml_text.split("\n")
+    for i, ln in enumerate(lines):
+        if 'name="floor"' in ln and ln.rstrip().endswith("/>"):
+            # 追加 `group="2"`（可见）与棋盘材质；只改渲染，不动碰撞参数
+            lines[i] = ln.rstrip()[: -len("/>")] + ' group="2" material="llp_groundplane"/>'
+            return "\n".join(lines)
+    raise ValueError("找不到 floor 的 geom 行")
+
+
+def load_model(xml_path, checkered_floor: bool = True):
+    """加载 MJCF；默认把地面做成**可见的棋盘**。
+
+    ⭐ 不补的话，viewer 里看不到地面（原因见 `_FLOOR_ASSETS` 的注释）。
+    补丁失败时回退到直接改 `model.geom_group[floor] = 2`（物理不受影响）。
+    """
+    import mujoco
+
+    xml_path = Path(xml_path)
+    if checkered_floor:
+        try:
+            patched = _patch_xml_for_floor(xml_path.read_text(encoding="utf-8"))
+            # meshdir 在本 XML 里是**绝对路径**，所以 from_xml_string 能直接找到网格
+            model = mujoco.MjModel.from_xml_string(patched)
+            print("[scene] 地面已补棋盘材质并设为可见 group=2（便于看出位移/打滑）")
+            return model
+        except Exception as exc:  # noqa: BLE001
+            print(f"[scene] 地面补丁失败（{type(exc).__name__}: {exc}），回退到只改渲染组")
+
+    model = mujoco.MjModel.from_xml_path(str(xml_path))
+    for i in range(model.ngeom):
+        if mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) == "floor":
+            model.geom_group[i] = 2  # 只影响渲染，不影响碰撞
+            print("[scene] 已把 floor 的渲染组改为 2（可见；仅渲染，不影响物理）")
+            break
+    return model
+
+
 def reset_state(model, data) -> None:
     """把机器人复位到 MJCF 的初始 keyframe（`R` 键与启动时**共用这一份逻辑**）。
 
@@ -606,7 +667,7 @@ class KeyboardCommandController:
 def play(args) -> int:
     import mujoco
 
-    model = mujoco.MjModel.from_xml_path(args.xml)
+    model = load_model(args.xml, checkered_floor=not args.no_checkered_floor)
     data = mujoco.MjData(model)
 
     if args.dump_model:
@@ -771,6 +832,28 @@ def play(args) -> int:
         viewer_ctx = mujoco.viewer.launch_passive(
             model, data, key_callback=teleop.on_key if teleop is not None else None
         )
+        # 初始相机：否则默认视角偏高偏远，第一眼容易看不到地面/脚
+        try:
+            with viewer_ctx.lock():
+                viewer_ctx.cam.lookat[:] = [0.0, 0.0, 0.5]
+                viewer_ctx.cam.distance = float(args.cam_distance)
+                viewer_ctx.cam.azimuth = 145.0
+                viewer_ctx.cam.elevation = -18.0
+                if args.show_collision:
+                    # group 3 = floor 原本的组 + 29 个碰撞胶囊（默认隐藏）
+                    viewer_ctx.opt.geomgroup[3] = 1
+                    print("[scene] 已开启 group 3 渲染（碰撞胶囊等非可视 geom）")
+            print(f"[scene] 初始相机: lookat=(0,0,0.5) distance={args.cam_distance} "
+                  f"azimuth=145 elevation=-18（鼠标可自由调）")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[scene] 设置初始相机失败（不影响仿真）: {type(exc).__name__}: {exc}")
+
+    # --- 实时节拍（⭐ 不加的话仿真会以 CPU 全速跑，看起来像 50x 快进）---
+    wall_dt = dt * decimation / max(1e-6, float(args.speed))
+    realtime = not args.no_realtime
+    t_start = time.perf_counter()
+    t_next = t_start
+    lag_reports = 0
 
     total_txt = "inf" if infinite else str(n_steps)
     print(f"[run] {total_txt} policy steps @ {args.policy_hz} Hz (decimation={decimation}, dt={dt})")
@@ -862,8 +945,23 @@ def play(args) -> int:
                 renderer.update_scene(data)
                 frames.append(renderer.render().copy())
 
-            if step % max(1, n_steps // 10) == 0:
-                print(f"  step {step:>5}/{n_steps}  height={data.qpos[2]:.3f}  |v|={np.linalg.norm(data.qvel[:3]):.3f}")
+            # --- 实时节拍：把每个策略步的墙上耗时对齐到 wall_dt ---
+            if realtime:
+                t_next += wall_dt
+                now = time.perf_counter()
+                slack = t_next - now
+                if slack > 0:
+                    time.sleep(slack)
+                elif -slack > 5.0 * wall_dt:
+                    # 落后超过 5 步 → 重置基准，不要"追赶式暴走"
+                    if lag_reports < 3:
+                        print(f"  [pace] 第 {step} 步落后 {-slack * 1000:.0f} ms，重置节拍基准")
+                        lag_reports += 1
+                    t_next = now
+
+            if step % (100 if infinite else max(1, n_steps // 10)) == 0:
+                print(f"  step {step:>6}/{total_txt}  height={data.qpos[2]:.3f}  "
+                      f"|v|={np.linalg.norm(data.qvel[:3]):.3f}")
     except KeyboardInterrupt:
         print("\n[interrupted]")
     finally:
@@ -871,6 +969,12 @@ def play(args) -> int:
             viewer_ctx.close()
         if renderer is not None:
             renderer.close()
+
+    # 实时性汇总：客观确认"不再是快进"（目标 1.00x）
+    wall_s = time.perf_counter() - t_start
+    sim_s = (step + 1) * dt * decimation
+    print(f"[pace] 仿真 {sim_s:.2f} s / 墙上 {wall_s:.2f} s = {sim_s / max(1e-9, wall_s):.2f}x 实时"
+          + ("（目标 1.00x）" if realtime else "（--no-realtime，全速跑）"))
 
     if args.record and frames:
         out = Path(args.record)
@@ -943,6 +1047,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="速度指令 (默认 0.5 0.0 0.0)")
     ap.add_argument("--duration", type=float, default=10.0,
                     help="回放时长（秒）；**0 = 无限运行直到关闭窗口**（键盘遥控时用）")
+    ap.add_argument("--speed", type=float, default=1.0,
+                    help="实时倍速（1.0 = 真机同速；0.5 = 慢放便于看细节）")
+    ap.add_argument("--no-realtime", action="store_true",
+                    help="关掉实时节拍（全速跑，用于快速扫参数；默认是实时）")
+    ap.add_argument("--cam-distance", type=float, default=3.0, help="初始相机距离（米）")
+    ap.add_argument("--show-collision", action="store_true",
+                    help="显示 group 3 的碰撞 geom（胶囊体等，排查接触时用）")
+    ap.add_argument("--no-checkered-floor", action="store_true",
+                    help="不给地面补棋盘材质（保持 MJCF 原样；地面会是纯色）")
     ap.add_argument("--policy-hz", type=float, default=50.0, help="策略频率（InstinctLab=50Hz）")
     ap.add_argument("--history", type=int, default=8, help="观测历史帧数（对齐训练配置）")
     ap.add_argument("--action-scale", type=float, default=0.25,
