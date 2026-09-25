@@ -794,3 +794,117 @@ bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk.sh 4096 5000 cuda:0'
 > 的 key 集合完全相同，直接在**首轮迭代**崩掉。这类约定不看源码是猜不出来的，
 > 而且症状（`KeyError`）离原因（奖励函数里的一行日志）很远。
 > 教训：**往框架的共享字典里写东西前，先确认那个字典的生命周期是谁管的**。
+
+---
+
+## 9. 奖励集返工：v1 → v2（2026-09-25）
+
+### 9.1 触发原因
+
+v1（5000 迭代）出现**单脚支撑 + 跳跃**的异常步态：回合 464/1000 步、**66% 回合触地终止**、
+脚距均值 0.348（超过 0.30 上限）。逐项核对 AMP_mjlab 的 `amp_loco` 奖励表后发现：
+
+> **v1 的 21 项奖励里，有 9 项是学长做「越障」动作测试时攒下的 `G1FlatRewardsCfg` 基类奖励，
+> AMP_mjlab 的 `amp_loco` 配方里根本没有**；另外 3 项权重与 AMP_mjlab 明显不一致且从未调整。
+
+### 9.2 实测证据（全部来自云端，非推断）
+
+工具：`instinct/tools/cloud_dump_rewards.py`（抽 TB 全量奖励项终值）、
+`instinct/tools/cloud_probe_rewards.py`（核对 `RewardManager` 实际加载项）。
+
+1. **21 项奖励无一缺项**：TB 里 `Episode_Reward/*` 恰好 21 个 tag。
+   （此前一度怀疑 `feet_air_time` 没进奖励函数 —— **不成立**，它在 21 项里。）
+2. **`feet_air_time` 实测仅 +0.018/s**（末段均值），而它在 `sum(in_contact)==1` 才给分。
+   若真长期单脚支撑，该项应在 0.25~0.5/s ⇒ **它不可能驱动步态**。
+   ⚠️ 这**推翻**了此前「`feet_air_time` 是单脚支撑次因」的推断。
+3. **`action_rate_l2` 是最大单项成本 −0.646/s**，而全部任务正向项合计才 ~+1.6/s。
+   v1 权重 −0.05 是 AMP_mjlab（−0.01）的 **5 倍**。跳跃恰好是「一次爆发 + 长时间不需要
+   动作」的**低动作频率**策略，走路则需持续换腿 ⇒ 过强惩罚本身在鼓励跳跃。
+4. 最大正项 `track_base_height` +0.59/s > `track_lin_vel_xy_exp` +0.48/s ⇒ **「稳住」比「走准」值钱**。
+5. `feet_lateral_width`(−0.0014/s) / `feet_crossing`(−0.0001/s) **几乎不激活**
+   （`max_cost=0.10` 封顶）⇒ 宽站姿**不会**因为 v2 自动解决。
+
+### 9.3 v2 改了什么
+
+新文件 `amp_walk_v2_env_cfg.py`（**不改任何现有文件、不改奖励函数本体、不动基类**）：
+
+**（a）删 9 项**（置 `None`，这是本仓库既定机制 —— `G1FlatEnvCfg.__post_init__` 的 run_name
+生成器对其中 4 项都写了 `is not None` 保护）：
+
+| 被删项 | v1 权重 | 删除理由 |
+|---|---|---|
+| `feet_air_time` | +1.0 | `sum(in_contact)==1` 才给分 → **构造上奖励单脚支撑**；AMP_mjlab 无 |
+| `joint_deviation_knee/hip/arms/torso` | −0.05/−0.1/−0.1/−0.1 | 把关节往 default（直腿）拽，与屈膝屈髋的行走腾空相**正面对抗** |
+| `flat_orientation_l2` | −1.0 | 与新增的 `body_ang_vel_xy` 语义重叠 |
+| `stand_still` | −0.8 | 与新增的 `track_default_pose_on_stand`(−1.0) 语义重叠 |
+| `lin_vel_z_l2` | −0.1 | 抑制竖直速度 → **直接压制起跳/落地** |
+| `dof_torques_l2` | −4e-6 | 实测 −0.018/s，纯装饰 |
+
+**（b）对齐 3 个权重**：`action_rate_l2` −0.05→**−0.01**、`dof_pos_limits` −1.0→**−10.0**、
+`dof_acc_l2` −2.0e-7→**−2.5e-7**（`func`/`params` 逐字沿用基类）。
+
+⇒ v2 = **12 项**，与 AMP_mjlab `amp_loco` 项数、权重逐项一致。
+
+**刻意保留的偏离**（避免一次改太多导致归因不清）：速度/角速度跟踪的 `std` 仍为 0.5
+（AMP_mjlab 1.0/3.14，与学长同族教师保持形状一致且**更严**）；`dof_pos_limits` 仍只作用于
+踝关节、`dof_acc_l2` 仍只作用于髋/膝（AMP_mjlab 均为全关节）。
+
+### 9.4 验证结果（PASS）
+
+```
+[配置层] rewards 字段总数 = 21
+[配置层] 被删除(None) 9 项: ['dof_torques_l2','feet_air_time','flat_orientation_l2',
+        'joint_deviation_arms','joint_deviation_hip','joint_deviation_knee',
+        'joint_deviation_torso','lin_vel_z_l2','stand_still']
+[配置层] 保留        12 项
+[运行层] reward_manager.active_terms 总数 = 12
+[REWARD-SET PASS] Instinct-Amp-Walk-V2-G1-v0: active_terms=12 (expect=12)
+```
+
+12 项权重实测：`action_rate_l2 −0.01`、`body_ang_vel_xy 0.7`、`dof_acc_l2 −2.5e-07`、
+`dof_pos_limits −10`、`feet_crossing −20`、`feet_lateral_width −10`、`feet_slide −0.25`、
+`termination_penalty −200`、`track_ang_vel_z_exp 1.2`、`track_base_height 1.5`、
+`track_default_pose_on_stand −1`、`track_lin_vel_xy_exp 1.5`。
+
+### 9.5 接口契约**完全不变**（关键）
+
+v2 只替换 `rewards` 字段，动作 29D / 顺序 / `scale=1.0` / default offset / `clip=None`、
+观测 626/99/670、时序 50 Hz、执行器 —— **逐项同 `INTERFACE_CONTRACT.md`**。因此：
+
+* checkpoint 结构与 v1 **互换**，可直接从 `model_5000.pt` 续训；
+* 环境类**仍是 `G1AmpWalkTeacherEnv`**（期望值全是类属性，`rewards={n}` 只打印不断言）；
+* agent cfg **复用同一份** `G1AmpWalkPPORunnerCfg`；
+* **蒸馏 teacher 侧接口不受影响**。
+
+### 9.6 启动记录
+
+```bash
+pkill -9 -f '[t]rain.py'          # 停掉 v1 续训（Step 9 未存过任何 checkpoint，无损失）
+python scripts/instinct_rl/train.py \
+  --task Instinct-Amp-Walk-V2-G1-v0 --num_envs 4096 --max_iterations 5000 \
+  --device cuda:0 --headless --run_name amp_walk_v2_4096 \
+  --resume --load_run 20260925_003514_G1AmpWalkPlane_obs626_directional_rew5_amp_walk_4096 \
+  --checkpoint model_5000.pt
+```
+
+* 日志：`/root/train_amp_walk_v2_4096.log`
+* run 目录：`logs/instinct_rl/g1_amp_walk/20260925_120621_G1AmpWalkV2Plane_obs626_rew12_alignAMP_amp_walk_v2_4096_from20260925_003514`
+* 启动日志确认：`[AMP-WALK PASS] policy=626 ... action=29, scale=1.0 ... rewards=12` +
+  `Loading model checkpoint from: .../model_5000.pt`
+
+> ⚠️ **预期现象**：奖励语义变了 ⇒ v1 的 value function 不再准确，续训初期**回报会先掉再涨**。
+> 不要把这个当作失败（参见 §8.3 的「假失败」教训）。
+
+### 9.7 观察指标（判断 v2 是否真的修好了步态）
+
+| 指标 | v1 末值 | 期望方向 |
+|---|---|---|
+| `Episode_Monitor`/触地终止比例 | 0.55~0.66 | **↓ 到 <0.1** |
+| 回合长度（步） | 464 / 1000 | ↑ 到 900+ |
+| `Step/foot_sep_mean` | 0.348 | 回到 0.15~0.30 |
+| `Episode_Reward/action_rate_l2` | −0.65 | 绝对值应大幅下降 |
+| `Policy/mean_noise_std` | 0.756 | 观察是否随步态变好而下降 |
+
+⚠️ **v2 没碰 `init_noise_std`（仍 1.0，实际 σ≈0.76 rad ≈ ±43° 关节目标噪声）**。
+这是刻意的：本次只改奖励集，保证**单变量归因**。若 v2 仍不理想，下一步（v3）按
+`init_noise_std 1.0 → ~0.3` 做对照 —— 那一项同样**不碰接口契约**。
