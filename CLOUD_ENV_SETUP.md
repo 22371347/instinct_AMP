@@ -735,6 +735,62 @@ bash instinct/tools/refresh_plots.sh stop     # 停止
 → 这个量必须**专门画出来看**：它在控制台只以 `Mean step foot_sep_mean` 出现一行，
   训练早期还容易误读成「正常」。**均值本身没越界检查，图上才看得见趋势。**
 
+---
+
+## 13. 本地 MuJoCo 回放训练策略（验证闭环，2026-09-25）
+
+本地 env 有 `mujoco 3.13.0` / `onnxruntime 1.30.0` / `imageio`，**不需要云 GPU 就能回放策略**。
+
+```bash
+# ① 云端导出（单环境！）→ 得到 actor.onnx + policy_normalizer.npz
+bash /root/cloud_eval_policy.sh <run_dir> model_5000.pt 500   # 内含录像 + 导出两步
+
+# ② 拉回本地后自检 + 回放
+python instinct/tools/g1_mujoco_play.py --selftest-obs
+python instinct/tools/g1_mujoco_play.py --policy instinct/eval/actor_model_5000.onnx \
+       --duration 15 --cmd 0.5 0 0 --no-view --record instinct/eval/out.mp4
+```
+
+### 13.1 ⭐ 三个必须做对的约定（每个都会让机器人**秒摔**）
+
+| # | 坑 | 后果 / 正确做法 |
+|---|---|---|
+| 1 | **观测归一化没加载**（最主要） | `OnPolicyRunner.export_as_onnx` 是**先归一化 obs、再把归一化器单独存成 `exported/policy_normalizer.npz`**，而 ONNX 的输入是**归一化后**的观测。直接喂原始观测 = OOD → 标称站姿就输出 ±3.8 rad 疯狂动作、1.6 s 摔倒；加载后同一策略稳定站 **15 s+**。公式 `(x − mean)/(std + eps)` |
+| 2 | **`mj_resetDataKeyframe` 后缺 `mj_forward`** | `data.xpos` 未初始化 → 首帧 `height_scan` 拿到 0.5（应 0.32）→ 首帧观测错 → 因 `last_action` 是无裁剪反馈，**指数发散到 NaN** |
+| 3 | **动作尺度用错约定** | 本仓库是 `ACTION_SCALE = 1.0`（`target = default_joint_pos + 1.0·action`，云端实测 `action_term._scale == 1.0`）；不要用 `beyondmimic` 的 per-joint `0.25·effort/kp`（小 2~13 倍） |
+
+### 13.2 关节序一共有三套（别混）
+
+| 序 | 前 3 项 | 用途 |
+|---|---|---|
+| **articulation 序 == OMNI_LOCO 序** | shoulder_pitch(L,R), waist_pitch … | **动作**、`last_action`、**观测里的 `joint_pos_rel`/`joint_vel`**（`SceneEntityCfg("robot")` 默认 → `joint_ids=slice(None)`）|
+| MuJoCo MJCF / 执行器序 | 腰 → 左腿 → 右腿 … | MuJoCo `qpos` / `ctrl` |
+| 训练 npz 的 `joint_names` 序 | 左腿(6) → 右腿(6) → 腰(3) → 臂(7) | AMP 参考动作 |
+
+**云端实测确认**：`robot.joint_names == action_term._joint_names == OMNI_LOCO_ORDER`
+⇒ articulation 序就是肩优先交错序（工具 `instinct/tools/cloud_probe_joint_order.py`）。
+
+### 13.3 云端口径核对（都是读源码/实测，不是推断）
+
+- `height_scan = sensor_z − hit_z − 0.5`，clip(−1,1) → **平地精确退化为常数 `torso_z − 0.5`**（torso_z=0.82 ⇒ 0.32）
+- `projected_gravity = R^T·(0,0,−1)` → 直立时 **(0,0,−1)**（旧 `ObsBuilder` 算成了 `R^T·ẑ`，符号反，已修）
+- `base_ang_vel` / `joint_vel` **无额外 scale**（原始 rad/s）
+- MuJoCo 侧 `MJCF 执行器序 == 硬编码 MUJOCO_ORDER` ✓、`keyframe home == INIT_JOINT_POS` 逐项一致 ✓、root 高度 0.82 ✓
+
+### 13.4 ⚠️ 曾怀疑、**已查实排除**的一项
+
+一度怀疑「npz 是腿优先序、而 motion_reference 不做按名重排」→ AMP 判别器会比较错位向量。
+**读加载器源码后确认是虚警**：`motion_reference/motion_files/amass_motion.py:580-588`
+按名字把 npz 关节列重排到 `isaac_joint_names`（articulation 序），缺关节还会报错。
+⇒ 转换器产出「源序 + 诚实的 `joint_names`」正是它要的契约，**无需重排、无需重训**。
+
+### 13.5 注意：策略动作幅度本身就很大（不是回放的 bug）
+
+训练侧 `Episode_Monitor/tracking_action/std ≈ 2.93`、**`abs_max ≈ 29.7`**（且随训练增大）。
+配合 `scale=1.0` ⇒ 策略把大部分目标角**推到关节限位**（bang-bang），
+`action_rate_l2 = −0.95` 因此成为最大代价项。
+学长的 OmniLoco 基线同样 `scale=1.0` + `init_noise_std=1.0`，属**有意对齐**，不是错误。
+
 ### 11.3 观测/统计的 5 个坑（共同点是**都会骗人**）
 
 | 坑 | 现象 | 对策 |
