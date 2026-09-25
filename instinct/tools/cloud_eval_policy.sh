@@ -1,29 +1,36 @@
 #!/usr/bin/env bash
 # ============================================================================
-# 策略验证：用 play.py 跑训练好的 checkpoint
-#   ① 录像（多环境）→ <run>/videos/play/*.mp4
-#   ② 导出 ONNX（单环境）→ <run>/exported/*.onnx   —— 给本地 MuJoCo 部署用
+# 策略验证：从训练好的 checkpoint 导出 ONNX（→ <run>/exported/），给本地 MuJoCo 用
 #
 # ⚠️ 三条实测踩到的硬约束（写死在这个脚本里，别再踩）：
 #   1. `--exportonnx` **只支持单环境**：`assert env.unwrapped.num_envs == 1`
-#      → 和 `--num_envs 16` 一起用会直接 AssertionError 崩掉整次运行（连录像都没了）。
-#   2. `play.py` 主循环是 `while simulation_app.is_running()`，**只有带 `--video`
-#      时才会在 `video_length` 步后 break**。不加 `--video` 的后台任务永远不会自己结束。
-#   3. `--exportonnx` 在 `if agent_cfg.load_run is not None:` 里 → 必须给 `--load_run`。
+#      → 和 `--num_envs 16` 一起用会直接 AssertionError 崩掉整次运行。
+#   2. `--exportonnx` 在 `if agent_cfg.load_run is not None:` 里 → 必须给 `--load_run`。
+#   3. ⭐ **`--exportonnx` 分支导出完会自己结束**（play.py 里依次
+#      `env.close(); simulation_app.close(); return`） ⇒ **不需要靠 `--video` 让它退出**。
+#      旧版本在这里先跑了一遍「16 环境 × N 步录像」，纯粹白占 GPU 时间和磁盘
+#      （`--video` 的 break 只对下面的常规播放循环成立，对导出分支根本不成立）。
+#      ⇒ **录像已移除**（用户不需要）。若确实要录像，见文件末尾的注释。
 #
 # 用法：
-#   bash cloud_eval_policy.sh [run_dir] [checkpoint] [video_steps]
-#   bash cloud_eval_policy.sh 20260925_003514_G1AmpWalkPlane_obs626_directional_rew5_amp_walk_4096 model_5000.pt 500
-#   （run_dir 也可从 /root/gpufree-data/instinct_xu/logs/instinct_rl/g1_amp_walk 里自动取最新）
+#   bash cloud_eval_policy.sh [run_dir] [checkpoint]
+#   bash cloud_eval_policy.sh 20260925_203531_G1AmpWalkV3Plane_obs626_rew14_ar0.02_ns0.3_amp_walk_v3c_4096 model_1000.pt
+#   （run_dir 留空则自动取 $LOGROOT 下**最新修改**的目录）
+#
+# 环境变量：
+#   TASK=<play 任务 id>   默认 Instinct-Amp-Walk-G1-Play-v0
+#
+# 产物：
+#   <run>/exported/*.onnx
+#   <run>/exported/policy_normalizer.npz
+# ============================================================================
 set -uo pipefail
 
 XU=/root/gpufree-data/instinct_xu
 LOGROOT="$XU/logs/instinct_rl/g1_amp_walk"
 RUN_ARG="${1:-}"
 CKPT="${2:-model_5000.pt}"
-VID_STEPS="${3:-500}"
-VID_ENVS="${4:-16}"
-#: 可覆盖任务 id（v2 用 Instinct-Amp-Walk-V2-G1-Play-v0）。
+#: 可覆盖任务 id（v2/v3 用 Instinct-Amp-Walk-V2/V3-G1-Play-v0）。
 #: 奖励在 play 阶段不生效，且 v1/v2 的观测/动作契约完全相同，
 #: 所以两者可以互用；但显式传对名称能避免日志误导。
 TASK="${TASK:-Instinct-Amp-Walk-G1-Play-v0}"
@@ -40,22 +47,13 @@ if [[ -z "$RUN" ]]; then
   RUN="$(basename "${RUN%/}")"
 fi
 RUNDIR="$LOGROOT/$RUN"
-echo "=== 策略验证 run=$RUN ckpt=$CKPT video=${VID_STEPS}步 ==="
+echo "=== 策略验证 run=$RUN ckpt=$CKPT task=$TASK ==="
 ls -l "$RUNDIR/$CKPT" 2>/dev/null || { echo "❌ checkpoint 不存在: $RUNDIR/$CKPT"; exit 2; }
 
-# ── ① 录像（多环境；带 --video 才会自然结束）────────────────────────────────
+# 视频录像已移除：--exportonnx 导出后 play.py 自己 return，无需 --video 结束────────────────────────────────
+# 导出 ONNX（单环境）────────────────────────────────────────────────────
 echo
-echo "---------- ① 录像（${VID_ENVS} 环境 × ${VID_STEPS} 步）----------"
-./play.sh \
-  --task "$TASK" \
-  --load_run "$RUN" --checkpoint "$CKPT" \
-  --num_envs "$VID_ENVS" --device cuda:0 --headless \
-  --video --video_length "$VID_STEPS" 2>&1 | tail -20
-echo "录像退出码: ${PIPESTATUS[0]}"
-
-# ── ② 导出 ONNX（单环境）────────────────────────────────────────────────────
-echo
-echo "---------- ② 导出 ONNX（单环境）----------"
+echo "---------- 导出 ONNX（单环境，不录像）----------"
 ./play.sh \
   --task "$TASK" \
   --load_run "$RUN" --checkpoint "$CKPT" \
@@ -66,10 +64,12 @@ echo "导出退出码: ${PIPESTATUS[0]}"
 # ── 产物 ───────────────────────────────────────────────────────────────────
 echo
 echo "======== 产物 ========"
-find "$RUNDIR/videos" -name '*.mp4' 2>/dev/null | while read -r f; do
-  printf '  MP4  %s  (%s)\n' "$f" "$(du -h "$f" | cut -f1)"
-done
-find "$RUNDIR/exported" -name '*.onnx' 2>/dev/null | while read -r f; do
-  printf '  ONNX %s  (%s)\n' "$f" "$(du -h "$f" | cut -f1)"
-done
+find "$RUNDIR/exported" -maxdepth 1 -type f \( -name '*.onnx' -o -name '*.npz' \) 2>/dev/null \
+  | while read -r f; do
+      printf '  %s  (%s)\n' "$f" "$(du -h "$f" | cut -f1)"
+    done
 echo "======== 验证结束 ========"
+
+# 如需录像（默认不做）：
+#   cd $XU && ./play.sh --task "$TASK" --load_run "$RUN" --checkpoint "$CKPT" \
+#     --num_envs 16 --device cuda:0 --headless --video --video_length 500

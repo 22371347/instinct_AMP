@@ -15,13 +15,16 @@
 #
 # 用法：
 #   bash instinct/tools/pull_latest_onnx.sh                 # 自动取云端最新 checkpoint
-#   bash instinct/tools/pull_latest_onnx.sh --list          # 只列出云端可用（不占 GPU）
+#   bash instinct/tools/pull_latest_onnx.sh --list          # 只看训练进度 + 可用 checkpoint（不占 GPU）
 #   bash instinct/tools/pull_latest_onnx.sh <run_dir> <ckpt>  # 指定 run 与 checkpoint
-#   bash instinct/tools/pull_latest_onnx.sh --tag v2_7000    # 覆盖本地目录名
+#   bash instinct/tools/pull_latest_onnx.sh --tag v3_1000    # 覆盖本地目录名
 #
 # 产物：
 #   instinct/eval/<tag>/actor.onnx
 #   instinct/eval/<tag>/policy_normalizer.npz
+#
+# ⚠️ 本脚本**不录云端视频**。`--exportonnx` 分支导出完会自己 `return`，play.py 随之退出 ——
+#    录像从来不是必需的（旧版先跑 16 环境 × N 步录像，纯浪费 GPU 与磁盘）。
 # ============================================================================
 set -uo pipefail
 
@@ -32,7 +35,6 @@ SSH=(python instinct/tools/instinct_ssh.py)
 XU=/root/gpufree-data/instinct_xu
 LOGROOT="$XU/logs/instinct_rl/g1_amp_walk"
 LOCAL_EVAL="$ROOT/instinct/eval"
-VID_STEPS="${VID_STEPS:-200}"
 
 LIST_ONLY=0
 TAG_OVERRIDE=""
@@ -49,16 +51,45 @@ done
 
 # ── 0. 把导出脚本同步到云端（幂等；脚本改了就生效）───────────────────────────
 "${SSH[@]}" --put instinct/tools/cloud_eval_policy.sh /root/cloud_eval_policy.sh >/dev/null 2>&1
+"${SSH[@]}" --put instinct/tools/cloud_list_runs.sh  /root/cloud_list_runs.sh  >/dev/null 2>&1
+
+# ⭐ 云端训练进度总览
+#    回答「最新那次训练跑到第几轮、存了 checkpoint 没有」—— 光看 model_*.pt 会答错：
+#    最新一版训练在过**第一个存盘点**之前，一个模型文件都没有，于是会被误认为
+#    「没有在训练」，或者默默拉回上一个 run 的 ckpt（用户实际遇到的困惑）。
+RAWPROG="$("${SSH[@]}" "bash /root/cloud_list_runs.sh 5" 2>/dev/null \
+  | grep -vE 'credentials|password' | tr -d '\r')"
+echo "════════ 云端训练进度（按日志修改时间倒序）════════"
+printf '  %-24s %-12s %-13s %-10s %s\n' "日志 tag" "迭代" "日志更新" "ckpt×个" "run 目录（只显示尾部）"
+if [[ -z "$RAWPROG" ]]; then
+  echo "  （/root 下没有 train_amp_walk_*.log）"
+else
+  echo "$RAWPROG" | while IFS='|' read -r t it mt rd ck nck; do
+    [[ -z "$t" ]] && continue
+    if [[ "$t" == "=ALIVE=" ]]; then
+      if [[ "${it:-0}" -gt 0 ]]; then
+        echo "  ✅ 当前有训练在跑（train.py 进程数 = $it）"
+      else
+        echo "  ⛔ 当前没有 train.py 进程（云端空闲）"
+      fi
+      continue
+    fi
+    ckd="${ck:-<无>}"; ckd="${ckd#model_}"; ckd="${ckd%.pt}"
+    rdd="$rd"; [[ ${#rdd} -gt 38 ]] && rdd="…${rdd: -38}"
+    printf '  %-24s %-12s %-13s %-10s %s\n' "$t" "$it" "$mt" "${ckd}×${nck}" "$rdd"
+  done
+fi
+echo
 
 # ── 1. 列出云端「真正含 checkpoint」的 run（跳过空的续训目录）────────────────
 #    在**本地**做格式化，避免嵌套引号把 awk 的 $1/$2 提前展开。
-echo "════════ 云端可用 checkpoint ════════"
+echo "════════ 云端可用 checkpoint（最新 10 个）════════"
 RAW="$("${SSH[@]}" "find $LOGROOT -maxdepth 2 -name 'model_*.pt' -printf '%TY-%Tm-%Td %TH:%TM %p\\n' 2>/dev/null | sort" 2>/dev/null \
   | grep -vE 'credentials|password' | tr -d '\r')"
 if [[ -z "$RAW" ]]; then
   echo "  （云端一个 model_*.pt 都没有）"
 else
-  echo "$RAW" | tail -20 | while read -r d t p; do
+  echo "$RAW" | tail -10 | while read -r d t p; do
     [[ -z "$p" ]] && continue
     printf '  %s %s  %s/%s\n' "$d" "$t" "$(basename "$(dirname "$p")")" "$(basename "$p")"
   done
@@ -87,29 +118,44 @@ echo "选定: run=$RUN_ARG  ckpt=$CKPT_ARG"
 # ── 3. 本地标签 / 任务 ID ───────────────────────────────────────────────────
 if [[ -n "$TAG_OVERRIDE" ]]; then
   TAG="$TAG_OVERRIDE"
+elif [[ "$RUN_ARG" == *V3* ]]; then
+  TAG="v3_${STEP}"
 elif [[ "$RUN_ARG" == *V2* ]]; then
   TAG="v2_${STEP}"
 else
   TAG="v1_${STEP}"
 fi
-if [[ "$RUN_ARG" == *V2* ]]; then
+# ⚠️ 任务 id 必须跟 run 的版本对上：V3 的指令分布/数据集与 v1/v2 不同。
+#    用错任务不会崩（obs/动作契约相同），但 play 阶段的环境配置是错的。
+if [[ "$RUN_ARG" == *V3* ]]; then
+  PLAY_TASK=Instinct-Amp-Walk-V3-G1-Play-v0
+elif [[ "$RUN_ARG" == *V2* ]]; then
   PLAY_TASK=Instinct-Amp-Walk-V2-G1-Play-v0
 else
   PLAY_TASK=Instinct-Amp-Walk-G1-Play-v0
 fi
 echo "本地标签: $TAG   任务: $PLAY_TASK"
 
+# ⭐ 若最新日志的 run 不是本次选的 run ⇒ 说明「最新那次训练还没存 checkpoint」
+NEWEST_TAG="$(echo "$RAWPROG" | grep -v '^=ALIVE=' | head -1 | cut -d'|' -f1)"
+if [[ -n "$NEWEST_TAG" && "$RUN_ARG" != *"$NEWEST_TAG"* ]]; then
+  echo "⚠️  最新日志是「$NEWEST_TAG」，但它还没有 model_*.pt；本次拉的是更早的 run「$RUN_ARG」。"
+fi
+
 # ── 4. 云端导出（后台跑 + 轮询产物）─────────────────────────────────────────
 # ⚠️ `--exportonnx` 只支持单环境；`play.py` 只有带 `--video` 才会自然退出。
 #    这些约束都已写死在 cloud_eval_policy.sh 里（见它的头注释）。
 echo
-echo "──── 云端导出中（单环境，含 ${VID_STEPS} 步录像；约 2~5 分钟）────"
-"${SSH[@]}" "bash /root/cloud_run_bg.sh 'TASK=$PLAY_TASK bash /root/cloud_eval_policy.sh $RUN_ARG $CKPT_ARG $VID_STEPS' /root/eval_${TAG}.log; echo launched" >/dev/null 2>&1
+echo "──── 云端导出中（单环境，仅 ONNX，不录像；约 2~4 分钟）────"
+# ⚠️ 用一个时间戳标记**排除历史 ONNX**：否则轮询会立刻看到上一次导出的旧文件而「成功」，
+#    拉到本地就是「旧 onnx + 新 normalizer」错配 —— 正是本脚本头部警告的那类坑。
+T0_MARK="/root/.eval_${TAG}.t0"
+"${SSH[@]}" "touch $T0_MARK; bash /root/cloud_run_bg.sh 'TASK=$PLAY_TASK bash /root/cloud_eval_policy.sh $RUN_ARG $CKPT_ARG' /root/eval_${TAG}.log; echo launched" >/dev/null 2>&1
 
 ONNX_REMOTE=""
 for _ in $(seq 1 40); do
   sleep 15
-  ONNX_REMOTE="$("${SSH[@]}" "ls $RUNDIR/exported/*.onnx 2>/dev/null | head -1" 2>/dev/null \
+  ONNX_REMOTE="$("${SSH[@]}" "find $RUNDIR/exported -maxdepth 1 -name '*.onnx' -newer $T0_MARK 2>/dev/null | head -1" 2>/dev/null \
     | grep -vE "credentials|password" | tr -d '\r' | tail -1)"
   [[ -n "$ONNX_REMOTE" ]] && break
   printf '.'

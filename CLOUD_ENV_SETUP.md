@@ -743,13 +743,35 @@ bash instinct/tools/refresh_plots.sh stop     # 停止
 
 ```bash
 # ① 云端导出（单环境！）→ 得到 actor.onnx + policy_normalizer.npz
-bash /root/cloud_eval_policy.sh <run_dir> model_5000.pt 500   # 内含录像 + 导出两步
+#    ⭐ 首选本地这一条：自动挑最新 checkpoint + 导出 + 拉回 + 本地自检，且**不录像**
+bash instinct/tools/pull_latest_onnx.sh
+bash instinct/tools/pull_latest_onnx.sh --list    # 只看云端训练进度 / 可用 checkpoint（不占 GPU）
+# 只想在云端拿到文件时：
+bash /root/cloud_eval_policy.sh <run_dir> model_5000.pt   # 仅导出 ONNX
 
 # ② 拉回本地后自检 + 回放
 python instinct/tools/g1_mujoco_play.py --selftest-obs
 python instinct/tools/g1_mujoco_play.py --policy instinct/eval/actor_model_5000.onnx \
        --duration 15 --cmd 0.5 0 0 --no-view --record instinct/eval/out.mp4
 ```
+
+> ⚠️ **更正（2026-09-25）**：`cloud_eval_policy.sh` 旧版跑「16 环境 × N 步录像 + 单环境导出」
+> 两步，注释里给的理由是"`play.py` 只有带 `--video` 才会自然退出"。**这个说法对导出分支是错的**：
+> `play.py` 的 `--exportonnx` 分支实际是
+> `obs, _ = env.get_observations(); ppo_runner.export_as_onnx(...); env.close(); simulation_app.close(); return`
+> —— **导出完自己就 `return` 了**，`while simulation_app.is_running()` 那个循环根本不会进入。
+> 所以录像纯属白占 GPU 时间与磁盘，**已删除**。实测导出耗时从「几分钟」降到 **~15 s**。
+
+> ⭐ **`pull_latest_onnx.sh` 的两个修正（同日）**：
+> 1. **不再靠 `model_*.pt` 猜"最新训练"** —— 最新一版训练在过**第一个存盘点**之前一个模型文件
+>    都没有，旧版会因此静默拉回**上一个 run** 的 ckpt。现在先打印一张「训练进度表」
+>    （tag / 迭代 `550/5000` / 日志更新时刻 / 已有 ckpt / run 目录），数据来自
+>    `cloud_list_runs.sh`（独立小脚本，避免三层嵌套引号）。选中的 run 与最新日志不一致时**显式告警**。
+> 2. **补上 V3 分支** —— 旧版只有 V2/v1：V3 的 run 会被标成 `v1_<step>`，且 `PLAY_TASK` 落到
+>    `Instinct-Amp-Walk-G1-Play-v0`（不会崩，但 play 阶段的 env_cfg 是错的）。现在 v3 走
+>    `v3_<step>` + `Instinct-Amp-Walk-V3-G1-Play-v0`。
+> 3. 导出轮询加了**时间戳标记**（`find -newer`），否则会立刻看到上一次导出的旧 ONNX 而"成功"，
+>    拉回本地就是「旧 onnx + 新 normalizer」错配 —— 正是 §13.1 坑 1 那类问题。
 
 ### 13.1 ⭐ 三个必须做对的约定（每个都会让机器人**秒摔**）
 
