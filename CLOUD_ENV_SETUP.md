@@ -974,3 +974,67 @@ floor geom: id=0 group=3 contype=1 conaffinity=1
 > 差别在于**它的 `<default>` 没给 geom 设 `group="3"`**，所以 floor 默认落在
 > group 0（可见）。它的实时节拍在 C++ 仿真器里（`simulate/src`），Python 侧只有策略配置。
 
+### 14.8 高亮 height_scan 扫描区域（2026-09-25）
+
+**默认就开**（`--no-show-scan` 可关）。开窗后能看到一个跟着机器人走的橙色矩形框。
+
+#### 几何来源（全是源码，不是估的）
+
+`instinct_xu` 的 `tasks/locomotion/config/g1/omni_loco_env_cfg.py:86`：
+
+```python
+height_scanner = MultiMeshRayCasterCfg(
+    prim_path = "{ENV_REGEX_NS}/Robot/torso_link",     # 挂在 torso 上
+    offset    = OffsetCfg(pos=(0.0, 0.0, 20.0)),       # 从 torso 上方 20 m 垂直向下打
+    ray_alignment = "yaw",                              # ⭐ 只跟航向，不随俯仰/横滚倾斜
+    pattern_cfg = GridPatternCfg(resolution=0.1, size=(3.0, 1.6)),
+    mesh_prim_paths = ["/World/ground"],
+)
+```
+
+**自洽校验**：`3.0/0.1 + 1 = 31`、`1.6/0.1 + 1 = 17` → `31 × 17 = 527`
+✓ = 契约里的 `AMP_WALK_SCAN_RAYS`（`amp_walk_env_cfg.py:87`）。
+
+⇒ **平地时扫描区域就是地面上一个 3.0（前后）× 1.6（左右）m 的矩形**，
+中心随机器人 `(x, y)` 平移、随航向（yaw）旋转，**与躯干高度无关**。
+
+#### 画了什么
+
+| 元素 | 含义 |
+|---|---|
+| **亮橙边框** | 扫描区域的 4 条边 |
+| 淡橙内部线 | 每 0.5 m 一条网格（不把 31×17 条射线全画出来遮住机器人）|
+| 前边缘外伸的短段 | 提示「这一侧是前方」（`GridPatternCfg` 的 x 是前后方向）|
+
+颜色/粗细常量：`SCAN_COLOR_EDGE` / `SCAN_COLOR_GRID` / `SCAN_LINE_RADIUS = 0.012 m`。
+
+#### 实现要点
+
+1. **用 MuJoCo 的 user geom 叠加层**（`Handle.user_scn`），每帧 `ngeom = 0` 后重填，
+   在 `viewer_ctx.lock()` 保护下写、再 `sync()` —— 不碰物理，也不增加碰撞体。
+2. 用 `mjv_initGeom(...)` 先设好 `rgba`，再 `mjv_connector(...)` 连两点成一条线。
+   （`mjv_connector` 的文档明确要求先调 `mjv_initGeom`。）
+3. ⭐ **只取 yaw**：`yaw_frame_basis()` 把机体 x 轴投到水平面再正交化。
+   用完整四元数画的话，框会跟着躯干 roll/pitch 翻转 —— **那就把几何画错了**，
+   因为 `ray_alignment="yaw"` 的语义就是「网格永远水平扣在地面上」。
+4. 机体 x 轴接近竖直（极端姿态）时退回单位阵，不除零。
+
+#### 验证（离线，不需要开窗）
+
+`instinct/tools/test_scan_visual.py` —— **17 项全过**：
+
+| 检查 | 结果 |
+|---|---|
+| 线段数 = 12 且真的写进 `mjvScene` | ✅ |
+| 原地朝向 +x：`x∈[-1.5, 1.8]`、`y∈[-0.8, 0.8]`、`z≡0.012` | ✅ |
+| 平移到 (2,3) → 框中心跟到 (2,3) | ✅ |
+| **躯干高度 0.82→1.30，框不变**（与身高无关）| ✅ |
+| 转向 90° → 跨度互换（`x`=1.6 左右、`y`=3.3 前后+标记）| ✅ |
+| ⭐ **俯仰/横滚 30° → 框仍贴地**（yaw 对齐语义）| ✅ |
+| 机头朝天（极端姿态）不崩 | ✅ |
+
+> ⚠️ 写这个单测时踩了一下：一开始想从画好的 `mjvGeom` 反推端点，结果 7 项失败 ——
+> 因为 MuJoCo 的 **capsule 长轴是局部 `z` 轴**（不是 x），而且总长还要算上两倍半径。
+> 修法是把几何抽成纯函数 `scan_footprint_segments()` 直接测，
+> **而不是去凑测试的换算公式**。
+

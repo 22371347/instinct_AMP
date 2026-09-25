@@ -34,6 +34,13 @@
     python tools/g1_mujoco_play.py --policy /path/to/policy.onnx --duration 0 --cmd-step 0.2
     #    指令会被夹在训练范围 `CMD_LIMITS` 内（超范围 = 分布外，摔了不代表策略差）。
     #    离线单测（不开窗）：python tools/test_keyboard_teleop.py
+
+    # 5) ⭐ 高亮 height_scan 的扫描区域（**默认就开**，随机器人平移 + 偏航）
+    #    橙色框 = 3.0(前后) x 1.6(左右) m 的地面矩形，即 527 条射线的落点范围；
+    #    内部淡橙线 = 0.5 m 网格；前边缘向外伸出的短段 = “这一侧是前方”。
+    #    几何取自源码 `omni_loco_env_cfg.py:86`（GridPatternCfg(0.1, (3.0, 1.6))）。
+    python tools/g1_mujoco_play.py --policy /path/to/policy.onnx --duration 0 --no-show-scan
+    #    离线几何单测（不开窗）：python tools/test_scan_visual.py
 """
 from __future__ import annotations
 
@@ -443,6 +450,133 @@ def onnx_info(path: str) -> None:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# 高程图（height_scan）扫描区域可视化
+# ---------------------------------------------------------------------------
+# 几何**完全取自源码**，不是估的：`instinct_xu` 的
+# `tasks/locomotion/config/g1/omni_loco_env_cfg.py:86`（`G1OmniLocoSceneCfg.height_scanner`）：
+#
+#     height_scanner = MultiMeshRayCasterCfg(
+#         prim_path = "{ENV_REGEX_NS}/Robot/torso_link",   # 挂在 torso 上
+#         offset    = OffsetCfg(pos=(0.0, 0.0, 20.0)),     # 从 torso 上方 20 m 垂直向下打
+#         ray_alignment = "yaw",                            # ⭐ 只跟航向，不随俯仰/横滚倾斜
+#         pattern_cfg = GridPatternCfg(resolution=0.1, size=(3.0, 1.6)),
+#     )
+#
+# 自洽校验：3.0/0.1 + 1 = 31、1.6/0.1 + 1 = 17 → 31 × 17 = **527**
+#           ✓ = 契约里的 `AMP_WALK_SCAN_RAYS`（`amp_walk_env_cfg.py:87`）
+#
+# 平地时扫描区域就是**地面上一个 3.0（前后）× 1.6（左右）m 的矩形**，
+# 中心随机器人 (x, y) 平移、随航向（yaw）旋转。下面画的正是它。
+SCAN_SIZE_XY = (3.0, 1.6)       # (前后, 左右) m —— GridPatternCfg 的 size
+SCAN_RESOLUTION = 0.1           # m —— GridPatternCfg 的 resolution
+SCAN_TORSO_BODY = "torso_link"  # 挂载点
+SCAN_ALIGNMENT = "yaw"          # 与 IsaacLab 的 ray_alignment 对齐
+
+SCAN_COLOR_EDGE = np.array([1.00, 0.35, 0.05, 0.90], dtype=np.float32)  # 边框（亮橙）
+SCAN_COLOR_GRID = np.array([1.00, 0.60, 0.30, 0.35], dtype=np.float32)  # 内部网格（淡）
+SCAN_LINE_RADIUS = 0.012        # 胶囊半径（m）：3 m 外也看得清，又不遮住机器人
+SCAN_DRAW_Z = 0.012             # 抬离地面 12 mm，避免与地面 z-fighting
+
+
+def yaw_frame_basis(quat_wxyz: np.ndarray) -> np.ndarray:
+    """把机体姿态投影到水平面 → 3x3 矩阵，列依次是 yaw 系的 x / y / z 轴。
+
+    ⭐ 为什么不用完整四元数：`ray_alignment="yaw"` 让扫描网格**不随躯干的
+    roll/pitch 倾斜**（永远水平扣在地面上）。用完整姿态画就会跟着躯干翻转 ——
+    那就把几何画错了。做法：取机体 x 轴投到水平面当 yaw 系 x 轴，z 取世界 z。
+    """
+    fwd = rotmat_wxyz(quat_wxyz)[:, 0].copy()   # 机体 x 轴 → 世界坐标
+    fwd[2] = 0.0
+    norm = float(np.linalg.norm(fwd))
+    if norm < 1e-6:                             # 机体 x 轴几乎竖直（极端姿态）→ 退回单位阵
+        return np.eye(3)
+    x_axis = fwd / norm
+    z_axis = np.array([0.0, 0.0, 1.0])
+    y_axis = np.cross(z_axis, x_axis)
+    return np.column_stack([x_axis, y_axis, z_axis])
+
+
+def scan_footprint_segments(data, torso_id: int, *, z: float = SCAN_DRAW_Z):
+    """算出 height_scan 扫描区域的全部线段，返回 `[(起点, 终点, rgba), ...]`（世界坐标）。
+
+    单独拆出来是为了**能被离线单测直接验证几何**（`test_scan_visual.py`）：
+    若从画好的 `mjvGeom` 反推端点，要处理 capsule 的轴向（MuJoCo 里是局部 **z** 轴，
+    不是 x）与半径补偿，容易把测试自己写错 —— 那测的就不是几何了。
+
+    画三样东西：边框（亮橙）、每 0.5 m 的内部网格（淡）、以及前边缘中点向外
+    0.3 m 的短线段（提示「这一侧是前方」，因为 GridPatternCfg 的 x 是前后方向）。
+    """
+    p = data.xpos[torso_id]
+    R = yaw_frame_basis(data.xquat[torso_id])
+    half_x, half_y = SCAN_SIZE_XY[0] / 2.0, SCAN_SIZE_XY[1] / 2.0
+
+    def to_world(ux: float, uy: float) -> np.ndarray:
+        """扫描系 (x=前后, y=左右) → 世界坐标（落在地面上）"""
+        return np.array([p[0], p[1], z]) + R[:, 0] * ux + R[:, 1] * uy
+
+    segments: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+
+    # 1) 边框 4 条边
+    corners = [(-half_x, -half_y), (half_x, -half_y), (half_x, half_y), (-half_x, half_y)]
+    for i in range(4):
+        segments.append((to_world(*corners[i]), to_world(*corners[(i + 1) % 4]), SCAN_COLOR_EDGE))
+
+    # 2) 内部网格（0.5 m 一条，避免把 31x17 条射线全画出来遮住机器人）
+    grid_step = 0.5
+    for i in range(1, int(SCAN_SIZE_XY[0] / grid_step)):
+        ux = -half_x + i * grid_step
+        segments.append((to_world(ux, -half_y), to_world(ux, half_y), SCAN_COLOR_GRID))
+    for i in range(1, int(SCAN_SIZE_XY[1] / grid_step)):
+        uy = -half_y + i * grid_step
+        segments.append((to_world(-half_x, uy), to_world(half_x, uy), SCAN_COLOR_GRID))
+
+    # 3) 前向标记：前边缘中点再往前 0.3 m
+    segments.append((to_world(half_x, 0.0), to_world(half_x + 0.3, 0.0), SCAN_COLOR_EDGE))
+    return segments
+
+
+def draw_scan_footprint(scn, data, torso_id: int, *, z: float = SCAN_DRAW_Z) -> int:
+    """把扫描区域画进 `mjvScene`（**只画线，不动物理**）。返回画出的线条数。"""
+    import mujoco
+
+    drawn = 0
+    for a, b, rgba in scan_footprint_segments(data, torso_id, z=z):
+        if scn.ngeom >= scn.maxgeom:
+            break
+        geom = scn.geoms[scn.ngeom]
+        # `mjv_connector` 的前置要求：先 mjv_initGeom 把其余属性（rgba 等）设好
+        mujoco.mjv_initGeom(
+            geom, mujoco.mjtGeom.mjGEOM_CAPSULE, np.zeros(3), np.zeros(3),
+            np.eye(3).flatten(), rgba,
+        )
+        mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_CAPSULE, SCAN_LINE_RADIUS, a, b)
+        scn.ngeom += 1
+        drawn += 1
+    return drawn
+
+
+def scan_geometry_text() -> str:
+    """启动时打印扫描区域几何（便于和云端配置对账）。"""
+    return (
+        f"[scan] 高程图扫描区域 = {SCAN_SIZE_XY[0]:.1f}(前后) x {SCAN_SIZE_XY[1]:.1f}(左右) m，"
+        f"res {SCAN_RESOLUTION} m → "
+        f"{int(SCAN_SIZE_XY[0] / SCAN_RESOLUTION) + 1} x {int(SCAN_SIZE_XY[1] / SCAN_RESOLUTION) + 1} = "
+        f"{SCAN_GRID_RAYS} 条射线\n"
+        f"       挂载 {SCAN_TORSO_BODY}，ray_alignment='{SCAN_ALIGNMENT}'"
+        f"（只跟航向，不随俯仰/横滚倾斜）\n"
+        f"       平地时 = 地面上的矩形，中心随机器人平移、随航向旋转（橙色框=边界，前边缘外伸段=前方）"
+    )
+
+
+# 527：由上面的 size/resolution 推导，不是硬写的常数
+SCAN_GRID_RAYS = (
+    int(SCAN_SIZE_XY[0] / SCAN_RESOLUTION) + 1
+) * (
+    int(SCAN_SIZE_XY[1] / SCAN_RESOLUTION) + 1
+)
+
+
+# ---------------------------------------------------------------------------
 # 键盘遥控（WASD/QE）—— 平地技能验证
 # ---------------------------------------------------------------------------
 
@@ -821,6 +955,16 @@ def play(args) -> int:
     if args.record:
         renderer = mujoco.Renderer(model, height=args.height, width=args.width)
 
+    # --- 高程图扫描区域可视化（默认开）---
+    scan_torso_id = -1
+    if args.view and args.show_scan:
+        scan_torso_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, SCAN_TORSO_BODY)
+        if scan_torso_id < 0:
+            print(f"[scan] ⚠️ MJCF 里找不到 body '{SCAN_TORSO_BODY}'，关闭扫描区域可视化")
+        else:
+            print(scan_geometry_text())
+            print(f"       torso_body_id = {scan_torso_id}")
+
     viewer_ctx = None
     teleop: KeyboardCommandController | None = None
     if args.view:
@@ -940,6 +1084,11 @@ def play(args) -> int:
                 mujoco.mj_step(model, data)
 
             if viewer_ctx is not None:
+                # 每帧重画扫描区域（user_scn 是“只读物理”的叠加层，不影响碰撞）
+                if scan_torso_id >= 0:
+                    with viewer_ctx.lock():
+                        viewer_ctx.user_scn.ngeom = 0
+                        draw_scan_footprint(viewer_ctx.user_scn, data, scan_torso_id)
                 viewer_ctx.sync()
             if renderer is not None and step % args.record_every == 0:
                 renderer.update_scene(data)
@@ -1054,6 +1203,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cam-distance", type=float, default=3.0, help="初始相机距离（米）")
     ap.add_argument("--show-collision", action="store_true",
                     help="显示 group 3 的碰撞 geom（胶囊体等，排查接触时用）")
+    ap.add_argument("--show-scan", dest="show_scan", action="store_true", default=True,
+                    help="高亮 height_scan 的扫描区域（默认开；橙色框=3.0x1.6 m）")
+    ap.add_argument("--no-show-scan", dest="show_scan", action="store_false",
+                    help="关掉扫描区域高亮")
     ap.add_argument("--no-checkered-floor", action="store_true",
                     help="不给地面补棋盘材质（保持 MJCF 原样；地面会是纯色）")
     ap.add_argument("--policy-hz", type=float, default=50.0, help="策略频率（InstinctLab=50Hz）")
