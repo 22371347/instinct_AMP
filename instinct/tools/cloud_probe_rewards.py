@@ -65,5 +65,21 @@ if args.expect is not None:
 else:
     print(f"\n[REWARD-SET INFO] {args.task}: active_terms={n}")
 
+# --- 4. agent cfg（策略/算法侧的关键超参）------------------------------------
+try:
+    from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
+
+    agent_cfg = load_cfg_from_registry(args.task, "instinct_rl_cfg_entry_point")
+    pol = getattr(agent_cfg, "policy", None)
+    alg = getattr(agent_cfg, "algorithm", None)
+    print(f"\n[agent] class = {type(agent_cfg).__name__}")
+    print(f"[agent] init_noise_std  = {getattr(pol, 'init_noise_std', '?')}"
+          f"    <- 绝对 σ（rad）；scale=1.0 下即关节目标噪声幅度")
+    print(f"[agent] clip_min_std    = {getattr(alg, 'clip_min_std', '?')}")
+    print(f"[agent] actor_hidden    = {getattr(pol, 'actor_hidden_dims', '?')}")
+    print(f"[agent] experiment_name = {getattr(agent_cfg, 'experiment_name', '?')}")
+except Exception as exc:  # noqa: BLE001
+    print(f"\n[agent] ⚠️ 读取 agent cfg 失败: {type(exc).__name__}: {exc}")
+
 env.close()
 simulation_app.close()
