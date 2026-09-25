@@ -23,6 +23,10 @@ RUN_ARG="${1:-}"
 CKPT="${2:-model_5000.pt}"
 VID_STEPS="${3:-500}"
 VID_ENVS="${4:-16}"
+#: 可覆盖任务 id（v2 用 Instinct-Amp-Walk-V2-G1-Play-v0）。
+#: 奖励在 play 阶段不生效，且 v1/v2 的观测/动作契约完全相同，
+#: 所以两者可以互用；但显式传对名称能避免日志误导。
+TASK="${TASK:-Instinct-Amp-Walk-G1-Play-v0}"
 
 cd "$XU" || exit 1
 [[ -f /root/.llp_env.sh ]] && source /root/.llp_env.sh
@@ -43,7 +47,7 @@ ls -l "$RUNDIR/$CKPT" 2>/dev/null || { echo "❌ checkpoint 不存在: $RUNDIR/$
 echo
 echo "---------- ① 录像（${VID_ENVS} 环境 × ${VID_STEPS} 步）----------"
 ./play.sh \
-  --task Instinct-Amp-Walk-G1-Play-v0 \
+  --task "$TASK" \
   --load_run "$RUN" --checkpoint "$CKPT" \
   --num_envs "$VID_ENVS" --device cuda:0 --headless \
   --video --video_length "$VID_STEPS" 2>&1 | tail -20
@@ -53,7 +57,7 @@ echo "录像退出码: ${PIPESTATUS[0]}"
 echo
 echo "---------- ② 导出 ONNX（单环境）----------"
 ./play.sh \
-  --task Instinct-Amp-Walk-G1-Play-v0 \
+  --task "$TASK" \
   --load_run "$RUN" --checkpoint "$CKPT" \
   --num_envs 1 --device cuda:0 --headless \
   --exportonnx 2>&1 | tail -15

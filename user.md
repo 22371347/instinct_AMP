@@ -8,3 +8,6 @@ python instinct/tools/g1_mujoco_play.py \
 bash instinct/tools/refresh_plots.sh  #10分钟传一次
 bash instinct/tools/refresh_plots.sh once  #传一次
 bash instinct/tools/refresh_plots.sh stop  
+
+onnx回传：
+bash instinct/tools/pull_latest_onnx.sh
