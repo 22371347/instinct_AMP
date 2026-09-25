@@ -38,3 +38,6 @@ Thumbs.db
 
 # ---- 训练曲线图（由 tools/refresh_plots.sh 自动生成，会频繁变动，不入库）----
 instinct/plots/
+
+# ---- MuJoCo 回放产物（录像/onnx/归一化，体积大且可重新生成）----
+instinct/eval/

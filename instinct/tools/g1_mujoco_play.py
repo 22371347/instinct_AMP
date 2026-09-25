@@ -75,6 +75,9 @@ class OnnxPolicy:
         self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
         self.input_name = self.sess.get_inputs()[0].name
         self.output_names = [o.name for o in self.sess.get_outputs()]
+        # 输入最后一维 = 策略期望的观测维度（用来自动选择 obs builder）
+        shape = self.sess.get_inputs()[0].shape
+        self.input_dim = int(shape[-1]) if shape and isinstance(shape[-1], int) else None
 
     def __call__(self, obs: np.ndarray) -> np.ndarray:
         out = self.sess.run(None, {self.input_name: obs.astype(np.float32)})
@@ -90,6 +93,8 @@ class TorchPolicy:
         if isinstance(obj, torch.nn.Module):
             obj.eval()
             self.module = obj
+            # torch 分支不解析维度；如需非默认观测布局，用 `--obs-mode` 显式指定
+            self.input_dim = None
         else:
             raise SystemExit(
                 "checkpoint 不是可直接调用的 nn.Module。\n"
@@ -111,6 +116,74 @@ def load_policy(path: str, policy_type: str = "auto"):
     if policy_type == "auto":
         policy_type = "onnx" if path.endswith(".onnx") else "torch"
     return OnnxPolicy(path) if policy_type == "onnx" else TorchPolicy(path)
+
+
+class ObsNormalizer:
+    """复现 `instinct_rl` 的观测归一化。
+
+    ⭐ **不加载它会直接得到垃圾动作**：`OnPolicyRunner.export_as_onnx` 在导出时
+    是先把 obs 归一化、再把**归一化器单独存成 `policy_normalizer.npz`** 的：
+
+        if "policy" in self.normalizers:
+            obs = self.normalizers["policy"](obs)              # 先归一化
+            self.normalizers["policy"].export(...npz)           # 统计量另存
+        self.alg.actor_critic.export_as_onnx(obs, ...)
+
+    ⇒ **ONNX 的输入是归一化后的观测**。直接喂原始观测 = OOD，
+      实测会在标称站姿下输出 ±3.8 rad 的“疯狂”动作、机器人立即摔倒。
+
+    公式（`instinct_rl/modules/normalizer.py`）：`(x - mean) / (std + eps)`
+    """
+
+    def __init__(self, path: str):
+        z = np.load(path, allow_pickle=True)
+        self.mean = np.asarray(z["mean"], dtype=np.float64).reshape(1, -1)
+        self.std = np.asarray(z["std"], dtype=np.float64).reshape(1, -1)
+        self.eps = float(np.asarray(z["eps"]).reshape(-1)[0]) if "eps" in z.files else 1e-2
+        self.dim = self.mean.shape[1]
+
+    def __call__(self, obs: np.ndarray) -> np.ndarray:
+        o = np.asarray(obs, dtype=np.float64)
+        return ((o - self.mean) / (self.std + self.eps)).astype(np.float32)
+
+
+def find_normalizer(policy_path: str) -> str | None:
+    """在策略文件旁边找 `policy_normalizer.npz`（云端 export 的默认位置）。"""
+    cand = os.path.join(os.path.dirname(os.path.abspath(policy_path)), "policy_normalizer.npz")
+    return cand if os.path.isfile(cand) else None
+
+
+# ---------------------------------------------------------------------------
+# 四元数 / 观测拼接工具
+# ---------------------------------------------------------------------------
+
+# IsaacLab 的 `projected_gravity_b` 用的重力方向（单位向量，wxyz 约定）
+GRAVITY_VEC_W = np.array([0.0, 0.0, -1.0])
+
+
+def rotmat_wxyz(quat_wxyz: np.ndarray) -> np.ndarray:
+    """四元数(w,x,y,z) → 旋转矩阵 R（body→world）。"""
+    w, x, y, z = np.asarray(quat_wxyz, dtype=np.float64)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def quat_apply_inverse_wxyz(quat_wxyz: np.ndarray, vec_w: np.ndarray) -> np.ndarray:
+    """world 系向量 → body 系。等价于 IsaacLab 的 `math_utils.quat_apply_inverse`。"""
+    return rotmat_wxyz(quat_wxyz).T @ np.asarray(vec_w, dtype=np.float64)
+
+
+def projected_gravity_wxyz(quat_wxyz: np.ndarray) -> np.ndarray:
+    """IsaacLab `asset.data.projected_gravity_b` 的等价实现。
+
+    直立时返回 (0, 0, -1) —— 这是判对错的关键：如果得到 (0,0,+1) 就是符号错了。
+    """
+    return quat_apply_inverse_wxyz(quat_wxyz, GRAVITY_VEC_W)
 
 
 # ---------------------------------------------------------------------------
@@ -152,18 +225,16 @@ class ObsBuilder:
 
     def build(self, cmd: np.ndarray, last_action: np.ndarray) -> np.ndarray:
         d = self.data
-        # 角速度（mujoco 的 free joint 角速度在前 3，线性在后 3）
+        # 角速度（mujoco free joint：qvel[3:6] 已经是 **body 系** 角速度）
         ang_vel = d.qvel[3:6].copy() * 0.25
         # 投影重力
-        quat = d.qpos[3:7]  # w, x, y, z
-        w, x, y, z = quat
-        grav = np.array(
-            [
-                2 * (x * z - w * y),
-                2 * (y * z + w * x),
-                1 - 2 * (x * x + y * y),
-            ]
-        )
+        # ⚠️ IsaacLab 的 `projected_gravity` = `asset.data.projected_gravity_b`
+        #    = quat_apply_inverse(root_quat_w, (0,0,-1))  → 直立时 (0,0,-1)。
+        #    这里原来算的是 R^T·ẑ = +[2(xz-wy), 2(yz+wx), 1-2(x²+y²)]，**符号反了**。
+        #    （IsaacLab 源码：`projected_gravity_b` 用 GRAVITY_VEC_W=(0,0,-1)；
+        #      InstinctLab 的 `instinct_mdp.projected_gravity` 就是 isaaclab 那个，
+        #      见 instinctlab/envs/mdp/observations/expanded.py 的 import 头）
+        grav = projected_gravity_wxyz(d.qpos[3:7])
         joint_pos_rel = d.qpos[7:] - self.default_joint_pos
         joint_vel = d.qvel[6:] * 0.05
 
@@ -181,6 +252,112 @@ class ObsBuilder:
                 "带深度的策略只能回放「非深度」分支，或到云端用 Isaac Sim 验证。"
             )
         return np.concatenate(parts, axis=-1)
+
+
+class AmpWalk626ObsBuilder:
+    """`Instinct-Amp-Walk-G1-v0` 的 **626 维** actor 特权观测拼接。
+
+    与上面的 `ObsBuilder`（InstinctLab parkour：8 帧历史 + scale 0.25/0.05）
+    完全不同：本任务是**单帧、无额外缩放、无历史**，按 `G1AmpWalkPolicyObsCfg`
+    的**声明顺序**拼接：
+
+        [ height_scan(527) | velocity_command(3) | base_lin_vel(3)
+          | projected_gravity(3) | base_ang_vel(3)
+          | joint_pos_rel(29) | joint_vel(29) | last_action(29) ] = 626
+
+    每一项的语义都对着源码钉过（不是猜的）：
+
+    | 项 | IsaacLab 实现 | MuJoCo 侧取法 |
+    |---|---|---|
+    | height_scan | `sensor_z - hit_z - 0.5`，clip(-1,1) | 平地 → 常数 `torso_z - 0.5` |
+    | velocity_command | `vel_command_b`（body 系） | 外部给定指令 |
+    | base_lin_vel | `root_lin_vel_b` | `R^T @ qvel[0:3]` |
+    | projected_gravity | `R^T @ (0,0,-1)` | `projected_gravity_wxyz()`（直立=(0,0,-1)）|
+    | base_ang_vel | `root_ang_vel_b`，**无缩放** | `qvel[3:6]`（free joint 角速度本就在 body 系）|
+    | joint_pos_rel | `joint_pos - default_joint_pos` | 需按**关节名**重排到 IsaacLab 序 |
+    | joint_vel | `joint_vel`，**无缩放** | 同上重排 |
+    | last_action | `action_manager.action` | 上一步策略输出（policy 序，**不重排**）|
+
+    来源核对：`instinctlab/envs/mdp/observations/expanded.py` 的 import 头
+    显示 `projected_gravity / base_ang_vel / last_action / joint_pos_rel / joint_vel`
+    全部转发自 `isaaclab.envs.mdp`；`height_scan` 的具体公式见
+    `isaaclab/envs/mdp/observations.py` 的 `height_scan`（offset 默认 0.5）。
+
+    ⚠️ **height_scan 是特权量**：MuJoCo 里没有 527 条射线的地形扫描器。
+    平地近似成常数是**精确**的（每条射线都命中 z=0 地面，公式退化成
+    `torso_z - 0.5`）；地形不平坦时这个近似不成立，回放结论不可信。
+    """
+
+    N_SCAN = 527          # 31 x 17：0.1 m 分辨率、3.0 x 1.6 m
+    SCAN_OFFSET = 0.5     # IsaacLab `height_scan` 默认 offset（我们的 ObsTerm 没传 → 0.5）
+    SCAN_CLIP = (-1.0, 1.0)
+
+    def __init__(self, model, data, default_joint_pos_mjcf, n_joint=29,
+                 torso_body_name="torso_link", obs_joint_order="npz"):
+        import mujoco
+
+        try:
+            from joint_order import (ISAACLAB_ORDER, MUJOCO_ORDER, NPZ_ORDER,
+                                     mjcf_to_order_index)  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise SystemExit(
+                "需要同目录的 joint_order.py（提供各套关节序映射）："
+                f"{exc}"
+            )
+
+        self.model, self.data = model, data
+        self.n_joint = n_joint
+        # ⭐ 关键：观测里的 `joint_pos_rel` / `joint_vel` 用的是 `SceneEntityCfg("robot")`
+        # 默认（joint_names=None → joint_ids=slice(None)）⇒ **articulation 序**，
+        # 与「动作」用的 OMNI_LOCO 序 **不是**同一套！
+        # 候选：articulation（= Unitree URDF 声明序）/ omiloco / mjcf
+        cand = {
+            "isaaclab": ISAACLAB_ORDER,
+            "omniloco": ISAACLAB_ORDER,
+            "npz": NPZ_ORDER,
+            "articulation": NPZ_ORDER,   # 云端实测确认后固定到这个
+            "mjcf": MUJOCO_ORDER,
+        }
+        if obs_joint_order not in cand:
+            raise SystemExit(f"未知 --obs-joint-order={obs_joint_order}，可选 {list(cand)}")
+        self.obs_order_name = obs_joint_order
+        self.mj_to_obs = np.array(mjcf_to_order_index(cand[obs_joint_order]), dtype=int)
+        # 默认站姿按**观测序**重排，供 joint_pos_rel 使用
+        self.default_policy = np.asarray(default_joint_pos_mjcf,
+                                         dtype=np.float64)[self.mj_to_obs]
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, torso_body_name)
+        if bid < 0:
+            raise SystemExit(
+                f"MJCF 里找不到 body '{torso_body_name}' —— height_scan 需要它的 z 坐标"
+            )
+        self.torso_body_id = bid
+        print(f"[obs] AMP-Walk 626 维：height_scan={self.N_SCAN} "
+              f"(平地常数 torso_z-{self.SCAN_OFFSET})，torso_body_id={bid}")
+        print(f"[obs] 观测关节块用 **{obs_joint_order}** 序"
+              f"（与动作的 OMNI_LOCO 序不同；重排={'生效' if not np.array_equal(self.mj_to_obs, np.arange(n_joint)) else 'no-op'}）")
+
+    def build(self, cmd: np.ndarray, last_action: np.ndarray) -> np.ndarray:
+        d = self.data
+        # 1) height_scan(527)：平地精确解
+        scan = np.full(self.N_SCAN, d.xpos[self.torso_body_id, 2] - self.SCAN_OFFSET)
+        np.clip(scan, *self.SCAN_CLIP, out=scan)
+        # 2) velocity_command(3)，body 系
+        cmd = np.asarray(cmd, dtype=np.float64)
+        # 3) base_lin_vel(3)：world → root(pelvis) 系
+        quat = d.qpos[3:7]  # w, x, y, z
+        lin_b = quat_apply_inverse_wxyz(quat, d.qvel[0:3])
+        # 4) projected_gravity(3)
+        grav = projected_gravity_wxyz(quat)
+        # 5) base_ang_vel(3)：free joint 的 qvel[3:6] 已是 body 系，且**无缩放**
+        ang_b = d.qvel[3:6].copy()
+        # 6/7) joint_pos_rel / joint_vel：MJCF 序 → **观测序**（articulation/npz）
+        jp = d.qpos[7:7 + self.n_joint][self.mj_to_obs] - self.default_policy
+        jv = d.qvel[6:6 + self.n_joint][self.mj_to_obs]
+        # 8) last_action（policy 序）
+        return np.concatenate(
+            [scan, cmd, lin_b, grav, ang_b, jp, jv,
+             np.asarray(last_action, dtype=np.float64)]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -275,21 +452,122 @@ def play(args) -> int:
 
     n_joint = model.nu
     default_joint_pos = default_qpos[7 : 7 + n_joint].copy()
-    if ACTION_SCALE.shape[0] != n_joint:
-        action_scale = np.full(n_joint, args.action_scale, dtype=np.float64)
-        print(f"[warn] MJCF 有 {n_joint} 个执行器（期望 29），回退到全局 action_scale={args.action_scale}")
-    else:
-        action_scale = ACTION_SCALE.copy()
-        print(f"[ctrl] 逐关节 action_scale: {action_scale.min():.5f} ~ {action_scale.max():.5f}")
+    # ⚠️ 必须 mj_forward 一次：`mj_resetDataKeyframe` 只写了 qpos/qvel，
+    #    `data.xpos`（body 世界坐标）等派生量还是**未初始化**的。
+    #    height_scan 要用 torso 的 z，不 forward 就会得到垃圾值（实测首帧
+    #    scan=0.5 而非 0.32）→ 第一帧观测错 → 动作飙到 4 rad → 因为 last_action
+    #    是无裁剪反馈，直接指数发散到 NaN。
+    mujoco.mj_forward(model, data)
+    # ⚠️ action_scale 在下面（知道 obs_mode 之后）才能定 —— 两种任务的约定不同，
+    #    见那里的注释（这是个能把机器人直接搞摔的坑）。
 
     # 策略
     policy = load_policy(args.policy, args.policy_type) if args.policy else None
     if policy is None:
         print("[warn] 未提供 --policy，仅做零动作站立（用于验证模型/PD）")
 
-    obs_builder = ObsBuilder(model, data, default_joint_pos, history=args.history) if policy else None
+    # --- 观测归一化（⭐ 不加载会得到垃圾动作，见 ObsNormalizer 注释）---
+    normalizer = None
+    if args.policy and not args.no_normalizer:
+        npath = args.normalizer or find_normalizer(args.policy)
+        if npath and os.path.isfile(npath):
+            normalizer = ObsNormalizer(npath)
+            print(f"[norm] 已加载观测归一化: {npath}  (dim={normalizer.dim}, eps={normalizer.eps:g})")
+        else:
+            print("[norm] ⚠️ 未找到 policy_normalizer.npz —— 若该策略训练时启用了观测归一化，"
+                  "现在得到的就是垃圾动作。用 --normalizer 指定路径，或 --no-normalizer 明确跳过。")
+
+    # --- 观测 builder 选择（按策略输入维度自动判定）---
+    obs_mode = args.obs_mode
+    if obs_mode == "auto":
+        dim = getattr(policy, "input_dim", None) if policy else None
+        if dim == 626:
+            obs_mode = "amp626"
+        elif dim is None:
+            if args.selftest_obs:
+                obs_mode = "amp626"   # 自检默认校验本任务的 626 维
+            else:
+                raise SystemExit(
+                    "--obs-mode auto 无法从策略文件推断观测维度（torch 分支 / 动态维度）。\n"
+                    "请显式指定：--obs-mode amp626（本任务）或 --obs-mode legacy（parkour）"
+                )
+        else:
+            obs_mode = "legacy"
+    if policy is None and not args.selftest_obs:
+        obs_builder = None
+    elif obs_mode == "amp626":
+        obs_builder = AmpWalk626ObsBuilder(model, data, default_joint_pos, n_joint=n_joint,
+                                           obs_joint_order=args.obs_joint_order)
+    else:
+        obs_builder = ObsBuilder(model, data, default_joint_pos, history=args.history)
+    print(f"[obs] obs_mode={obs_mode}"
+          + (f"  策略期望维度={getattr(policy, 'input_dim', None)}" if policy else "")
+          + f"  （自检：实际拼出 {626 if obs_mode == 'amp626' else '?'} 维）")
+
+    # 动作重排：策略输出是 IsaacLab(policy) 序，MJCF 的 ctrl 是 MJCF 序。
+    # 两套顺序不同（IsaacLab 肩优先左右交错；MJCF 按 body 遍历）→ 不重排会完全错位。
+    if args.joint_order == "isaaclab":
+        try:
+            from joint_order import policy_to_mujoco_index  # type: ignore
+            pol_to_mj = np.array(policy_to_mujoco_index(), dtype=int)
+            print(f"[act] 动作按关节名从 policy 序 → MJCF 序重排"
+                  f"（{'no-op' if np.array_equal(pol_to_mj, np.arange(n_joint)) else '生效'}）")
+        except ImportError as exc:  # pragma: no cover
+            raise SystemExit(f"--joint-order isaaclab 需要 joint_order.py：{exc}")
+    else:
+        pol_to_mj = np.arange(n_joint)
+        print("[act] 不做关节重排（--joint-order as-is）")
+
+    # --- 动作尺度（⭐ 这是个能把机器人直接搞摔的坑）---
+    #   本仓库（OmniLoco/AMP-Walk）的 `JointPositionAction` 是 **scale = 1.0**：
+    #       target = default_joint_pos + 1.0 * action        （action 直接是弧度偏移）
+    #   而 `beyondmimic` 那套（parkour/vault）用的是 per-joint
+    #       action_scale = 0.25 * effort / kp                 （例：0.0745 ~ 0.5476）
+    #   用错会把目标角缩小 2~13 倍 → 腿推不动 → 一启动就摔。
+    #   契约校验会打印 `scale=1.0`，与我们的 cfg 一致。
+    scale_mode = args.action_scale_mode
+    if scale_mode == "auto":
+        scale_mode = "unity" if obs_mode == "amp626" else "beyondmimic"
+    if scale_mode == "unity":
+        action_scale = np.ones(n_joint, dtype=np.float64)
+        print(f"[ctrl] action_scale = 1.0（unity，与 IsaacLab 的 scale=1.0 一致）")
+    elif ACTION_SCALE.shape[0] != n_joint:
+        action_scale = np.full(n_joint, args.action_scale, dtype=np.float64)
+        print(f"[warn] MJCF 有 {n_joint} 个执行器（期望 29），回退到全局 action_scale={args.action_scale}")
+    else:
+        action_scale = ACTION_SCALE.copy()
+        print(f"[ctrl] 逐关节 action_scale（beyondmimic）: "
+              f"{action_scale.min():.5f} ~ {action_scale.max():.5f}")
+
     cmd = np.array(args.cmd, dtype=np.float64)
-    last_action = np.zeros(n_joint, dtype=np.float64)
+    last_action = np.zeros(n_joint, dtype=np.float64)  # 始终是 **policy 序**
+
+    # --- 观测自检：只拼一帧，打印各段维度/取值（不跑策略，不需要 --policy）---
+    if args.selftest_obs:
+        mujoco.mj_forward(model, data)
+        obs = obs_builder.build(cmd, last_action)
+        segs = [
+            ("height_scan", 527), ("velocity_command", 3), ("base_lin_vel", 3),
+            ("projected_gravity", 3), ("base_ang_vel", 3), ("joint_pos_rel", 29),
+            ("joint_vel", 29), ("last_action", 29),
+        ]
+        print(f"\n[selftest] 总维度 = {len(obs)}（本任务期望 626）")
+        off = 0
+        for name, n in segs:
+            chunk = obs[off:off + n]
+            print(f"  {name:18s} [{off:3d}:{off + n:3d}] n={n:3d}  "
+                  f"min={chunk.min(): .4f} max={chunk.max(): .4f}  "
+                  f"head={np.array2string(chunk[:3], precision=4)}")
+            off += n
+        g = obs[527 + 3 + 3: 527 + 3 + 3 + 3]
+        print(f"\n[selftest] 符号关键检查：")
+        print(f"  projected_gravity = {np.array2string(g, precision=4)}"
+              f"   → 直立时应接近 (0, 0, -1)；若是 (0,0,+1) 则符号错了")
+        print(f"  height_scan[0]    = {obs[0]:.4f}   → 平地应 ≈ torso_z - {0.5}")
+        print(f"  joint_pos_rel[:3] = {np.array2string(obs[527 + 3 + 3 + 3 + 3:][:3], precision=4)}"
+              f"   → 按 IsaacLab(肩优先交错) 序，即 left/right shoulder pitch, waist pitch")
+        print(f"  base_ang_vel      = {np.array2string(obs[527 + 3 + 3 + 3:527 + 3 + 3 + 3 + 3], precision=4)}")
+        return 0
 
     # PD 增益：优先用 MJCF 的位置执行器增益，否则用给定默认值
     if model.nu > 0 and np.all(model.actuator_gainprm[:, 0] > 0):
@@ -326,13 +604,53 @@ def play(args) -> int:
                 obs = obs_builder.build(cmd, last_action)
                 if obs.ndim == 1:
                     obs = obs[None, :]
-                act = policy(obs)
+                if step == 0:
+                    print(f"[obs] 第 1 帧拼出维度 = {obs.shape[-1]}"
+                          + ("  ✅ 与策略输入一致" if int(obs.shape[-1]) == int(getattr(policy, 'input_dim', -1) or -1) else "  ⚠️ 与策略输入维度不一致！"))
+                # 非有限值会把 ctrl 变成 NaN、让仿真彻底崩 —— 这里定位到**具体哪一段**
+                o1 = obs.reshape(-1)
+                if not np.isfinite(o1).all():
+                    print(f"  ❌ step {step}: obs 出现非有限值，分段排查：")
+                    for nm, a, b in [("height_scan", 0, 527), ("velocity_command", 527, 530),
+                                     ("base_lin_vel", 530, 533), ("projected_gravity", 533, 536),
+                                     ("base_ang_vel", 536, 539), ("joint_pos_rel", 539, 568),
+                                     ("joint_vel", 568, 597), ("last_action", 597, 626)]:
+                        seg = o1[a:b]
+                        print(f"     {nm:18s} |max|={np.abs(seg).max():.4g} "
+                              f"finite={np.isfinite(seg).all()}")
+                    break
+                obs_in = normalizer(obs) if normalizer is not None else obs
+                act = policy(obs_in)
                 act = np.asarray(act).reshape(-1)[:n_joint]
+                # 可选安全裁剪：IsaacLab 的 action 项 clip=None（不裁），所以默认也不裁。
+                # 但 MuJoCo 里一个 NaN 就会污染整个仿真（ctct 变 NaN），调试时用
+                # --act-clip 限住更好定位。
+                if args.act_clip is not None:
+                    act = np.clip(act, -args.act_clip, args.act_clip)
+                if not np.isfinite(act).all():
+                    idx = np.nonzero(~np.isfinite(act))[0]
+                    print(f"  ❌ step {step}: 策略输出出现非有限值，关节下标 {idx.tolist()}"
+                          f"（policy 序）→ obs 幅值 |max|={np.abs(o1).max():.4g}")
+                    print(f"     obs 分段 |max|: scan={np.abs(o1[:527]).max():.4g} "
+                          f"cmd={np.abs(o1[527:530]).max():.4g} "
+                          f"lin_b={np.abs(o1[530:533]).max():.4g} "
+                          f"grav={np.abs(o1[533:536]).max():.4g} "
+                          f"ang_b={np.abs(o1[536:539]).max():.4g} "
+                          f"jp={np.abs(o1[539:568]).max():.4g} "
+                          f"jv={np.abs(o1[568:597]).max():.4g} "
+                          f"la={np.abs(o1[597:626]).max():.4g}")
+                    break
+                if step % 50 == 0:
+                    print(f"    [obs] |max|={np.abs(o1).max():6.3f} (scan={np.abs(o1[:527]).max():.3f} "
+                          f"lin_b={np.abs(o1[530:533]).max():.3f} ang_b={np.abs(o1[536:539]).max():.3f} "
+                          f"jp={np.abs(o1[539:568]).max():.3f} jv={np.abs(o1[568:597]).max():.3f})"
+                          f"  [act] min={act.min(): .3f} max={act.max(): .3f}")
             else:
                 act = np.zeros(n_joint)
-            last_action = act.copy()
+            last_action = act.copy()          # IsaacLab 的 last_action 是 policy 序
 
-            target = default_joint_pos + action_scale * act
+            # 应用到 MJCF：目标角 = MJCF 序默认站姿 + 逐关节 scale × MJCF 序动作
+            target = default_joint_pos + action_scale * act[pol_to_mj]
 
             # --- 物理子步 ---
             for _ in range(decimation):
@@ -384,6 +702,47 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--xml", default=str(DEFAULT_XML), help="G1 MJCF/scene XML 路径")
     ap.add_argument("--dump-model", action="store_true", help="打印模型结构后退出")
     ap.add_argument("--onnx-info", action="store_true", help="打印 ONNX 策略 IO 后退出")
+    ap.add_argument(
+        "--obs-mode", choices=["auto", "amp626", "legacy"], default="auto",
+        help="观测拼接方式：auto=按策略输入维度自动判定（626→amp626）；"
+             "amp626=本任务 Instinct-Amp-Walk（单帧 626 维）；legacy=InstinctLab parkour（8 帧堆叠）",
+    )
+    ap.add_argument(
+        "--joint-order", choices=["isaaclab", "as-is"], default="isaaclab",
+        help="策略向量 ↔ MJCF ctrl 的关节序转换：isaaclab=按关节名重排（正确）；as-is=不重排",
+    )
+    ap.add_argument(
+        "--action-scale-mode", choices=["auto", "unity", "beyondmimic"], default="auto",
+        help="动作尺度约定：auto=amp626 用 unity / legacy 用 beyondmimic；"
+             "unity=target=default+1.0*action（本仓库 OmniLoco/AMP-Walk 的 scale=1.0）；"
+             "beyondmimic=per-joint 0.25*effort/kp",
+    )
+    ap.add_argument(
+        "--act-clip", type=float, default=None,
+        help="动作裁剪上限（默认 None = 不裁，与 IsaacLab 的 clip=None 一致）；"
+             "调试发散问题时建议给个 5.0",
+    )
+    ap.add_argument(
+        "--obs-joint-order", choices=["npz", "articulation", "omniloco", "isaaclab", "mjcf"],
+        default="isaaclab",
+        help="观测里 joint_pos_rel/joint_vel 用的关节序。**云端实测：InstinctLab 的"
+             "articulation 序 == ACTION_TERM_JOINTS == OMNI_LOCO（肩优先交错）**，"
+             "所以默认 isaaclab/omniloco 才是对的；npz 是 AMP 参考动作的序（腿优先），"
+             "仅在排查 AMP 观测对齐时才有用",
+    )
+    ap.add_argument(
+        "--normalizer", default=None,
+        help="观测归一化 npz（默认：在策略文件旁边找 policy_normalizer.npz）。"
+             "⭐ 训练启用了观测归一化时必须给，否则策略输入 OOD、输出疯狂动作",
+    )
+    ap.add_argument(
+        "--no-normalizer", action="store_true",
+        help="明确跳过观测归一化（默认会检查同目录下的 policy_normalizer.npz）",
+    )
+    ap.add_argument(
+        "--selftest-obs", action="store_true",
+        help="只初始化环境并打印第一帧观测各段维度/取值后退出（不跑策略，无需 --policy）",
+    )
     ap.add_argument("--policy", help="策略文件 (.onnx / .pt)")
     ap.add_argument("--policy-type", choices=["auto", "onnx", "torch"], default="auto")
     ap.add_argument("--cmd", nargs=3, type=float, default=[0.5, 0.0, 0.0], metavar=("VX", "VY", "WZ"),

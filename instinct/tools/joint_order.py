@@ -65,6 +65,36 @@ assert len(MUJOCO_ORDER) == 29, len(MUJOCO_ORDER)
 assert len(ISAACLAB_ORDER) == 29, len(ISAACLAB_ORDER)
 assert set(MUJOCO_ORDER) == set(ISAACLAB_ORDER)
 
+#: 训练数据 npz 的 `joint_names` 顺序（AMP 参考动作序）。
+#: 取自 `.../config/g1/motions/amp_walk/*.npz` 的 `joint_names` 字段：
+#: 左腿(6) → 右腿(6) → 腰(3) → 左臂(7) → 右臂(7)，即 Unitree G1 URDF/USD 的声明序。
+#: ⚠️ 它**既不等于** `ISAACLAB_ORDER`（肩优先）**也不等于** `MUJOCO_ORDER`（腰优先），
+#: 所以「动作」与「关节位置/速度观测」必须用各自的映射。
+NPZ_ORDER: tuple[str, ...] = (
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+    "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+    "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+)
+assert len(NPZ_ORDER) == 29, len(NPZ_ORDER)
+assert set(NPZ_ORDER) == set(ISAACLAB_ORDER), set(NPZ_ORDER) ^ set(ISAACLAB_ORDER)
+
+
+def mjcf_to_order_index(dst_order: "tuple[str, ...] | list[str]") -> list[int]:
+    """MJCF(MUJOCO_ORDER) 序 → dst_order 序的索引映射。
+
+    用途：把 `qpos[7:]` / `qvel[6:]`（MJCF 序）重排成策略/观测期望的顺序。
+    用法：`vec_dst = vec_mjcf[[mjcf_to_order_index(dst)]]`
+    """
+    return [MUJOCO_ORDER.index(n) for n in dst_order]
+
 
 # ---------------------------------------------------------------------------
 # 从 MJCF 读出权威顺序
