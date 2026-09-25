@@ -1071,3 +1071,103 @@ python scripts/instinct_rl/train.py \
 ⭐ **首要判据是 σ**：如果它不再单调上升（甚至缓慢下降），说明「抽走密集梯度 → PPO σ 膨胀」
 这个机制判断成立；如果 σ 仍涨，就要考虑在 `WasabiPPOAmpMix` 里给 σ 硬性封顶
 （`ActorCritic.clip_std` 支持 `max`，只是 `PPO.update` 没传）。
+
+### 11.5 首轮 v3 被拦下 → 改成 v3b：数据集 + 指令分布对齐 AMP_mjlab（2026-09-25）
+
+#### （a）用户的两点要求
+
+1. **参考数据集换成 AMP_mjlab 的精选清单**（依据他们的实测经验：**运动数据过多会导致
+   风格混乱** —— 判别器的风格分布在过大的参考集上被摊平，反而拉不住步态）。
+2. **指令分布参照 `AMP_mjlab/src/tasks/amp_loco/config/g1/env_cfgs.py` 修改**
+   （分档为原地 / 纵向 / 横向 / 斜向 / 后退）。
+
+#### （b）数据集 17 → 7 clip
+
+来源：`AMP_mjlab/motion_data_csv/amp_selected.txt` 里**未注释**的 7 行
+（文件头写着「v4：6 行走 + 1 慢跑 = 7 个 clip」）—— **用户说的「约 6 个」就是指这个**。
+选择清单：`motions/amp_walk/amp_walk_v3_motion_selection.yaml`。
+
+| amp_selected.txt 里的 clip | 我们用的 | 说明 |
+|---|---|---|
+| `walk_forward_loop_002__A022` | 同 | 前进 ~0.6-1.0 |
+| `walk_backward_loop_003__A143` | ⚠️ **`walk_backward_loop_001__A022`** | **代替品**，见下 |
+| `walk_sideway_left_loop_002__A021` | 同 | 左侧移 |
+| `walk_sideway_right_loop_001__A022` | 同 | 右侧移 |
+| `jog_forward_loop_003__A022` | 同 | 慢跑前进（巡航 1.7-1.9）★ |
+| `arc_walk_left_loop_001__A029` | 同 | 左弧 |
+| `walk_arc_cw_loop_002__A046` | 同 | 右弧 |
+
+⚠️ **为什么用代替品**：`walk_backward_loop_003__A143` 在 AMP_mjlab 的
+`src/assets/motions/g1/amp/WalkandRun/` 里**只有 CSV、没有 npz**（那目录正好 17 个 npz
+= 我们原来的 17 clip），补齐它要跑 AMP_mjlab 的 `scripts/csv_to_npz.py`
+（**仿真式重定向**，属另一个工程；`deploy_walk_v2.py` 还是云端 SSH 脚本）。
+而代替品用 `analyze_amp_motions.py` 实测 **vx = −0.62 m/s**，正好落在 AMP_mjlab 给
+后退档设的 `back_lin_vel_range = (−0.7, −0.4)` **区间内** ⇒ 对该命令带**功能等价**。
+
+**不选「原地」那一组**（`idle_turn_270/360`、`step_rotate_idle`）：与 amp_selected.txt 一致 ——
+静止/原地转的风格由 `prob_low`（20%，其中 60% 给精确 (0,0,0)）+ `track_default_pose_on_stand`
+负责，**不靠参考动作**。
+
+#### （c）指令分布换成 AMP_mjlab v4（逐字段对照）
+
+| 字段 | v1 | **v3b**（= AMP_mjlab v4）|
+|---|---|---|
+| `prob_low`（含 60% 精确 (0,0,0)）| 0.15 | **0.20** |
+| `prob_side`（纯侧向 $v_x\equiv0$）| 0.25 | **0.20** |
+| `prob_lin`（纯前后 $v_y\equiv0$）| 0.25 | **0.40** |
+| `prob_lin_fwd`（其中持续直线前向）| 0.6 | **0.7** |
+| `prob_back`（专属持续后退）| 0.10 | 0.10 |
+| （余下）均匀**斜向** | 0.25 | **0.10** |
+| `straight_lin_vel_range` | (0.5, 1.2) | **(0.4, 2.0)** |
+| `back_lin_vel_range` | (−1.0, −0.5) | **(−0.7, −0.4)** |
+| `lin_vel_x` | (−1.0, 1.2) | **(−0.7, 2.0)** |
+| `lin_vel_y` | ±0.5 | **±1.0** |
+| `ang_vel_z` | ±0.8 | **±1.57** |
+| `resampling_time_range` | (10, 10) | **(6, 15)** |
+
+⇒ 分档概率和 = 0.20+0.20+0.40+0.10 = **0.90**，余 **0.10** 为均匀斜向，
+与 AMP_mjlab 注释「low 0.20 + side 0.20 + lin 0.40(fwd 70%) + back 0.10 + diag 0.10」**逐位一致**。
+
+⚠️ **两项刻意不照抄**（照抄会报错或失效，不是保守）：
+`rel_standing_envs` 仍 **0.0**（AMP_mjlab 是 0.05 —— 我们的实现有 **fail-fast 断言**，
+站立语义已交给 `prob_low`）；`heading_command` 仍 **False**（AMP_mjlab 是 True，
+开了之后 `wz` 会被**航向环重算**，方向分档直接失效）。
+
+⚠️ **已知覆盖缺口**：精选 7 clip 实测 |wz| 上限 ≈ 1.13，而指令范围 ±1.57（照抄 AMP_mjlab）。
+vx/vy 刚好覆盖，**wz 超出风格集**。若大角速度命令下步态劣化，先怀疑这里。
+
+#### （d）⭐ 首轮 v3 被契约校验器拦下（探针又救了一次）
+
+改完指令分布后探针直接失败：
+
+```
+RuntimeError: Unified OmniLoco teacher contract failed:
+  - command ranges ((-0.7, 2.0), (-1.0, 1.0), (-1.57, 1.57)) != ((-1.0, 1.2), (-0.5, 0.5), (-0.8, 0.8))
+  - command hold is (6.0, 15.0), expected 10 seconds
+```
+
+根因两种，性质不同：
+
+1. `expected_command_ranges` **是类属性** ✓ → 只需给 v3 一个子类覆盖它
+   （新建 `G1AmpWalkV3TeacherEnv(G1AmpWalkTeacherEnv)`，与 v1 的做法一致）；
+2. ⚠️ 「指令保持时长」原先**写死在方法体里**（`omni_loco_env_cfg.py:256` 硬编码 `(10.0, 10.0)`）
+   → 已改成**类属性** `expected_command_hold`，**默认值与原来逐位相同**，
+   OmniLoco / v1 / v2 行为**完全不变**，各任务现在可以自行声明期望值。
+
+> 教训（与 §11.3 的上传坑同源）：**改配置后必须跑探针核验运行层**。
+> 这次两个问题（上传路径拼错、契约校验拦下）都是探针发现的，都不是靠看代码想出来的。
+
+#### （e）v3b 启动核验：全绿
+
+```
+[AMP-WALK PASS] policy=626, action=29, scale=1.0,
+                cmd_ranges=((-0.7, 2.0), (-1.0, 1.0), (-1.57, 1.57)) (directional), rewards=12
+[运行层] reward_manager.active_terms 总数 = 12
+[REWARD-SET PASS] Instinct-Amp-Walk-V3-G1-v0: active_terms=12 (expect=12)
+[agent] class = G1AmpWalkV3PPORunnerCfg   init_noise_std = 0.3   clip_min_std = 0.015
+[motion] selected_files = 7 个
+契约/异常计数 = 0
+```
+
+启动：`--task Instinct-Amp-Walk-V3-G1-v0 --num_envs 4096 --max_iterations 5000`
+（**从零**，`--run_name amp_walk_v3b_4096`，日志 `/root/train_amp_walk_v3b_4096.log`）。
