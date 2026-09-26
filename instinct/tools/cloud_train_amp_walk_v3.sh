@@ -53,6 +53,8 @@ DEV="${3:-cuda:0}"
 TAG="${4:-amp_walk_v3c_${INST}}"
 LOAD_RUN="${5:-}"
 CKPT="${6:-model_5000.pt}"
+#: $7 任务 id（默认 v3）。v4 用 `Instinct-Amp-Walk-V4-G1-v0`。
+TASK_ARG="${7:-Instinct-Amp-Walk-V3-G1-v0}"
 
 # 续训还是从零：resume 相关参数只在脚本**内部**拼，外层命令行保持“全是单 token”，
 # 这样经 cloud_run_bg.sh → bash -c → train.py 三层传递时不会被引号拆坏。
@@ -81,6 +83,7 @@ export PYTHONUNBUFFERED=1
   echo "num_envs  : $INST"
   echo "迭代数    : $ITERS"
   echo "device    : $DEV"
+  echo "task      : $TASK_ARG"
   echo "run_name  : $TAG"
   echo "python    : $PY"
   echo "resume    : $RESUME_DESC"
@@ -90,7 +93,7 @@ export PYTHONUNBUFFERED=1
 }
 
 CUDA_VISIBLE_DEVICES="${DEV##*:}" "$PY" -u scripts/instinct_rl/train.py \
-  --task Instinct-Amp-Walk-V3-G1-v0 \
+  --task "$TASK_ARG" \
   --num_envs "$INST" --max_iterations "$ITERS" \
   --device "$DEV" --headless \
   --run_name "$TAG" ${RESUME_FLAGS[@]+"${RESUME_FLAGS[@]}"}

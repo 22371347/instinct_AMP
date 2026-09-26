@@ -1440,3 +1440,170 @@ log[f"joint_error_rmse/{joint_name}"] = torch.sqrt(torch.mean(joint_error[:, ind
 4. **对称性**：⚠️ **不要**直接罚 `|q_L − mirror(q_R)|` —— 正常步态本来就左右交替；
    更稳的是提高 `discriminator_reward_coef` 或换一个能定位到关节的风格项
 5. 把「臂/腿/腰分组平均偏差 + 左右不对称度」加进 `digest.txt`，让姿态有可见指标
+
+---
+
+### 11.9 V4：AMP 侧两项修正（镜像损失 + 站立关风格）（2026-09-26）
+
+#### （a）为什么开 V4
+
+v3c_cont 训练跑偏（用户判断 + 实测：`joint_error_rmse` 平均偏差 **38°**、
+臂 7 组 `Σ(R−L) = +1.739`、触地终止比 0.72、中位回合长度仅 **68.5 步**）。
+
+#### （b）核对结论（由 AMP_mjlab 工作区 agent 提供，见 `AMP_MJLIB_CHECK*.md`）
+
+| 结论 | 证据 |
+|---|---|
+| **手臂不一致是数据本身固有** | 17/17 npz 与对方原版**逐帧零差异**（`mean\|Δq\|=0.000000`、`corr=1.0`）|
+| **不是选集差异** | 两边 7-clip 精选集几乎相同 |
+| ⭐ **真正差异只有两条** | 他们 `use_mirror_loss=True`（**从第 0 轮开、无分阶段**）+ `amp_disable_style_on_stand=True`；**我们两条都没有** |
+| 他们的 AMP obs 是 **195 维纯 link 相对位姿** | 不含任何 `joint_pos`/`joint_vel` ⇒ 关节角不一致对其影响较小 |
+| 他们的 RSI 是**随机帧** | 不是第 0 帧 ⇒ "每 episode 从迈步相位起步"的担心不成立 |
+
+#### （c）V4 改了什么（环境 / 观测 / 动作 / 奖励 **全部不动**）
+
+| 项 | v3c | **V4** |
+|---|---|---|
+| `use_mirror_loss` | **无** | **`True`**（`coeff = 0.1`，= AMP_mjlab `mirror_loss_coeff`）|
+| `disable_style_on_stand` | `False` | **`True`**（`stand_speed_threshold = 0.1`）|
+| 奖励集 / 数据集 / 指令分布 / σ=0.3 / 契约 | — | **完全不变** |
+
+#### （d）实现（刻意做轻）
+
+* `instinctlab/utils/mirror.py` —— 镜像算子。**`height_scan` 的排布从 IsaacLab 源码确认**
+  （`GridPatternCfg(size=(3.0,1.6), res=0.1, ordering="xy")` ⇒ 527 = **31(前向)×17(侧向)**，
+  扁平化 `idx = iy*31 + ix` ⇒ 镜像 = `reshape(17,31)[::-1]`）。
+* **接线方式**：覆写 `compute_losses()` 并放一个 `losses["mirror"]`，系数落在 `self.mirror_coef`
+  —— 利用 `PPO.update` 的 `getattr(self, k + "_coef", 1.0)` 机制，
+  **不复制那 90 行 `update()`**（避免上游升级漏改）。`Loss/mirror` 自动进 TB。
+* 新增 `agents/amp_walk_v4_ppo_cfg.py`、`amp_walk_v4_env_cfg.py`（后者**只换 run_name**）、
+  注册 `Instinct-Amp-Walk-V4-G1-v0` / `-Play-v0`。
+* 启动脚本 `cloud_train_amp_walk_v3.sh` 新增 `$7` 任务参数（默认仍是 v3）。
+
+#### （e）启动核验（全绿）
+
+```
+Learning iteration 0/1000000000     rewards=14     Mean action noise std: 0.30     GPU 11352 MiB
+打表损失项: surrogate_loss 0.3073 / value_loss 3.7559 / entropy -6.4231 /
+            ⭐ mirror 1.1493 / total_loss 4.1268 / discriminator_loss 0.5948 / amp_total_loss 1.1407
+真异常: (无)
+```
+
+⇒ **`mirror` 已确认进入 loss 且非 0** ✓；`disable_style_on_stand=True` 未报错 ⇒ 成功定位到指令切片 ✓
+
+#### （f）踩到的三个坑（都值得记）
+
+1. **单测的 import 方式**：`from instinctlab.utils.mirror import ...` 会连带执行
+   `instinctlab/__init__.py`，把 **Omniverse/Kit 拉进来** ⇒ 非交互环境**卡在
+   `Do you accept the EULA? (Yes/No)`**（现象：输出全空、进程一直挂着，极难排查）。
+   改成 `importlib` **按文件路径**加载；且加载后**必须先注册进 `sys.modules`**，
+   否则 `@dataclass` 报 `'NoneType' object has no attribute '__dict__'`。
+2. ⭐ **CPU/CUDA 混用**：`perm`/`sign` 构造时是 CPU 张量，训练时 `q` 在 CUDA
+   ⇒ v4 **第一次启动就崩在 `mirror_joints`**。
+   **教训：单测必须在训练设备上跑**（已补第 [7] 节 CUDA 回归，云端 25/25）。
+   * 单测第一次还抓到另一个真 bug：`knee`/`elbow` **也是 pitch 类**（名字里没有 "pitch"），
+     naive 的 `"pitch" in name` 会误判成反号 ⇒ 被"默认姿态是不动点"这条判据抓到（`max|Δ|=2×0.669`）。
+3. **等待循环的 error pattern**：`grep 'Error'` 会被 PhysX 的无害告警
+   `[Error] ... Patch buffer overflow` **误触发**，让循环第一次检查就 break（会误判成"没进展"）。
+   用 `Traceback|RuntimeError|ImportError|TypeError|ValueError`。
+
+#### （g）V4 要看的指标
+
+| 指标 | 起点 | 期望 |
+|---|---|---|
+| **`Loss/mirror`** | 1.149 @iter0 | 下降（策略逐渐左右等变）；**恒 0 说明没接上** |
+| 左右不对称度 | 臂 Σ(R−L) **+1.739**、腿 +0.159 | 显著下降 |
+| 触地终止比 / 中位回合长度 | 0.72 / **68.5 步** | 改善 |
+| 姿态平均偏差（`joint_error_rmse` 均值）| 38° | 下降 |
+| `Episode_Reward/track_default_pose_on_stand` | — | ⚠️ 开门控后**会更小**，**不能**用它判断姿态 |
+
+---
+
+### 11.10 V4 第 2500 轮核验：`mirror` 系数**数值证明**已生效 + 同轮次对比
+
+#### （a）先怀疑，再查代码，再数值反证
+
+疑点：iter0 的 `total_loss = 4.1268`，而 `surrogate 0.3073 + value 3.7559 = 4.0632`
+已经几乎占满总量 —— 担心 `mirror` **只是被打印、没进总损失**。
+
+查代码（三处）：
+
+- `instinct_rl/algorithms/ppo.py:200`：`loss += getattr(self, k + "_coef", 1.0) * v`
+- `ppo.py:287`：返回的 `entropy` 是 **`-entropy_batch.mean()`**（负号在算法里）
+- 配置 `instinct_rl_ppo_cfg.py`：`value_loss_coef = 1.0`，**`entropy_coef = 0.008`**
+
+数值反证（精确吻合到 4 位）：
+
+```
+1.0×0.3073 + 1.0×3.7559 + 0.008×(−6.4231) + 0.1×1.1493 = 4.1268
+日志里实际的 total_loss                                  = 4.1268   ✓
+（若 mirror 没进总损失：0.3073+3.7559−0.0514 = 4.0118，差 0.115，对不上）
+```
+
+⇒ **`mirror` 确实以系数 `mirror_coef = 0.1` 进入总损失**，不是「只进日志」。
+同时反过来证明：`mirror_loss()` 返回的是**不含系数**的原始值 `mean(sum(·))`，
+系数由 `update()` 按 `"mirror" + "_coef"` 约定补上 —— 与命名设计一致。
+
+#### （b）⭐ 定量解读：打印值换算成「每维 RMS」
+
+打印值 $= \frac{1}{B}\sum_b \sum_{j=1}^{626}\big(\mu_\pi(M_{obs}o_b)_j - M_{act}(\mu_\pi(o_b))_j\big)^2$
+
+$$\text{每维 RMS} = \sqrt{\text{打印值} / 626}$$
+
+| iter | 打印值 | 每维 RMS |
+|---|---|---|
+| 0 | 1.1493 | 0.0428 rad ≈ **2.45°** |
+| 500 | **0.0337**（最低）| 0.0073 rad ≈ **0.42°** |
+| 1000 | 0.0435 | 0.0083 rad ≈ 0.48° |
+| 2000 | 0.0625 | 0.0100 rad ≈ 0.57° |
+| 2500 | 0.0658 | 0.0103 rad ≈ **0.59°** |
+
+含义（两条都要记）：
+
+1. **策略在「镜像等变」意义下已经几乎是左右对称的**（μ 的差只有 0.6°）。
+   所以**不能指望镜像损失单独去修「单脚跳」** —— 若不对称模态之后又出现，
+   那它来自**闭环对称性破缺 / 观测历史 / 奖励算子的不对称**，而不是「策略本身左右有别」。
+2. 注意这个数有个天然偏小的来源：**当状态本身左右对称时**（$o \approx M(o)$）
+   打印值也会自动变小。所以它更像「策略在左右对称状态上输出得对不对称」，
+   而不是纯粹的策略属性。**拐点要看它随步态形成是涨还是压住。**
+
+#### （c）v3c / v4 **同轮次**对比（新工具 `instinct/tools/cloud_compare_runs.sh`）
+
+| iter | v3c 回报 | v4 回报 | v3c 回合长 | v4 回合长 | v3c 触地 | v4 触地 | v4 mirror |
+|---|---|---|---|---|---|---|---|
+| 0 | −3.77 | −3.75 | 6.07 | 6.09 | 0.8072 | 0.8078 | 1.1493 |
+| 500 | 6.82 | **7.86** | 459.8 | **480.1** | 0.6104 | 0.6614 | 0.0337 |
+| 1000 | **0.45** | −1.97 | **435.7** | 387.0 | **0.7057** | 0.7395 | 0.0435 |
+| 1500 | **−1.60** | −7.46 | **457.2** | 411.3 | **0.6972** | 0.7416 | 0.0511 |
+| 2000 | **−7.96** | −9.52 | 428.5 | **503.0** | 0.6833 | 0.7046 | 0.0625 |
+| 2500 | −9.99 | **−7.69** | 496.5 | 464.5 | 0.6868 | 0.7005 | 0.0658 |
+| 3000 | 0.57 | — | 481.2 | — | 0.7591 | — | — |
+| 3500 | 1.14 | — | 429.5 | — | 0.7338 | — | — |
+| 4000 | 4.41 | — | 535.9 | — | 0.7039 | — | — |
+| 4500 | 4.83 | — | 516.7 | — | 0.6644 | — | — |
+| 5000 | **5.17** | — | 538.6 | — | 0.6475 | — | — |
+
+**读法（重要）**：
+
+- **iter0 两条几乎逐位相同**（−3.77/−3.75，amp_style 0.7631/0.7630）
+  ⇒ 初始动力学没被两项改动影响，改动是「干净的」✓
+- v4 现在（2500 轮）正落在 **v3c 一模一样的「2000–2900 低谷」**里
+  （v3c 在 2000/2500 是 −7.96/−9.99，v4 是 −9.52/−7.69）
+  ⇒ **同量级、没有发散**。这个低谷是任务设定的固有现象，不是 V4 引入的退化。
+- v3c 是**从 3000 轮才爬升**、到 4500–5000 才稳定到 +4.8 → +5.2。
+  ⇒ **V4 现在（2500）远未到可判断的轮次，必须至少跑到 5000 轮再比。**
+- v4 触地终止率略高（0.70 vs 0.687）、回合长略短，属于同轮次的正常抖动。
+
+#### （d）日志 tag 真相（`plot_training.py` 之外手查时必须知道）
+
+| 想查什么 | 正确写法 | 坑 |
+|---|---|---|
+| 迭代号 | 行内有 `Learning iteration <N>/<max>` | **前缀字段数不固定**，`$3` 取到的是字面量 `iteration`；必须正则抽 |
+| 回报 | **`Mean reward:`** | 不是 `Train/mean_reward`（那是 TB 名） |
+| 回合长度 | **`Mean episode length:`** | 同上 |
+| 风格奖励 | `Mean step amp_style_reward:` | `disable_style_on_stand` 会把站立样本置 0 ⇒ 均值天然偏低，**不能**直接与 v3c 比 |
+| 触地终止 | `Episode_Termination/base_contact:` | ⚠️ 与 `Episode_Reward/*` 一样是**每秒速率**，**不是比例** |
+
+⇒ 已把解析逻辑固化成 `instinct/tools/cloud_compare_runs.sh`（`SAMPLE=250` 可调采样间隔），
+避免每次用「本地 → python → ssh → 远端」四层引号传 `$NF`/`$2` 被吃掉
+（症状：只回一行垃圾 `0 |`）。

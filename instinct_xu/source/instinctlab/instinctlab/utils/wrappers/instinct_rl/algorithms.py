@@ -25,6 +25,8 @@ import torch
 from instinct_rl.algorithms.wasabi import WasabiPPO
 from instinct_rl.utils.utils import get_obs_slice
 
+from instinctlab.utils.mirror import MirrorSpec
+
 #: 速度指令项在 policy 观测组里的候选名（本任务用 `velocity_command`，
 #: 与 `AMP_WALK_OBSERVATION_TERMS` 一致）。
 _COMMAND_TERM_CANDIDATES = (
@@ -99,6 +101,9 @@ class WasabiPPOAmpMix(WasabiPPO):
         style_lerp: float = 0.75,
         disable_style_on_stand: bool = False,
         stand_speed_threshold: float = 0.1,
+        use_mirror_loss: bool = False,
+        mirror_loss_coeff: float = 0.1,
+        mirror_joint_names: list[str] | None = None,
         **kwargs,
     ):
         if reward_mix_mode not in ("additive", "lerp"):
@@ -109,6 +114,14 @@ class WasabiPPOAmpMix(WasabiPPO):
         self.style_lerp = float(style_lerp)
         self.disable_style_on_stand = bool(disable_style_on_stand)
         self.stand_speed_threshold = float(stand_speed_threshold)
+        #: 镜像损失（PPO 左右等变性）：`L = coeff·||μ_π(M_obs o) − M_act(μ_π(o))||²`
+        #: ⚠️ 系数必须叫 `mirror_coef`：`PPO.update` 用
+        #:    `getattr(self, k + "_coef", 1.0)` 给 `losses` 里每个键取系数，
+        #:    所以只要 `compute_losses` 里放一个 `losses["mirror"]` 就自动乘上它。
+        self.use_mirror_loss = bool(use_mirror_loss)
+        self.mirror_coef = float(mirror_loss_coeff)
+        self._mirror_spec: MirrorSpec | None = None
+        self._mirror_joint_names = tuple(mirror_joint_names) if mirror_joint_names else None
         #: 当前 step 的环境奖励（`PPO.process_env_step` 期间有效），供 lerp 公式用。
         self._task_rewards: torch.Tensor | None = None
         #: policy 观测组里速度指令的切片；只有 `disable_style_on_stand` 才会去解析。
@@ -146,6 +159,52 @@ class WasabiPPOAmpMix(WasabiPPO):
                         f"实际项 {list((obs_format.get('policy') or {}).keys())}"
                     )
         super().init_storage(num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards)
+
+    # ------------------------------------------------------------------
+    # 镜像损失（左右等变性）
+    # ------------------------------------------------------------------
+
+    def _mirror_spec_or_raise(self) -> MirrorSpec:
+        if self._mirror_spec is None:
+            if not self._mirror_joint_names:
+                raise ValueError(
+                    "use_mirror_loss=True 但没给 mirror_joint_names；"
+                    "应传 articulation 序的 29 个关节名（即 OMNI_LOCO_JOINT_ORDER）"
+                )
+            self._mirror_spec = MirrorSpec.from_joint_names(list(self._mirror_joint_names))
+        return self._mirror_spec
+
+    def mirror_loss(self, obs: torch.Tensor) -> torch.Tensor:
+        """`mean_j ||μ_π(M_obs o)_j − M_act(μ_π(o))_j||²`（**不含**系数）。
+
+        ⚠️ 已知近似：此时 `obs` 是**归一化之后**的观测（storage 存的就是它），
+           所以约束的是「策略作为它真实输入的函数」的等变性，而不是物理量的等变性。
+           这是通行做法（归一化本身不是镜像等变的），但值得记一笔。
+        """
+        spec = self._mirror_spec_or_raise()
+        ac = self.actor_critic
+        mu_obs = ac.action_mean.clone()          # = μ_π(o)（`compute_losses` 刚算过）
+        ac.act(spec.mirror_obs(obs), masks=None, hidden_states=None)
+        mu_mir = ac.action_mean                  # = μ_π(M_obs o)
+        # ⚠️ `act()` 内部会 `update_distribution()`，**覆盖 `self.distribution`**。
+        #    目前 `compute_losses` 之后没人再读 `action_mean`（σ 又是与输入无关的参数，
+        #    回读也一致），但仍显式还原原分布 —— 已经因为一个"应该没问题"的假设崩过一次，
+        #    这里用一次多余的前向换掉一类静默错误。
+        ac.update_distribution(obs)
+        return torch.mean(torch.sum((mu_mir - spec.mirror_action(mu_obs)) ** 2, dim=-1))
+
+    def compute_losses(self, minibatch):
+        """父类损失 + 镜像损失。
+
+        只覆写这一个方法，**不复制 `PPO.update`**（它 90 行且会随上游演进）。
+        返回元数保持不变（父类现在是三元组，这里用 `out[1:]` 兼容任意元数）。
+        """
+        out = super().compute_losses(minibatch)
+        if self.use_mirror_loss:
+            losses = dict(out[0])
+            losses["mirror"] = self.mirror_loss(minibatch.obs)
+            out = (losses,) + tuple(out[1:])
+        return out
 
     def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs):
         """把本次的**任务奖励**暂存起来，供 `compute_auxiliary_reward` 使用。

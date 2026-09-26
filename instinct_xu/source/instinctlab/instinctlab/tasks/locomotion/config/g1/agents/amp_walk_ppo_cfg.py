@@ -78,6 +78,15 @@ class AmpWalkAlgorithmCfg(AlgorithmCfg):
     # 处理了低速回位，两套机制叠加容易互相打架；需要时可一键打开。
     disable_style_on_stand = False
     stand_speed_threshold = 0.1
+
+    # --- 镜像损失（PPO 左右等变性，仿 AMP_mjlab `symmetry_cfg`）--------------
+    # ⚠️ 与 `style_lerp` 同理：**必须在算法 `@configclass` 里显式声明**，
+    #    否则 `to_dict()` 不会带上它们（算法侧 `__init__` 的形参收不到）。
+    use_mirror_loss = False
+    mirror_loss_coeff = 0.1
+    #: articulation 序的 29 个关节名（不是 npz 序！）。
+    #: 算子按**关节名**求左右置换，所以顺序无所谓，但必须与 obs/动作一致。
+    mirror_joint_names = None
     # ⚠️ 必须显式设 `[1.0]`：`PPO.__init__` 收到**空列表**时会把系数退化成标量 1.0，
     # 而 `process_env_step` 里是
     # `coef * v * self.auxiliary_reward_per_env_reward_coefs` —— 标量只能靠广播侥幸对上，

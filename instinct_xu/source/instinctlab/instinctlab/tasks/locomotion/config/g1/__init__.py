@@ -6,6 +6,7 @@ from . import agents
 from .amp_walk_env_cfg import G1AmpWalkEnvCfg, G1AmpWalkEnvCfg_PLAY, G1AmpWalkTeacherEnv
 from .amp_walk_v2_env_cfg import G1AmpWalkV2EnvCfg, G1AmpWalkV2EnvCfg_PLAY
 from .amp_walk_v3_env_cfg import G1AmpWalkV3EnvCfg, G1AmpWalkV3EnvCfg_PLAY, G1AmpWalkV3TeacherEnv
+from .amp_walk_v4_env_cfg import G1AmpWalkV4EnvCfg, G1AmpWalkV4EnvCfg_PLAY
 from .omni_loco_env_cfg import G1OmniLocoEnvCfg, G1OmniLocoEnvCfg_PLAY, G1OmniLocoTeacherEnv
 
 for task_id, env_cfg in (
@@ -75,5 +76,23 @@ for task_id, env_cfg in (
         kwargs={
             "env_cfg_entry_point": env_cfg,
             "instinct_rl_cfg_entry_point": f"{agents.__name__}.amp_walk_v3_ppo_cfg:G1AmpWalkV3PPORunnerCfg",
+        },
+    )
+
+# --- AMP 行走特权教师 v4：AMP 侧两项修正（镜像损失 + 站立关风格）---------------
+# 环境 / 观测 / 动作 / 奖励集（14 项）/ σ 起点 **全部继承 v3**；
+# 只换 agent cfg。动机与两边差异见 `agents/amp_walk_v4_ppo_cfg.py` 的模块 docstring。
+# ⚠️ teacher 侧仍用 `G1AmpWalkV3TeacherEnv`（环境完全相同，契验期望值一致）。
+for task_id, env_cfg in (
+    ("Instinct-Amp-Walk-V4-G1-v0", G1AmpWalkV4EnvCfg),
+    ("Instinct-Amp-Walk-V4-G1-Play-v0", G1AmpWalkV4EnvCfg_PLAY),
+):
+    gym.register(
+        id=task_id,
+        entry_point=G1AmpWalkV3TeacherEnv,
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": env_cfg,
+            "instinct_rl_cfg_entry_point": f"{agents.__name__}.amp_walk_v4_ppo_cfg:G1AmpWalkV4PPORunnerCfg",
         },
     )
