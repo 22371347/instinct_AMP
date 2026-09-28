@@ -104,6 +104,8 @@ class WasabiPPOAmpMix(WasabiPPO):
         use_mirror_loss: bool = False,
         mirror_loss_coeff: float = 0.1,
         mirror_joint_names: list[str] | None = None,
+        amp_reward_form: str = "raw",
+        amp_reward_eps: float = 1.0e-6,
         **kwargs,
     ):
         if reward_mix_mode not in ("additive", "lerp"):
@@ -130,6 +132,24 @@ class WasabiPPOAmpMix(WasabiPPO):
         #: 系数。我们额外暴露一个仅供日志用的 `amp_style_reward`（见
         #: `compute_auxiliary_reward`），把它钉成 0.0 → 该键**只进日志、不进奖励**。
         self.amp_style_reward_coef = 0.0
+        #: 下三项同理：**全是诊断量，系数 0 ⇒ 绝不进奖励**。
+        #: ⚠️ 新增 log 用的 aux 键**必须**在 `__init__` 里定义 `*_coef = 0.0`：
+        #:    `process_env_step` 是 `getattr(self, k + "_coef", 1.0)`，**缺省是 1.0**
+        #:    ⇒ 忘了定义就会被当成真奖励加进去，静默改变训练目标。
+        self.amp_style_zero_frac_coef = 0.0
+        self.amp_style_std_coef = 0.0
+        self.amp_stand_frac_coef = 0.0
+        #: 原始判别器输出 `d`（仅 `log_quad` 形式下有效）——**只进日志**。
+        #: 它让我们第一次能直接看到 `d_actor` 的均值/方差，而不用从奖励反解。
+        self.amp_d_coef = 0.0
+        #: 风格奖励的**函数形式**（在桥接层做，**避免改上游 `instinct_rl`**）：
+        #:   `"raw"`      — 原样用父类给的 `discriminator_reward`（默认，与父类行为一致）；
+        #:   `"log_quad"` — ⭐ LLP 论文形式 $r=-\log(1-D)$，$D=\mathrm{quad}(d)$。
+        #: ⚠️ 用 `log_quad` 时 **必须**把 `discriminator_reward_type` 设为 `"wasserstein"`：
+        #:    那是父类里**唯一原样返回 `d`** 的分支（`reward = disc`）。
+        #:    否则拿到的是已经压过的值，反解 `d` 会有符号歧义。
+        self.amp_reward_form = str(amp_reward_form)
+        self.amp_reward_eps = float(amp_reward_eps)
         super().__init__(*args, **kwargs)
 
     # ------------------------------------------------------------------
@@ -137,6 +157,15 @@ class WasabiPPOAmpMix(WasabiPPO):
     # ------------------------------------------------------------------
 
     def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1):
+        # ---- amp_reward_form 的 fail-fast（放在最前面，早于建判别器）----
+        if self.amp_reward_form not in ("raw", "log_quad"):
+            raise ValueError(f"amp_reward_form 只支持 'raw' / 'log_quad'，收到 {self.amp_reward_form!r}")
+        if self.amp_reward_form != "raw" and self.discriminator_reward_type != "wasserstein":
+            raise ValueError(
+                "amp_reward_form='log_quad' 需要**原始判别器输出 d** ⇒ 必须把 "
+                "`discriminator_reward_type` 设为 'wasserstein'（父类里唯一原样返回 d 的分支）；"
+                f"当前是 {self.discriminator_reward_type!r}"
+            )
         if self.reward_mix_mode == "lerp":
             # lerp 公式里 `r_task` 与 `r_amp` 逐元素配对，多奖励组（多 critic）时
             # `r_task` 是 (num_envs, num_rewards)，语义不明确 → 直接 fail-fast。
@@ -227,13 +256,45 @@ class WasabiPPOAmpMix(WasabiPPO):
     @torch.no_grad()
     def compute_auxiliary_reward(self, obs_pack: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         aux = super().compute_auxiliary_reward(obs_pack)
-        r_amp = aux.get("discriminator_reward")
-        if r_amp is None:
+        raw = aux.get("discriminator_reward")
+        if raw is None:
             raise RuntimeError("父类没给出 'discriminator_reward'，WasabiAlgoMixin 未生效？")
+
+        # ---- 风格奖励的函数形式（在桥接层做，不改上游）----
+        if self.amp_reward_form == "log_quad":
+            # ⭐ LLP 论文形式： r = -log(1 - D)，  D = quad(d) = clamp(1 - (d-1)^2/4, 0)
+            #   闭式： r = -log(1/4) - 2*ln|d-1| = 1.3863 - 2*ln|d-1|
+            #   ⇒ d=-1 → r=0；d=0 → 1.386；d=±0.9 → 0.103；梯度 dr/dd = -2/(d-1)（在 d=-0.9 处 = +2.0，
+            #     比 log 形式的 sigmoid(d)=0.29 **强 7 倍且不消失**）
+            # ⚠️⚠️ **奇点**：D 在 d=1 处**恰好等于 1** ⇒ -log(0) = +inf。
+            #     MSELoss 的**参考侧目标就是 +1** ⇒ 不是罕见事件 ⇒ 必须夹住。
+            #     夹到 1-eps 后奖励上界 = -log(eps) = 13.8（eps=1e-6），有限且不报 NaN。
+            d = raw
+            d_quad = torch.clamp(
+                1.0 - 0.25 * torch.square(d - 1.0),
+                min=0.0,
+                max=1.0 - self.amp_reward_eps,
+            )
+            r_amp = -torch.log(1.0 - d_quad)
+            # 只进日志（amp_d_coef = 0.0）：终于能直接看判别器原始输出，不用反解
+            aux["amp_d"] = d
+        else:
+            r_amp = raw
+
         # 仅供 TensorBoard 的原始风格奖励。`amp_style_reward_coef = 0.0` 保证它
         # **不会**被 `PPO.process_env_step` 加进奖励（那里是 `if coef != 0.0: 才加`），
         # 但 `infos["step"][k] = v` 在 if 之外，所以照样会进日志。
         aux["amp_style_reward"] = r_amp
+
+        #: 诊断（**门控前**的 r_amp）：
+        #: - `amp_style_zero_frac`：r_amp 恰好为 0 的样本比例。`quad` 形式在
+        #:   `d <= -1` 时有死区（r ≡ 0 且 dr/dd = 0 ⇒ 该样本既不进奖励也不给梯度），
+        #:   这个量就是死区大小；换成 `log` 后应降到 ≈0。
+        #: - `amp_style_std`：⭐⭐ **r_amp 的跨 env 标准差 —— “排序信号”的直接度量**。
+        #:   均值再大、若 std ≈ 0，风格对策略也只是个常数没有引导力。
+        #: 用门控前的 r_amp 是为了**与 `disable_style_on_stand` 解耦**。
+        aux["amp_style_zero_frac"] = (r_amp <= 0.0).to(r_amp.dtype).mean()
+        aux["amp_style_std"] = r_amp.std() if r_amp.numel() > 1 else torch.zeros((), device=r_amp.device)
 
         if self.reward_mix_mode != "lerp":
             return aux
@@ -248,7 +309,11 @@ class WasabiPPOAmpMix(WasabiPPO):
         if self.disable_style_on_stand:
             command = obs_pack["policy"][..., self._command_slice]
             cmd_speed = torch.norm(command[..., :2], dim=-1, keepdim=True) + torch.abs(command[..., 2:3])
-            style = style * (cmd_speed > self.stand_speed_threshold).to(style.dtype)
+            gate = (cmd_speed > self.stand_speed_threshold).to(style.dtype)
+            style = style * gate
+            #: 被门控判为“站立”的 env 比例（= 门控质量）。
+            #: 之前只能用 `exp(-cmd_speed/0.25)` 粗估成 0.037，现在直接实测。
+            aux["amp_stand_frac"] = (1.0 - gate).mean()
 
         coef = float(self.discriminator_reward_coef)
         aux["discriminator_reward"] = (1.0 - self.style_lerp) * (style - self._task_rewards / coef)

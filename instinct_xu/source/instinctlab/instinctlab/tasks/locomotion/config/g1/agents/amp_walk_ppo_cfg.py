@@ -87,6 +87,16 @@ class AmpWalkAlgorithmCfg(AlgorithmCfg):
     #: articulation 序的 29 个关节名（不是 npz 序！）。
     #: 算子按**关节名**求左右置换，所以顺序无所谓，但必须与 obs/动作一致。
     mirror_joint_names = None
+
+    # --- 风格奖励的函数形式（v8 起：LLP 论文的 r = -log(1 - quad(d))）-----------
+    # ⚠️ 同样**必须在算法 @configclass 里显式声明**，否则 `to_dict()` 不会带上它们。
+    #: "raw"（默认，与父类一致）| "log_quad"（r = -log(1-D)，D = clamp(1-(d-1)^2/4, 0)）
+    #: ⚠️ 用 "log_quad" 时**必须**把 `discriminator_reward_type` 设为 "wasserstein"
+    #:    （那是父类里唯一**原样返回 d** 的分支）。二者不匹配会 fail-fast。
+    amp_reward_form = "raw"
+    #: `-log(1-D)` 在 d=1 处会 +inf（D 恰好=1，而 MSELoss 的参考侧目标就是 +1）
+    #: ⇒ 把 D 夹到 1-eps，奖励上界 = -log(eps) ≈ 13.8。
+    amp_reward_eps = 1.0e-6
     # ⚠️ 必须显式设 `[1.0]`：`PPO.__init__` 收到**空列表**时会把系数退化成标量 1.0，
     # 而 `process_env_step` 里是
     # `coef * v * self.auxiliary_reward_per_env_reward_coefs` —— 标量只能靠广播侥幸对上，

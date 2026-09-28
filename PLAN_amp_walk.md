@@ -1602,8 +1602,531 @@ $$\text{每维 RMS} = \sqrt{\text{打印值} / 626}$$
 | 回报 | **`Mean reward:`** | 不是 `Train/mean_reward`（那是 TB 名） |
 | 回合长度 | **`Mean episode length:`** | 同上 |
 | 风格奖励 | `Mean step amp_style_reward:` | `disable_style_on_stand` 会把站立样本置 0 ⇒ 均值天然偏低，**不能**直接与 v3c 比 |
-| 触地终止 | `Episode_Termination/base_contact:` | ⚠️ 与 `Episode_Reward/*` 一样是**每秒速率**，**不是比例** |
+| 触地终止 | `Episode_Termination/base_contact:` | ⚠️ **是「比例」**（over 本步刚终止的 env），**不是每秒速率**（源：`termination_manager.py:147`）|
 
 ⇒ 已把解析逻辑固化成 `instinct/tools/cloud_compare_runs.sh`（`SAMPLE=250` 可调采样间隔），
 避免每次用「本地 → python → ssh → 远端」四层引号传 `$NF`/`$2` 被吃掉
 （症状：只回一行垃圾 `0 |`）。
+
+---
+
+### 11.11 V5：风格奖励形式 `quad` → `log`（2026-09-26，**续训**不重训）
+
+#### （a）问题：AMP 引导力太弱，且与 AMP_mjlab 差 4 倍
+
+用户反馈：`amp_style_reward` 无论移动还是静止都在 **0.09** 左右，而
+AMP_mjlab 训练时是 **0.3~0.4**、理想值应为 **0.5**。用 `cloud_amp_diag.sh` 反解
+$d = 1-2\sqrt{1-r}$（`quad` 形式）后定位到根因：
+
+| iter | $r_{amp}$ | 反解 $d$ | $\mathcal{L}_{disc}$ |
+|---|---|---|---|
+| 0 | 0.763 | +0.03 | 0.595 |
+| 500 | 0.122 | **−0.875** | 0.033 |
+| 2500 | 0.070 | −0.929 | 0.017 |
+| 7000 | 0.093 | −0.905 | 0.015 |
+
+⇒ **判别器第 500 轮就把二分类做完了，之后 6500 轮一直停在 $d\approx-0.9$**
+（目标是 −1）。v3c / v4 两条曲线逐位一致 ⇒ 与镜像损失 / 站立关风格无关。
+
+#### （b）两个机制（实测 + 源码双证）
+
+1. **量级塌陷**：`quad` $=\mathrm{clamp}(1-\tfrac{(d-1)^2}{4},0)$ 是给**无界**判别器输出设计的
+   （源码原注释：`"Copied from WASABI, not sure if this is correct."`
+    `"This assumes disc is the output of a direct linear layer."`），
+   而我们配 `MSELoss` + 目标 ±1 ⇒ $d$ **被钉在 ±1**。
+   同一个 $d=-0.90$：`quad` 给 **0.093**，`log` 给 $-\log(1-\sigma(d))$ = **0.341**。
+2. ⭐ **死区**：$d\le-1$ 时 `quad` 的 $r\equiv0$ **且 $\partial r/\partial d=-0.5(d-1)=0$**
+   ⇒ **既不进奖励也不给梯度**。`log` 的梯度是 $\sigma(d)=0.29$，处处非零。
+   （由 $E[r_{quad}]=0.093$ 与 $E[r_{log}]=0.403$ 同时成立反推，
+   落在死区的样本比例相当大。）
+
+#### （c）续训 vs 重训：**属于奖励构成改动 ⇒ 续训**
+
+| 问 | 答 |
+|---|---|
+| 改了判别器自己吗？ | ❌ 没改。`discriminator_loss_func`/优化器/输入/正则全部不动 |
+| 改在哪？ | `WasabiAlgoMixin.compute_auxiliary_reward()` 里「判别器输出 → 奖励」那一步 |
+| 判别器权重会丢吗？ | ❌ 不会。`wasabi.py:284` 存 `state_dict["discriminator"]`，:291 按 key 恢复；
+**连它的优化器**也存 ⇒ 续训带着**已饱和的$d\approx-0.9$** 进来，换 `log` 后立刻生效 |
+| 需要重训吗？ | 不需要 |
+
+#### （d）实现（单一变量）
+
+只改 **1 个字段**：`algorithm.discriminator_reward_type = "log"`。
+`discriminator_reward_coef` **保持 0.1**，让「奖励形式」成为唯一变量。
+
+⚠️ 但要清楚它的后果：风格项由 $0.025\times0.093=0.0023$/步 →
+$0.025\times0.40=0.010$/**步（实测 4.3 倍）**，AMP 占净回报量级会从 **29% → ~75%**。
+若只想要"形状修好、力度不变"，把 `discriminator_reward_coef` 降到 **0.027** 即可
+（已写成常数 `DISC_REWARD_COEF_KEEP_MAGNITUDE_V5`，默认不启用）。
+
+新增文件：`amp_walk_v5_env_cfg.py` / `agents/amp_walk_v5_ppo_cfg.py`，
+注册 `Instinct-Amp-Walk-V5-G1-v0` / `-Play-v0`（teacher 继续复用 `G1AmpWalkV3TeacherEnv`）。
+
+#### （e）顺手补的 AMP 引导质量诊断（`algorithms.py`）
+
+| 新日志项 | 含义 |
+|---|---|
+| `Step/amp_style_zero_frac` | r_amp **恰好为 0** 的样本比例 = **死区大小**（用**门控前**的 r_amp ⇒ 与 `disable_style_on_stand` 解耦）|
+| ⭐ `Step/amp_style_std` | **r_amp 的跨 env 标准差 = "排序信号"幅度**。均值再大、std≈0 也没有引导力 |
+| `Step/amp_stand_frac` | 被站立门控判为站立的 env 比例（实测 1.1%，此前只能用解析式粗估 3.7%）|
+
+⚠️ **新增 aux 日志键必须在 `__init__` 里定义 `*_coef = 0.0`**：`process_env_step` 是
+`getattr(self, k + "_coef", 1.0)`，**缺省是 1.0** ⇒ 忘了定义就会被当成真奖励加进去，
+静默改变训练目标。
+
+#### （f）启动记录与核验（全绿）
+
+```
+bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk_v3.sh 4096 1000000000 cuda:0 \
+  amp_walk_v5_4096 \
+  /root/.../20260926_083420_G1AmpWalkV4Plane_obs626_rew14_ar0.02_ns0.3_mirror_amp_walk_v4_4096 \
+  model_7000.pt Instinct-Amp-Walk-V5-G1-v0' /root/train_amp_walk_v5_4096.log
+```
+
+| 项 | 值 | 判定 |
+|---|---|---|
+| `Learning iteration` | `7000/1000007000` | ✅ 续训成功 + 无上限 |
+| `rewards=` | 14 | ✅ 奖励集没动 |
+| `Step/amp_style_reward` | **0.4028**（V4 同轮 0.0931） | ✅ **4.3 倍，log 生效** |
+| `Step/amp_style_zero_frac` | **0.0000** | ✅ **死区消失**（quad 下不可能为 0）|
+| `Step/amp_style_std` | 0.1670 | ✅ 排序信号非零 |
+| `Step/amp_stand_frac` | 0.0112 | ✅ 门控质量 1.1% |
+| 异常 | 无 | ✅ |
+
+⚠️ **首轮 `discriminator_loss` 会从 0.015 跳到 ~0.16**，这是**正常的**：
+checkpoint **不存仿真状态**，续训时所有 env 都从初始姿态重置 ⇒
+第一轮的状态分布对判别器是 OOD。同理参考动作播放游标也重置回第 0 帧。
+数轮之内会回落，**不要**把它当成 bug。
+
+#### （g）V5 要看什么
+
+| 指标 | V4 起点 | 期望 |
+|---|---|---|
+| `Step/amp_style_reward` | 0.093 | 稳在 **0.3~0.5**（而不是重新掉到 0.1）|
+| ⭐ `Step/amp_style_std` | —（新） | **非零且稳定**；若趋向 0 ⇒ 判别器把所有状态当同一个，引导消失 |
+| `discriminator_loss` | 0.015 | 回升到 **0.1~0.35** 更健康 |
+| 回报 / 回合长度 / 触地终止 | −7.69 / 464 / 0.70 | 不要出现不可恢复的崩塌（风格项现在强 4.3 倍）|
+| 臂 $\Sigma(R-L)$ | +1.739 | 下降 |
+
+⚠️ 因为风格项变强 4.3 倍，**若出现任务奖励被压住（速度跟踪学不出来）
+或回报持续下降，第一手段是把 `discriminator_reward_coef` 降到 0.027~0.05**，
+而不是回退 `log`（`log` 修掉的是死区，那是纯收益）。
+
+---
+
+### 11.12 ⭐ 口径纠正：`Mean reward` 里**根本没有 AMP**；AMP 占真实回报 **≈80%**
+
+#### （a）`Mean reward:`（= `Train/mean_reward`）的真实口径
+
+**代码证据**（`instinct_rl/runners/on_policy_runner.py::rollout_step`）：
+
+```python
+obs, rewards, dones, infos = self.env.step(actions)      # ← 纯环境奖励
+self.alg.process_env_step(rewards, dones, infos, ...)    # ← AMP aux 在这个函数内部才加
+return obs, critic_obs, infos["observations"], rewards, … # ← 返回的仍是那个纯环境奖励
+```
+
+`PPO.process_env_step` 是 `self.transition.rewards = rewards.clone()` 之后才 `+= c·aux`，
+**不会改到 runner 手里那个张量**。而 `rewbuffer`（→ `Mean reward`）累加的正是它。
+
+**数值证据**：$\Sigma$`Episode_Reward`$\,\times\,20\,\text{s} = 1.274$ vs `Mean reward` $=1.29$
+（差 1.3%，两者都是纯任务回报）；若 `Mean reward` 含 AMP 则应为 **4.7**，不是 1.3。
+
+⇒ ⚠️ **`Mean reward` 既不含 AMP、也不含 $\lambda$**，它**不能**用来判断 AMP 配比。
+（§11.10 里"AMP 占 29%"因此是错的：那是拿 AMP 去比**未乘 $\lambda$** 的任务和。）
+
+#### （b）V5 实测：**没有上升趋势**，判别器 500 轮内**重新饱和**
+
+| iter | `style_r` | 反解 $d$ | `style_std` | `stand_frac` | `disc_loss` | `Mean reward` | 回合长 |
+|---|---|---|---|---|---|---|---|
+| 7000（续训首轮）| 0.4028 | −0.72 | 0.1670 | 0.0112 | **0.1638** ⚠️首轮 OOD | −4.05 | 7.2 |
+| 7500 | 0.3369 | −0.922 | 0.0550 | 0.0110 | 0.0156 | −0.28 | 375 |
+| 8000 | 0.3308 | −0.932 | 0.0441 | 0.0103 | 0.0129 | −0.39 | 471 |
+| 8500 | 0.3290 | −0.936 | 0.0460 | 0.0112 | 0.0120 | −0.03 | 408 |
+| 8580 | **0.3317** | **−0.932** | 0.0547 | 0.0108 | **0.0123** | **+1.29** | 457 |
+
+- **用户观察"从 7600 起稳定"被证实**：7500 之后 $r_{amp}$ 钉在 0.33、`zero_frac = 0`、
+  `disc_loss` 回到 0.012（**比 V4 的 0.015 还低**，即判别器分离得更干净）。
+- ⇒ ⭐ **判别器续训后 500 轮内又饱和**（$d\approx-0.93$，目标 −1）。
+  `log` 改变的是**地板高度**（0.313 @ $d=-1$，之后指数衰减），**不是趋势** ——
+  **$r_{amp}$ 本来就不该"上升"**，用"是否上升"判健康度是错的。
+- ✅ **"水平太低"这个问题确实已修好**：0.093 → **0.332**，落在 AMP_mjlab 的 0.3–0.4 区间。
+
+#### （c）AMP 在真实训练回报里的占比
+
+$R = \lambda r_{task} + (1-\lambda)c\,r_{amp} = 0.75\,r_{task} + \mathbf{0.025}\,r_{amp}$
+
+iter 8580（`r_amp` 门控后 $=0.3317\times0.9917=0.3290$，回合长 457.2）：
+
+| 项 | 每步 | 每回合 |
+|---|---|---|
+| 任务项 $\lambda r_{task}$ | $0.75\times0.00282 = 0.00212$ | **0.97** |
+| AMP 项 $0.025 r_{amp}$ | $0.025\times0.3290 = 0.00823$ | **3.76** |
+| **合计** | 0.0103 | **4.73** |
+
+⇒ ⭐⭐ **AMP 占真实训练回报 ≈ 79.6%，任务项只剩 20%。**
+
+**独立交叉校验**（路径 B，只用日志实测的量）：
+`Mean step discriminator_reward`（= aux）$=+0.0800$，入奖励时乘 $c=0.1$ ⇒
+每步净增 $+0.0080$；$R = r_{task}+0.0080 = 0.0108$ ⇒ 每回合 4.95、AMP 占 **80.4%**。
+两条路径差 **4%**，闭合 ✅
+
+⇒ 工具 `instinct/tools/cloud_v5_amp_share.sh` 已改成
+**λ 加权 + 两条路径交叉校验**（旧版把 79.6% 误报成 74.6%）。
+
+#### （d）结论修正（两条）
+
+1. **"AMP 引导太弱"已不成立**——它占回报 **80%**，是**主导项**。
+   ⚠️ 风险已**反转**：该担心的是**任务被压住**（速度跟踪学不出来）。
+   盯 `Step_Monitor/tracking_command_bins/*_vxy_rmse`（当前 `vy_mid` 0.379、`wz_*` ≈ 1.7）。
+2. **还剩的问题**：`amp_style_std = 0.0547`（$r_{amp}$ 跨 env 标准差，均值 0.332）——
+   死区已消除（`zero_frac=0`）⇒ 梯度处处非零，但**"排序信号"幅度仍小**：
+   反解 $d$ 的跨 env 标准差 ≈ **0.19**，即判别器把 4096 个状态全压在 $[-1.3,-0.5]$ 附近。
+   ⇒ 这**只能靠动判别器侧解决**（我们的输入是 **670 维 ×10 帧**，
+   AMP_mjlab 是 **195 维 ×单帧且无关节角**）——**那才需要重训**。
+
+---
+
+### 11.13 V6：恢复基类 `joint_deviation_arms`（−0.1）—— 约束肩/肘姿态（2026-09-26）
+
+#### （a）问题（用户实测）
+
+无论**静止还是移动**，**肩、肘关节异常：高举且接近限位**。实测（v3c @5390）：
+
+| 关节 | 偏差 | |
+|---|---|---|
+| `right_shoulder_roll` | **2.0338 rad ≈ 116.5°** | 全场最差 |
+| `left_shoulder_roll` | 1.5495 rad ≈ 88.8° | |
+| 双侧 `elbow` | ≈ 1.49 rad ≈ 85° | |
+
+臂上 $\Sigma(R-L) = +1.739$（腿只有 +0.159）。而 default 是 `elbow +0.600` /
+`shoulder_pitch +0.200` / `shoulder_roll ±0.200`。
+
+**根因**：v2 迁移 AMP_mjlab 12 项配方时把 `joint_deviation_arms` **整项删掉**了
+⇒ **15 项奖励里没有任何一项约束手臂**；AMP 判别器只输出**整条 transition 的全局标量**，
+无法定位到关节 ⇒ 手臂自由漂到限位。
+
+#### （b）改动：**新建 V6**，不动 V3/V4/V5
+
+v3 的 `AMP_WALK_V3_CHANGES` 是唯一事实来源，且 v4/v5 日志已按 `rewards=14` 发布
+⇒ 新建任务，保持"单变量"与历史可比。
+
+| 文件 | 内容 |
+|---|---|
+| `amp_walk_v6_env_cfg.py` | **新增**：`G1AmpWalkV6RewardsCfg`（v3 的 14 项 + `joint_deviation_arms`）、V6 env / PLAY |
+| `agents/amp_walk_v6_ppo_cfg.py` | **新增**：算法侧**零改动**，只继承 v5 ⇒ **可续训** |
+| `config/g1/__init__.py` | 注册 `Instinct-Amp-Walk-V6-G1-v0` / `-Play-v0` |
+
+项定义**与基类逐字一致**（`mdp.joint_deviation_l1`、`weight=-0.1`、
+7 个关节模式/侧 = shoulder_pitch/roll/yaw + elbow + wrist_roll/pitch/yaw），
+**无门控** ⇒ 走路/站立都生效。`rewards={n}` 在契约里**只打印不断言** ⇒ 不会被拦下。
+
+#### （c）⭐ 量化该奖励项的量级（从 v1 实测反推）
+
+v1 是**唯一带过这一项**的版本，实测 `Episode_Reward/joint_deviation_arms = -0.2145/s`
+（回合长 385）⇒ 每回合 **−4.29** ⇒ **每步 −0.0111** ⇒ 反推 $\Sigma|\Delta q| = 0.111$ rad。
+
+- ✅ **好消息**：$\Sigma|\Delta q|$ 仅 0.111 rad ⇒ **这项确实把手臂摁在 default 上，非常有效**。
+- ⚠️ **稳态量级不小**：−0.0111/步 对比 V5 现在**整个每步回报 0.0103** ⇒
+  稳态下它会是**单项最大**的奖励项（一项占量级 ~64%）。若要它只当"刹车"，用 −0.02~−0.03。
+  **用户选择保留基类原值 −0.1。**
+- ⚠️ **续训瞬时冲击更大**：V5 结束时手臂 $\Sigma|\Delta q|$ 至少 6.6 rad
+  （只算 shoulder_roll×2 + elbow×2）、估计 8~13 rad ⇒ 每步 **−0.8~−1.3**（约现在的 100 倍，且符号翻转）。
+
+#### （d）两个安全阀（已核对，均不会致命）
+
+1. `gamma=0.99` + `lam=0.95` ⇒ 有效信用分配视界 $\approx 1/(1-\gamma\lambda) \approx$ **17 步**
+   ⇒ 可逃避的惩罚现值只有 ~±22 << 终止罚 **−200** ⇒ **不会**出现"故意摔倒来逃避手臂惩罚"。
+2. `schedule="adaptive"`、`desired_kl=0.01` ⇒ KL 一冲高 LR 就自动 ÷1.5（下限 1e-5）
+   ⇒ **更新会被自动刹车**，正是为这种冲击准备的机制。
+
+#### （e）启动记录与核验（全绿）
+
+```
+bash /root/cloud_run_bg.sh 'bash /root/cloud_train_amp_walk_v3.sh 4096 1000000000 cuda:0 \
+  amp_walk_v6_4096 <V5 run 目录> model_9500.pt Instinct-Amp-Walk-V6-G1-v0' \
+  /root/train_amp_walk_v6_4096.log
+```
+
+| 项 | 值 | 判定 |
+|---|---|---|
+| `resume` | `from ...V5... / model_9500.pt` | ✅ |
+| `[AMP-WALK PASS]` | **`rewards=15`** | ✅ 奖励集 14 → 15 |
+| 奖励表 | `| 6 | joint_deviation_arms | -0.1 |` | ✅ 已注册、基类原值 |
+| `Learning iteration` | `9500/1000009500` | ✅ |
+| 异常 | 无 | ✅ |
+
+⚠️ 首块 `Mean reward: -4.34` / `回合长 6.79` 是**续训标准瞬态**
+（所有 env 重置到初始姿态后直接倒地，与 V5 首块的 `-4.05 / 7.21` 同形），
+**不是**手臂项造成的 —— 手臂项在 reset 后（关节从 default 附近开始）本来就很小。
+
+#### （f）V6 要看的（"预期现象"别误判成 bug）
+
+| 指标 | 预期 | 判据 |
+|---|---|---|
+| ⚠️ `Mean reward` | **会先大幅变负**（可能 −100 ~ −300）再回升 | 因为 `joint_deviation_arms` 是**环境奖励项** ⇒ 它**在** `Mean reward` 里（AMP 则不在） |
+| ⭐ 中位回合长度 | 不应崩到接近 0 | 若崩 ⇒ 真失控；只是变负不算 |
+| `Episode_Reward/joint_deviation_arms` | 从 −0.2 量级逐步回到 **−0.02 ~ −0.05** | 说明手臂被摁回 default 附近 |
+| 肩/肘 `joint_error_rmse` | 2.03 / 1.49 → **显著下降** | 直接目标 |
+| 手臂 $\Sigma(R-L)$ | +1.739 → 下降 | 直接目标 |
+| `amp_style_reward` / `amp_style_std` | 不应被压到 0 | 手臂项会夺走量级主导权，注意 AMP 是否被挤掉 |
+
+---
+
+### 11.14 ⚠️ 两个口径纠正：V6「arms 在变大」是假象 / `default_pose` 确实是错误引导
+
+#### （a）V6 的 `joint_deviation_arms`「增大」是**口径假象**
+
+用户观察：续训到 13k 轮，`Episode_Reward/joint_deviation_arms` 不但没减，反而**增到 −0.56**。
+
+用新工具 `instinct/tools/cloud_sample_terms.sh` 采样并把**回合长剥掉**：
+
+| iter | arms 每秒速率 | ⭐ **arms 每步值** | ep_len | track_lin_vel 每秒 | **每步** |
+|---|---|---|---|---|---|
+| 10000 | −0.5129 | −0.02137 | 480 | 0.5287 | 0.02203 |
+| 11000 | −0.5070 | −0.02138 | 474 | 0.5651 | 0.02383 |
+| 12000 | −0.5644 | −0.01986 | 569 | 0.6355 | 0.02236 |
+| 13000 | −0.5506 | −0.01795 | 614 | 0.6245 | 0.02036 |
+| 13360 | **−0.6091** | **−0.01988** | 613 | **0.6969** | **0.02274** |
+
+- ⚠️ `Episode_Reward/*` = **回合内累加 / `max_episode_length_s`(20 s)**
+  ⇒ **回合变长它就会线性变大**。回合 480→613（×1.28）解释了 −0.51→−0.61 的全部变化。
+- ⇒ **每步值平在 −0.020**（波动区间 −0.018~−0.023），**根本没恶化**。
+- 同理「速度跟踪在提高」也是同一个假象：**每步 0.0220→0.0227 基本持平**，涨的只是回合长。
+  ⇒ 两条曲线都**不能**用来支持或反对「重训」。
+
+**但这个数不能反过来证明「手臂没问题」**：
+
+- −0.0199/步 ⇒ $\Sigma|\Delta q| \approx 0.199$ rad（v1 稳态是 0.111 rad ⇒ V6 差 1.8 倍）。
+- ⭐ 扣分函数是 **14 关节的 mean**：单个关节偏 1.5 rad 只贡献 $1.5/14 = 0.107$
+  ⇒ **对「哪个关节」完全盲**。要判定手臂真伪**必须看 per-joint**
+  （`joint_error_rmse/<joint>`，那个 metric 只在评估/digest 里）。
+- ⇒ **建议：加一个 per-joint 的手臂/腿偏差监控项**（零系数、只进日志，改动几行、
+  下次重启生效），比盲重训便宜得多。
+
+#### （b）❗⚠️ 已撤回：`default pose` **不是**问题（用户判定，2026-09-26）
+
+> **本节结论已作废，方法学上不成立**：拿「7 个**行走** clip 的平均姿态」去和
+> 站立默认姿态比较是**无效**的 —— 平均多个行走相位得到的关节角**几何上根本无法站立**
+> （两腿平均 ≈ 劈叉/塔陷）。所谓「最静帧」也只是行走 clip 里速度最小的 5%，
+> **并不是真正的站立帧**（参考集里就没有 idle clip）。
+>
+> ⇒ **`default_pose` 维持现状，本议题关闭。** 保留下面的数值仅作为**历史记录**，
+>    不得再当作证据引用。
+>
+> ⚠️ 但本节 （c） 的 **keyframe 交叉校验仍然有效且有用**。
+
+~~（以下为已作废的原分析）~~
+
+**代码事实**（`tasks/locomotion/mdp/rewards_amp.py`）：
+
+```python
+abs_err = |joint_pos - asset.data.default_joint_pos|      # ← 目标就是资产的 init_state.joint_pos
+cost   = w · (4.0·mean(abs_err) + 0.5·mean(|joint_vel|))
+w      = exp(-cmd_speed / 0.25)                          # cmd=0 ⇒ w=1
+```
+
+**（已作废的）核对结果**（对照精选 7 clip 共 3516 帧、取其中最静止 5% = 175 帧）：
+
+| 关节 | default | clip 均值 | 【最静帧】 | Δ(default−均值) |
+|---|---|---|---|---|
+| `hip_pitch` L/R | −0.312 | −0.095 / −0.077 | +0.073 / +0.068 | −0.22 / −0.24 |
+| `knee` L/R | +0.669 | +0.480 / +0.456 | +0.132 / +0.135 | +0.19 |
+| `ankle_pitch` L/R | −0.363 | −0.174 / −0.158 | −0.207 / −0.154 | −0.19 |
+| `elbow` L/R | +0.600 | +1.009 / +1.108 | +1.125 / +1.186 | −0.41 / −0.51 |
+| `shoulder_pitch` R | +0.200 | −0.060 | −0.068 | +0.26 |
+| `waist_pitch` | 0.000 | +0.208 | +0.188 | −0.21 |
+
+仍**有效**的两条客观事实（与“对错”无关，仅记录）：
+- default = `knee +0.669` / `hip_pitch −0.312` / `ankle_pitch −0.363`（半蹲），其余 22 关节为 0；
+- 参考集里 `idle_turn_*` / `step_rotate_idle_*` **文件存在但不在精选 7 clip 里**
+  ⇒ `cmd=0` 时 AMP 没有参考片段可用（这是**独立的**事实，与 default 对错无关）。
+
+**图像产物**（`instinct/eval/default_pose_check/`，作为工具演示保留）：
+
+| 文件 | 内容 |
+|---|---|
+| `render_default.png` | 默认姿态的离屏渲染（侧视半蹲）|
+| `render_reference_mean.png` | 参考 clip 均值姿态 |
+| `default_vs_reference.png` | 骨架对比 + Top12 逐关节偏差条形图 |
+| `default_vs_reference.csv` | 逐关节数值 |
+
+#### （c）✅ 交叉校验：MuJoCo 回放**不会**被默认姿态偏置（一度以为是问题，已排除）
+
+`instinct/assets/g1_29dof_popsicle_play.xml` 的 **`qpos0` 里那 12 个关节全是 0.000**，
+**但 `nkey = 1`**，而 `g1_mujoco_play.py` 的默认姿态**取 keyframe**：
+
+```python
+if model.nkey > 0: default_qpos = model.key_qpos[0]   # ← 走这条
+else:              default_qpos = model.qpos0.copy()
+```
+
+`key_qpos[0]` 与 cfg **逐位一致**（`max|cfg − keyframe| = 0.000000`）
+⇒ **回放基准正确**，`qpos0` 那份全零只是未被使用。
+
+#### （d）建议的修法（**关键区别：能不能续训**）
+
+| 方案 | 做法 | 能续训吗 |
+|---|---|---|
+| **C** | 直接改 `init_state.joint_pos` 的 `knee/hip_pitch/ankle_pitch` | ❌ **不能**：它同时是 `use_default_offset` 的基准 ⇒ **动作语义变了，必须重训** |
+
+⚠️ 本节 （d） 的 A/B/C 方案随着 （b） 的**撤回而失效**（没有必要改站立目标姿态）。
+**保留 C 那一条作为一般性提醒**：任何时候改 `init_state.joint_pos` 都等于改动作基准。
+
+---
+
+### 11.15 ⭐ 解释「奖励反推手臂偏差 0.18 rad」 vs 「回放里手臂卡死」的矛盾
+
+#### （a）先修一条单位错误：`Episode_Termination/*` **是比例，不是每秒速率**
+
+```python
+# termination_manager.py:147
+extras["Episode_Termination/" + key] = last_episode_done_stats[i].item()
+```
+
+⇒ 含义是「**本步刚终止的那些 env 中，由该项终止的比例**」。
+⚠️ §11.10（d） 里我写的「与 `Episode_Reward/*` 一样是每秒速率」**是错的**。
+
+`Episode_Reward/*` 的除数**已核实**（`reward_manager.py:116-122`）：
+
+```python
+episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])   # 只对本步终止的 env
+episodic_sum_avg / self._env.max_episode_length_s                  # = /20 s
+```
+
+⇒ **除 20 s、且只对终止的 env 求均值** ⇒ 我那个反推（Σ|Δq| = 值×200/回合长）
+在数学上**没错** ⇒ **矛盾是真的**，需要解释。
+
+#### （b）解释：坏姿态是**低速工况的局部吸引子**，被 episode 平均**稀释了 5 倍**
+
+- 反推（@13360，ep_len 613.6）：`Episode_Reward/joint_deviation_arms = −0.5506/s`
+  ⇒ Σ_j|Δq_j| 的**全时平均** = $0.5506\times20/(0.1\times613.6)$ = **0.180 rad**
+- 而指令分布是 `prob_low = 0.20`（`low_vel=0.1`、`zero_frac_in_low=0.6`）
+  ⇒ **~20% 的样本处于低速/站立档**。若手臂**只在该档**卡死：
+  $$\Sigma|\Delta q|_{\text{低速档}} \approx 0.180 / 0.20 = \mathbf{0.90\ rad}$$
+  （例如双侧 `shoulder_roll` 各抬 ~0.45 rad）—— **完全自洽** ✓
+- ⚠️ **而恰恰在这一工况，AMP 被 `disable_style_on_stand=True` 关掉了**
+  （门控 `cmd_speed ≤ 0.1`，与 `prob_low` 的 `low_vel = 0.1` **完全重合**）
+  ⇒ 低速档只剩任务奖励管手臂，而那里的手臂专项只有
+  `joint_deviation_arms = 0.1/rad`，`track_default_pose_on_stand` 的
+  `pos_joint_weights` 又**只给 `waist_yaw` ×3、没给手臂**
+  （每关节基础只有 $1/29 = 0.0345$/rad）
+  ⇒ **约束太弱 ⇒ 形成局部吸引子**
+- ⇒ 这也解释了用户说的「恢复的可能较渺茫」：在 **80% 的样本里它没问题**，
+  所以整体回报不惩罚它，**梯度被稀释 5 倍**；而一旦形成吸引子，续训很难出来。
+
+#### （c）❗⚠️ 上面（b） 的「低速档稀释」解释**已撤回**（用户证实：**任意指令都卡死**）
+
+用户反馈：手臂坏姿态**不只出现在静止，任何速度指令下都出现**
+⇒ 「只在 20% 样本里卡死」的前提不成立 ⇒ **（b） 的稀释解释作废**。
+而且矛盾**反而更尖锐**：
+
+- 若 100% 时间都是那个 V 形，双侧 `shoulder_roll` 各偏离 ~1.3 rad ⇒ $\Sigma_j|\Delta q|\ge2.6$ rad
+  ⇒ `Episode_Reward/joint_deviation_arms` 应该是 **~8/s**，而实测 **0.55/s**（**差 ~14 倍**）
+- ⇒ ⭐ **训练环境里的手臂，和回放看到的不是同一个东西。**
+
+已排除的候选：✔ `joint_deviation_arms` 的 7 个通配符**确实命中 14 个关节**
+（离线对真实关节名验证：7 个 `.*_shoulder_*/elbow/wrist_*` 完全匹配）⇒ 覆盖范围没错。
+
+剩下两个候选（都是**重训前 10 分钟能查**的）：
+
+| 候选 | 怎么查 |
+|---|---|
+| ⭐ **回放喂给策略的 obs 与训练不一致** —— 这条正好解释用户说的「**任意指令都一样**」：若策略看到的输入不随指令变化，输出当然与指令无关 | 回放命令里的 `--action_scale_mode` 是否为 `ones`（=1.0，与训练一致）；`AmpWalk626ObsBuilder` 的 6 段布局/归一化是否与训练逐位一致 |
+| 运行时 `joint_ids` 与离线解析不同 | 重训启动时把该奖励项的实际 `joint_ids` 数量打出来 |
+
+#### （c2）`action_scale` 假设的量化（用户提出）
+
+- 训练侧确实用 **1.0**：`G1AmpWalkEnvCfg(G1OmniLocoEnvCfg)`，而
+  `G1OmniLocoActionsCfg.__post_init__ → self.joint_pos.scale = 1.0`
+  （`flat_env_cfg` 里那个逐关节 `beyondmimic_action_scale` **不生效**）
+  ⚠️ 且启动日志里的 `scale=1.0` 是**硬编码字符串**（`amp_walk_env_cfg.py:600`），**并不是校验**。
+- 逐关节设计 scale = `0.25 × effort / kp`（`beyondmimic_action_scale`，实测）：
+
+| 关节组 | 设计 scale | 训练/设计 |
+|---|---|---|
+| 肩(pitch/roll/yaw) / 肘 / 腕 roll | 0.4386 | **2.3×** |
+| 膝 / 髋 roll | 0.3507 | **2.9×** |
+| ankle / waist pitch·roll | 0.4386 | 2.3× |
+| **腕 pitch / 腕 yaw** | **0.0745** | **13.4×** |
+
+⇒ `action_scale=1.0` **确实偏大**（是个真实的发散风险源），**但放大是全身性的**
+—— 腿的膝/髋 roll（2.9×）比肩/肘（2.3×）还大
+⇒ **无法单独解释「只有手臂卡死而腿正常」**。
+它只能算「贡献因素」，不是「充分原因」。
+
+#### （c3）⭐ 重训前的一个决定性廉价实验
+
+**回放 `instinct/eval/v1_5000/actor.onnx`**（v1 是**唯一「手臂项从第 0 轮就在场」**的版本；
+它在奖励意义上手臂被摁住：该项稳态 $\Sigma|\Delta q| = 0.111$ rad）：
+
+- 若 v1 的手臂**视觉正常** ⇒ 「从零重训（配置同 V6）」**就够** ⇒ 用户「不修改直接重训」
+  的计划**成立** ✓
+- 若 v1 的手臂**也卡死** ⇒ 单靠 0.1/rad 这一项不够，必须动 `action_scale` ⇒ 那就不该「不修改」
+
+#### （d）已验证：`track_default_pose_on_stand` 的 default pose **维持现状**（见 （b） 撤回）
+
+**门控对齐的修法（供参考，非当前路线）**：给 `track_default_pose_on_stand` 的
+`pos_joint_weights` 加手臂关节（它**只在低速生效** ⇒ 对走路零影响）。
+有效每关节梯度 = `pos_scale(4.0) × k / 29`；k=5 时 ≈ 0.69/rad。
+
+---
+
+### 11.16 ✅ V7（从零 + σ 0.2 + AMP 减半）**解决了手臂卡死**（2026-09-27）
+
+#### （a）配置（用户确认的路线 A）
+
+| 字段 | v6 | v7 |
+|---|---|---|
+| `policy.init_noise_std` | 0.3 | **0.2** |
+| `algorithm.clip_min_std` | 0.015 | **0.01**（保持"归一化下限 5%"语义）|
+| `algorithm.discriminator_reward_coef` | 0.1 | **0.05**（AMP 减半）|
+| 启动方式 | 续训 | ⭐ **从零**（`resume : <从头开始>`）|
+
+任务：`Instinct-Amp-Walk-V7-G1-v0`（`amp_walk_v7_env_cfg.py` +
+`agents/amp_walk_v7_ppo_cfg.py`），奖励集沿用 v6 的 15 项。
+
+#### （b）⭐ 结果：手臂偏差降 70%
+
+判据用**逐关节监控** `Step_Monitor/tracking_joint_error_rmse/*`
+（= `|q − default_joint_pos|` 的 RMS，源码 `loco_metrics.py` 已确认）：
+
+| 关节 | V6 @13840 | **V7 @8260** | 变化 |
+|---|---|---|---|
+| `shoulder_roll` L/R | **2.038 / 2.039**（贴限位 2.252）| **0.613 / 0.625** | **−70%** |
+| `elbow` L/R | **1.490 / 1.489**（贴限位 2.094）| **0.410 / 0.406** | **−73%** |
+| `hip_pitch` L/R | 0.677 / 0.699 | 0.680 / 0.682 | 持平 |
+| `knee` L/R | 0.372 / 0.349 | 0.380 / 0.376 | 持平 |
+| `ankle_pitch` L/R | 0.234 / 0.226 | 0.251 / 0.250 | 略升 |
+| `waist_pitch` | 0.516 | 0.517 | 持平 |
+| `fall_rate_step` | 0.0002 | 0.0012 | 略升（仍极低）|
+
+⇒ `shoulder_roll` 实际角 **2.24 → ≈0.81 rad**、`elbow` **2.09 → ≈1.01 rad**，
+**离硬限位都很远** ✓ **手臂卡死解除**。
+
+⚠️ V7 是**从零**跑 8260 轮，与 V6 的 13850 轮（续训）不是同轮次对比；
+但 70% 的降幅远超噪声，结论成立。
+
+#### （c）⚠️ 同时作废一条重要口径：`Episode_Reward/*` 不能做量级判断
+
+用两个独立项交叉验证（逐关节实测 vs 日志的 `Episode_Reward/*`）：
+
+| 项 | 由逐关节实测推算 | 日志实际 | 差 |
+|---|---|---|---|
+| `joint_deviation_arms` | ~35 /s | −0.55 /s | **64×** |
+| `joint_deviation_torso` | ~2.7 /s | −0.046 /s | **58×** |
+
+**同样的 ~60× 系统因子** ⇒ 是**单位/缩放问题**，不是关节覆盖问题。\n
+⇒ **§11.12 的"AMP 占真实回报 ~80%"、§11.15 的"手臂 0.18 rad"都作废**，
+今后判断姿态**一律用 `Step_Monitor/tracking_joint_error_rmse/*`**。
+
+#### （d）后续（暂停时状态）
+
+- 训练于 **iter 8260** 手动停止；GPU 已完全释放（73 MiB，无计算进程）。
+- checkpoints：`model_500 … model_8000`（每 500 一个），
+  run 目录 `logs/instinct_rl/g1_amp_walk/20260926_232020_G1AmpWalkV7Plane_obs626_rew15_ar0.02_ns0.2_ampc0.05_arms_amp_walk_v7_4096`。
+- ⚠️ 若日后要续训 V7：`--resume --load_run <上一行 run 目录> --checkpoint model_8000.pt`
+  （任务用 `Instinct-Amp-Walk-V7-G1-v0`）。
+- 观察项：`shoulder_roll`/`elbow` 的 `joint_error_rmse` 是否继续下降；
+  `tracking_vxy_rmse`；`fall_rate_step` 是否保持 <0.005。

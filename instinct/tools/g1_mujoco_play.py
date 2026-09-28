@@ -583,7 +583,7 @@ SCAN_GRID_RAYS = (
 #: 训练时的速度指令范围，= `instinct_xu` 的 `AMP_WALK_COMMAND_RANGES`
 #: （`tasks/locomotion/config/g1/amp_walk_env_cfg.py:92`）。
 #: 键盘遥控**必须**夹在这个范围内：超出范围属于分布外指令，摔了不代表策略差。
-CMD_LIMITS: tuple[tuple[float, float], ...] = ((-1.0, 1.2), (-0.5, 0.5), (-0.8, 0.8))
+CMD_LIMITS: tuple[tuple[float, float], ...] = ((-2.0, 2.0), (-1.5, 1.5), (-2.8, 2.8))
 
 #: 键码 → 动作名。**两种键码语义都注册**：
 #:   · GLFW 键码：`glfw.KEY_W == 87`
@@ -1192,7 +1192,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--policy", help="策略文件 (.onnx / .pt)")
     ap.add_argument("--policy-type", choices=["auto", "onnx", "torch"], default="auto")
-    ap.add_argument("--cmd", nargs=3, type=float, default=[0.5, 0.0, 0.0], metavar=("VX", "VY", "WZ"),
+    ap.add_argument("--cmd", nargs=3, type=float, default=[0.0, 0.0, 0.0], metavar=("VX", "VY", "WZ"),
                     help="速度指令 (默认 0.5 0.0 0.0)")
     ap.add_argument("--duration", type=float, default=10.0,
                     help="回放时长（秒）；**0 = 无限运行直到关闭窗口**（键盘遥控时用）")
@@ -1221,7 +1221,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="开 viewer 时启用 WASD/QE 键盘遥控（默认开）")
     ap.add_argument("--no-teleop", dest="teleop", action="store_false",
                     help="关掉键盘遥控（指令固定为 --cmd）")
-    ap.add_argument("--cmd-step", type=float, default=0.1, help="键盘每次按键的指令增量（默认 0.1）")
+    ap.add_argument("--cmd-step", type=float, default=0.5, help="键盘每次按键的指令增量（默认 0.5）")
     ap.add_argument("--record", help="录制到 mp4（需 imageio）")
     ap.add_argument("--record-every", type=int, default=1, help="每 N 个策略步录一帧")
     ap.add_argument("--width", type=int, default=640)
