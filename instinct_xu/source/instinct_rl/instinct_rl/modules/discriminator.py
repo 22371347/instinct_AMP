@@ -103,14 +103,53 @@ class Discriminator(nn.Module):
             x = self.normalizer(x)
         return self.model(x)
 
-    def forward(self, x, hidden_states=None, masks=None):
-        """NOTE: saving hidden_states and masks for future recurrent models. (Maybe not necessary)"""
+    def forward(self, x, hidden_states=None, masks=None, update_normalizer: bool = True):
+        """NOTE: saving hidden_states and masks for future recurrent models. (Maybe not necessary)
+
+        Args:
+            update_normalizer: 是否允许 normalizer 在本次前向时更新统计量。
+                默认 `True`（= 上游行为）；AMP 判别器的"状态白化"改造（2026-10-03）里，
+                **actor 侧前向应传 `False`** —— 我们希望统计量只由 expert/参考侧累积
+                （对齐 AMP_mjlab 的 `amp_normalizer`），否则策略越跑偏、统计量越被带偏。
+        """
         if self.encoders is not None:
             # The encoders will determine and update the input segment by itself.
             x = self.encoders(x)
         if self.normalizer is not None:
             # The normalizer will determine and update the mean and std of the input data by itself.
-            x = self.normalizer(x)
+            x = self.normalizer(x) if update_normalizer else self.normalize_input(x)
+        return self.model(x)
+
+    def normalize_input(self, x):
+        """把**原始**输入白化成网络真正吃到的张量；**不更新统计量**。
+
+        没接 normalizer 时原样返回。供两类调用方使用：
+        * `forward(..., update_normalizer=False)`：避免 actor 侧污染统计量；
+        * **GP 在归一化空间求梯度**（`‖∂d/∂x̃‖`）：若在原始空间求，则
+          `∂d/∂x = (∂d/∂x̃)/σ`，而 `σ` 在近常数维上→0 ⇒ `‖∇d‖` 会从 ~5e-3 爆到 10²~10³，
+          GP 项直接支配损失（实测见 `RESULTS_amp_vs_mjlab_params.md` §F）。
+        """
+        if self.normalizer is None:
+            return x
+        fn = getattr(self.normalizer, "normalize", None)
+        if fn is not None:
+            return fn(x, update=False)
+        # 兼容其它 normalizer 实现（没有 normalize 方法）：临时切 eval 再前向（forward 只在 training 时更新）
+        was_training = self.normalizer.training
+        self.normalizer.eval()
+        try:
+            with torch.no_grad():
+                return self.normalizer(x)
+        finally:
+            self.normalizer.train(was_training)
+
+    def forward_normalized(self, x, hidden_states=None, masks=None):
+        """输入**已白化**时跳过 normalizer 的前向（供 GP 在归一化空间求梯度用）。
+
+        与 `forward(x, update_normalizer=False)` 的区别：后者会把 `x` **再**归一化一次。
+        """
+        if self.encoders is not None:
+            x = self.encoders(x)
         return self.model(x)
 
     def logit_layer_weights(self):

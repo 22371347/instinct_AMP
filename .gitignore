@@ -41,3 +41,8 @@ instinct/plots/
 
 # ---- MuJoCo 回放产物（录像/onnx/归一化，体积大且可重新生成）----
 instinct/eval/
+
+# ---- 外部产物 / 生成物（2026-10-08 清理前快照时排除）----
+g1_scan_loco_9600_train_sim2sim/
+instinct/probe/
+instinct/backups/

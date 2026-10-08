@@ -35,8 +35,20 @@ class AmpStorage:
         actor_state_shape,
         reference_state_shape,
         device="cpu",
+        independent_reference_sampling: bool = False,
     ):
         self.device = device
+
+        #: ⭐ V29（对齐 AMP_mjlab 的数据管线）：`True` ⇒ 判别器的**参考批独立随机重采 (T,B)**，
+        #: 不再是“与策略同相位的那一步”的参考状态。默认 `False` ⇒ 完全保留旧行为。
+        #: 动机见 `amp_walk_v29_env_cfg.py`：旧口径下判别器只能学到
+        #: “策略在相位 p 的样子 vs 参考在相位 p 的样子”，风格信号被相位/时序俘获。
+        self.independent_reference_sampling = bool(independent_reference_sampling)
+
+        #: ⭐⭐ V30：**离线专家 buffer**（`(N, reference_dim)`）。非 None 时，参考批
+        #: 从它里面 **i.i.d. 随机抽行**（= AMP_mjlab `AMPLoader` 口径），完全不用
+        #: `self.reference_states`（活体影子机器人）。由算法侧在 `init_storage` 里载入。
+        self.expert_buffer = None
 
         self.actor_states_shape = actor_state_shape
         self.reference_states_shape = reference_state_shape
@@ -143,7 +155,27 @@ class AmpStorage:
         """
         if padded_B_slice is None:
             actor_batch = self.actor_states[T_select, B_select]
-            reference_batch = self.reference_states[T_select, B_select]
+            if self.expert_buffer is not None:
+                # ⭐⭐ V30：参考批 = 从**整个离线运动数据集** i.i.d. 抽样（mjlab 口径）。
+                #   与旧口径的区别：旧口径的参考批是“活体影子机器人当前那一步”的状态
+                #   （只能覆盖当时那一小段相位），新口径覆盖**整个运动流形**。
+                n = T_select.shape[0]
+                idx = torch.randint(0, self.expert_buffer.shape[0], (n,), device=self.expert_buffer.device)
+                reference_batch = self.expert_buffer[idx]
+                del idx
+            elif self.independent_reference_sampling:
+                # ⭐ V29 专家批解耦：参考批**独立**随机重采 (T, B)。
+                #   旧口径：`reference_states[T_select, B_select]` ⇒ 与 actor 批**同一时刻、同一 env**
+                #   ⇒ 判别器每步只看得到“当前相位”的参考分布（相位被策略的时钟俘获）。
+                #   新口径：在整个 rollout buffer 上 i.i.d. 抽样 ⇒ 每步都覆盖“全相位”
+                #   （等价于 mjlab 的 “clip 轮换 + clip 内随机抽帧”）。
+                n = T_select.shape[0]
+                T_ref = torch.randint(0, self.num_transitions_per_env, (n,), device=self.device)
+                B_ref = torch.randint(0, self.num_envs, (n,), device=self.device)
+                reference_batch = self.reference_states[T_ref, B_ref]
+                del T_ref, B_ref
+            else:
+                reference_batch = self.reference_states[T_select, B_select]
             hid_batch = None
             state_mask_batch = None
         else:

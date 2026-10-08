@@ -46,7 +46,15 @@ if [[ -z "$RUN" ]]; then
   RUN="$(ls -dt "$LOGROOT"/*/ 2>/dev/null | head -1)"
   RUN="$(basename "${RUN%/}")"
 fi
-RUNDIR="$LOGROOT/$RUN"
+# ⭐ 2026-10-07：run 根**不止一个**（由 agent 的 `experiment_name` 决定）：
+#   AMP-Walk ⇒ g1_amp_walk；OmniLoco 基座（T0）⇒ g1_unified_omni_loco。
+#   所以允许传**绝对路径**：带 `/` 就直接当 run 目录用（否则按旧口径拼 $LOGROOT）。
+if [[ "$RUN" == */* ]]; then
+  RUNDIR="$RUN"
+  RUN="$(basename "$RUNDIR")"
+else
+  RUNDIR="$LOGROOT/$RUN"
+fi
 echo "=== 策略验证 run=$RUN ckpt=$CKPT task=$TASK ==="
 ls -l "$RUNDIR/$CKPT" 2>/dev/null || { echo "❌ checkpoint 不存在: $RUNDIR/$CKPT"; exit 2; }
 
@@ -54,12 +62,22 @@ ls -l "$RUNDIR/$CKPT" 2>/dev/null || { echo "❌ checkpoint 不存在: $RUNDIR/$
 # 导出 ONNX（单环境）────────────────────────────────────────────────────
 echo
 echo "---------- 导出 ONNX（单环境，不录像）----------"
+# ⚠️ 不能只靠退出码：`play.sh` 内部管道会把 python 的失败吃掉（历史上它返回 0），
+#    所以先把输出落盘，再**看内容**判定成败。
+EXPORT_OUT=/tmp/export_${RUN}.out
 ./play.sh \
   --task "$TASK" \
   --load_run "$RUN" --checkpoint "$CKPT" \
   --num_envs 1 --device cuda:0 --headless \
-  --exportonnx 2>&1 | tail -15
-echo "导出退出码: ${PIPESTATUS[0]}"
+  --exportonnx > "$EXPORT_OUT" 2>&1
+RC=$?
+tail -15 "$EXPORT_OUT"
+echo "导出退出码: $RC"
+if grep -qa 'Traceback' "$EXPORT_OUT"; then
+  echo "❌ 导出失败（上方的 traceback）—— 常见原因：任务 id 与 ckpt 的版本不匹配"
+  echo "   （例：V12 的 ckpt 用 V11 的 Play 任务 ⇒ 判别器 [1024,134] vs [1024,670]）"
+  exit 4
+fi
 
 # ── 产物 ───────────────────────────────────────────────────────────────────
 echo

@@ -26,6 +26,9 @@
 
 环境变量（全都有默认值，按需覆盖）：
   LLP_LOG_ROOT   日志根目录，默认 /root/gpufree-data/instinct_xu/logs/instinct_rl/g1_amp_walk
+  LLP_RUN        ⭐ 选择要画的 run：**目录名子串**（`v9c` / `amp_walk_v9b_mvp_4096`）
+                 或完整目录名；留空 = 最新。命中多个取最新一个。
+                 并行跑多份训练（v9b / v9c …）时必须用它，否则画的是“最后启动的那份”
   LLP_OUT        resume 模式输出目录
   LLP_OUT_FULL   full 模式输出目录
   LLP_LATEST     显式指定 run 目录（跳过自动取最新）
@@ -39,9 +42,15 @@
   LLP_DPI        出图 DPI，默认 130
 
 用法：
-  python plot_training.py                # 出全部图（resume + full）
-  python plot_training.py --list-tags    # 只列出「最新 run 里真实存在的 tag」再退出
-  LLP_SKIP_FULL=1 python plot_training.py
+  python plot_training.py                     # 出全部图（resume + full，最新 run）
+  python plot_training.py --run v9c           # ⭐ 只画 v9c 那份，输出进 <OUT>/v9c/
+  python plot_training.py --run v9b --all-matching   # 命中多个时全部合并（full 模式）
+  python plot_training.py --list-runs         # 列出可选 run（目录名 / 修改时间 / 最新 ckpt）
+  python plot_training.py --list-tags         # 只列出「选中的 run 里真实存在的 tag」再退出
+  LLP_SKIP_FULL=1 python plot_training.py --run v9c
+
+⚠️ 给了 `--run` 时输出目录会自动加子目录（`<OUT>/<run>` / `<OUT_FULL>/<run>_full`），
+   这样多份训练互不覆盖；不想用子目录就显式传 `--outdir` / `--outdir-full`。
 """
 
 from __future__ import annotations
@@ -53,6 +62,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 
 import numpy as np
 import matplotlib
@@ -144,6 +154,44 @@ def discover_runs() -> list[str]:
     return runs
 
 
+def slug(token: str) -> str:
+    """把 `--run` 的取值变成安全的目录名（`v9c` → `v9c`；带空格/斜杠的会被替换）。"""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", (token or "").strip()) or "run"
+
+
+def match_runs(runs: list[str], token: str) -> list[str]:
+    """按 **目录名子串**（大小写不敏感）匹配 run；也接受完整目录名。
+
+    用途：并行跑多份训练时（v9b / v9c …）用 `--run v9c` 明确“画哪一份”，
+    而不是永远画“最新那一个”。返回按时间顺序（旧→新）。
+    """
+    if not token:
+        return list(runs)
+    t = token.strip().lower()
+    exact = [r for r in runs if os.path.basename(os.path.normpath(r)).lower() == t]
+    if exact:
+        return exact
+    return [r for r in runs if t in os.path.basename(os.path.normpath(r)).lower()]
+
+
+def run_info(run_dir: str) -> str:
+    """一行描述一个 run：目录名 / 修改时间 / 最新 ckpt / events 文件数。"""
+    name = os.path.basename(os.path.normpath(run_dir))
+    try:
+        mt = time.strftime("%m-%d %H:%M", time.localtime(os.path.getmtime(run_dir)))
+    except OSError:
+        mt = "?"
+    cks = glob.glob(os.path.join(run_dir, "model_*.pt"))
+
+    def _step(p: str) -> int:
+        m = re.search(r"model_(\d+)", os.path.basename(p))
+        return int(m.group(1)) if m else -1
+
+    newest_ck = os.path.basename(max(cks, key=_step)) if cks else "(无 ckpt)"
+    n_ev = len(glob.glob(os.path.join(run_dir, "events.out.tfevents.*")))
+    return f"{name:<72} {mt}  {newest_ck:<16} events={n_ev}"
+
+
 # ---------------------------------------------------------------------------
 # TensorBoard 读取（带缓存 + 拷贝避免读写竞争）
 # ---------------------------------------------------------------------------
@@ -185,6 +233,30 @@ def _accumulator(run_dir: str) -> EventAccumulator | None:
 def available_tags(run_dir: str) -> list[str]:
     acc = _accumulator(run_dir)
     return [] if acc is None else list(acc.Tags().get("scalars", []))
+
+
+def _drop_warmup(steps, vals, drop_iters: int):
+    """隐去开头的**初始化段**（默认前 100 轮，即 10 个 TB 采样点）。
+
+    为什么要裁：训练启动的头 50~100 轮是"初始化/自检"阶段 ——
+      * 从零训练：机器人还不会站，奖励在 `−40 ↔ +15` 量级剧烈震荡；
+      * 热启动（`--resume`）：判别器被 `drop_amp_discriminator` 重置、参考动作游标
+        归零 ⇒ 头几轮 `amp_d`/`amp_style_reward`/回合长度全部跳变。
+    这段的振幅比后续"真正的趋势变化"大得多 ⇒ **y 轴被迫拉得很宽，后期细节看不见**。
+    用户反馈：用对数轴不符合直觉 ⇒ 正确做法是**裁掉初始化段**。
+
+    ⚠️ 必须裁在**平滑之前**：若只 `set_xlim`，移动平均仍会被初始化段的尖峰污染，
+       开头几个点会假性外飞。
+    ⚠️ 裁掉的部分会写进 x 轴标签与 suptitle（**不能静默裁**）—— 否则就会重演历史上
+       `smooth_series` 那个 bug 的观感："曲线从 500 轮才有数据"。
+    ⚠️ 数据本来就短（裁完 < 5 点）则不裁，避免整张图变成空图。
+    """
+    if drop_iters <= 0 or len(steps) == 0:
+        return steps, vals, 0
+    keep = steps >= float(drop_iters)
+    if int(keep.sum()) < 5:
+        return steps, vals, 0
+    return steps[keep], vals[keep], int(len(steps) - keep.sum())
 
 
 def _series(run_dir: str, tag: str, clip: float | None = None):
@@ -236,12 +308,23 @@ def _merge(run_dirs: list[str], tag: str, clip: float | None = None):
 
 
 def smooth_series(steps, vals, window: int):
+    """尾部（trailing）移动平均，**保留全部 x**（曲线从 step 0 开始）。
+
+    ⚠️ 旧实现用 `np.convolve(..., mode="valid")` + `steps[w-1:]` ⇒ **丢掉前 w−1 个采样点**，
+    而 TB 每 10 轮才记一次 ⇒ 图上曲线的 x 起点变成 `10×(w−1)`（运行早期 w≈50 时正好 ≈500），
+    看起来像"奖励项从 500 轮才开始有数据"（其实 TB 里所有标量都从 step 0 开始）。
+    现在：前 w−1 点用"到目前为止可用样本"的均值（等价于 pandas `rolling(w, min_periods=1)`），
+    于是 x 从 0 起、整体趋势与旧图一致，只是开头不再被截掉。
+    """
     if window <= 1 or len(vals) < 5:
         return steps, vals
     w = max(min(window, len(vals) // 5), 1)
     if w <= 1:
         return steps, vals
-    return steps[w - 1:], np.convolve(vals, np.ones(w) / w, mode="valid")
+    n = len(vals)
+    cum = np.convolve(vals, np.ones(w) / w, mode="full")[:n]   # 尾部和的 1/w（窗口不足时偏小）
+    cnt = np.minimum(np.arange(1, n + 1), w)                    # 每个点实际参与平均的样本数
+    return steps, cum * w / cnt                                 # 归一化成"可用样本的均值"
 
 
 def _align_to(steps_target, series_list):
@@ -260,15 +343,22 @@ def _align_to(steps_target, series_list):
 
 
 class Plotter:
-    def __init__(self, mode: str, outdir: str, runs: list[str], latest: str):
+    def __init__(self, mode: str, outdir: str, runs: list[str], latest: str,
+                 drop_iters: int = 100):
         self.mode = mode
         self.outdir = outdir
         self.runs = runs          # full 模式要合并的 run 列表
         self.latest = latest
+        #: 隐去的初始化轮数（0 = 不隐）。见 `_drop_warmup` 的 docstring。
+        self.drop_iters = int(drop_iters)
         self.tags_cache: list[str] | None = None
         os.makedirs(outdir, exist_ok=True)
 
     # --- 取数 ---
+    def drop_note(self) -> str:
+        """图上统一的"已隐去前 N 轮"标注（裁了就必须写出来，否则会被误读）。"""
+        return "" if self.drop_iters <= 0 else f"  |  drop-first-{self.drop_iters}-iters"
+
     def get(self, tag: str, smooth: int | None = None, clip: float | None = None):
         # ⭐ clip 默认 **不裁剪**。蓝本对每张图都传 clip=1000，结果把
         # `Perf/total_fps`（真实值 ~24000）整个裁成空 → 图上显示 no data。
@@ -277,6 +367,8 @@ class Plotter:
             s, v = _series(self.latest, tag, clip)
         else:
             s, v = _merge(self.runs, tag, clip)
+        # ⭐ 先裁初始化段，再平滑（顺序不能反，见 `_drop_warmup`）
+        s, v, _ = _drop_warmup(s, v, self.drop_iters)
         return smooth_series(s, v, SMOOTH if smooth is None else smooth)
 
     def tags(self) -> list[str]:
@@ -323,13 +415,17 @@ class Plotter:
             ax.text(0.99, y, " " + lab, transform=ax.get_yaxis_transform(),
                     ha="right", va="bottom", fontsize=7, color="0.35")
         ax.set_title(title)
-        ax.set_xlabel("iteration")
+        # ⚠️ 裁了初始化段就必须**写在轴上**，否则会被误读成"训练从第 N 轮才开始"。
+        # ⚠️ 必须**纯 ASCII**：云端 matplotlib 只有 DejaVu Sans（无 CJK 字形）
+        #    ⇒ 中文会渲染成方块/缺字（实测）。
+        ax.set_xlabel("iteration" if self.drop_iters <= 0
+                      else f"iteration  (first {self.drop_iters} iters hidden)")
         ax.grid(alpha=0.3)
 
     def fig_overview(self):
         fig, axes = plt.subplots(2, 2, figsize=(14, 9))
         fig.suptitle(f"AMP Walk Training Overview [{'latest' if self.mode == 'resume' else 'full'}]"
-                     f"  {os.path.basename(os.path.normpath(self.latest))}", fontsize=13)
+                     f"  {os.path.basename(os.path.normpath(self.latest))}{self.drop_note()}", fontsize=13)
         self._panel(axes[0, 0], f"Train/mean_reward_{0}", "Mean Reward (episode total)")
         self._panel(axes[0, 1], "Train/mean_episode_length", "Episode Length (steps)")
         self._panel(axes[1, 0], "Loss/amp_total_loss", "AMP Total Loss")
@@ -343,7 +439,7 @@ class Plotter:
         cols = 3
         rows = (n + cols - 1) // cols
         fig, axes = plt.subplots(rows, cols, figsize=(16, 2.8 * rows), squeeze=False)
-        fig.suptitle(f"Per-Reward-Term Convergence (smooth={SMOOTH})", fontsize=13)
+        fig.suptitle(f"Per-Reward-Term Convergence (smooth={SMOOTH}){self.drop_note()}", fontsize=13)
         for i, tag in enumerate(tags):
             self._panel(axes.flat[i], tag, tag.replace("Episode_Reward/", ""))
             axes.flat[i].set_title(tag.replace("Episode_Reward/", ""), fontsize=9)
@@ -460,7 +556,7 @@ class Plotter:
         fig, axes = plt.subplots(1, 2, figsize=(16, 6))
         fig.suptitle(
             f"Task vs AMP Contribution (both MEASURED)   "
-            f"(λ={LERP}, c={C_COEF} → 风格权重 (1-λ)·c={ (1 - LERP) * C_COEF :.4f})",
+            f"(λ={LERP}, c={C_COEF} → 风格权重 (1-λ)·c={ (1 - LERP) * C_COEF :.4f}){self.drop_note()}",
             fontsize=13)
 
         ax = axes[0]
@@ -542,25 +638,66 @@ class Plotter:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--list-tags", action="store_true",
-                    help="只打印最新 run 里真实存在的 scalar tag 再退出")
+                    help="只打印选中 run 里真实存在的 scalar tag 再退出")
+    ap.add_argument("--list-runs", action="store_true",
+                    help="列出可选 run（目录名 / 修改时间 / 最新 ckpt）再退出")
+    ap.add_argument("--run", default=os.environ.get("LLP_RUN", ""),
+                    help="选哪个 run：目录名**子串**（v9c / amp_walk_v9b_mvp_4096）"
+                         "或完整目录名；留空 = 最新。命中多个时取最新一个")
+    ap.add_argument("--all-matching", action="store_true",
+                    help="--run 命中多个时，full 模式把它们全部合并（默认只合并选中的那个）")
+    ap.add_argument("--outdir", default=None,
+                    help=f"resume 模式输出目录（默认 {OUT_RESUME}；给了 --run 则默认 <它>/<run>）")
+    ap.add_argument("--outdir-full", default=None,
+                    help=f"full 模式输出目录（默认 {OUT_FULL}；给了 --run 则默认 <它>/<run>_full）")
+    ap.add_argument("--drop-iters", type=int, default=100,
+                    help="隐去开头的初始化段（单位=轮，默认 100；即 TB 前 10 个采样点）。"
+                         "初始化段的振幅比后续趋势大得多 ⇒ 会压扁 y 轴。"
+                         "给 0 = 完全不裁；要看更晚的阶段可以给 500 / 1000")
     args = ap.parse_args()
 
     runs = discover_runs()
-    latest = os.path.normpath(LATEST_OVERRIDE) if LATEST_OVERRIDE else runs[-1]
+
+    if args.list_runs:
+        print(f"[INFO] LOG_ROOT = {LOG_ROOT}")
+        print(f"[INFO] 共 {len(runs)} 个 run（旧 → 新）：")
+        for r in runs:
+            print("   ", run_info(r))
+        print("[INFO] 用法示例： --run v9c   /   --run amp_walk_v9b_mvp_4096")
+        return 0
+
+    hits = match_runs(runs, args.run)
+    if not hits:
+        print(f"[ERROR] --run {args.run!r} 没匹配到任何 run。可选（新 → 旧）：")
+        for r in reversed(runs[-12:]):
+            print("   ", os.path.basename(os.path.normpath(r)))
+        return 2
+
+    latest = os.path.normpath(LATEST_OVERRIDE) if LATEST_OVERRIDE else os.path.normpath(hits[-1])
     if LATEST_OVERRIDE and os.path.normpath(LATEST_OVERRIDE) not in \
             [os.path.normpath(r) for r in runs]:
         print(f"[WARN] LLP_LATEST={LATEST_OVERRIDE} 不在时间戳 run 列表里，仍按它读")
 
+    tag = slug(args.run) if args.run else ""
+    outdir_resume = args.outdir or (os.path.join(OUT_RESUME, tag) if tag else OUT_RESUME)
+    outdir_full = args.outdir_full or (os.path.join(OUT_FULL, tag + "_full") if tag else OUT_FULL)
+
     print(f"[INFO] LOG_ROOT = {LOG_ROOT}")
-    print(f"[INFO] run 数 = {len(runs)}；最新 = {os.path.basename(os.path.normpath(latest))}")
+    print(f"[INFO] run 数 = {len(runs)}；--run = {args.run or '(未指定→最新)'}；命中 {len(hits)} 个")
+    print(f"[INFO] 选中 run = {os.path.basename(os.path.normpath(latest))}")
+    if len(hits) > 1:
+        others = ", ".join(os.path.basename(os.path.normpath(h)) for h in hits[:-1])
+        print(f"[INFO] （同命中的更早 run：{others}）")
 
     if args.list_tags:
         tags = available_tags(latest)
-        print(f"[INFO] 最新 run 的 scalar tag 共 {len(tags)} 个：")
+        print(f"[INFO] 选中 run 的 scalar tag 共 {len(tags)} 个：")
         for t in tags:
             print("   ", t)
         return 0
 
+    # full 模式合并范围：默认全历史（或从 LLP_OLD_RUN 起）；一旦指定 --run，就只合并
+    # “命中的 run”，避免把别的版本混进同一条曲线（v9b / v9c 对比时尤其重要）。
     old_idx = 0
     if OLD_RUN:
         for i, r in enumerate(runs):
@@ -568,9 +705,19 @@ def main() -> int:
                 old_idx = i
                 break
     full_runs = runs[old_idx:]
+    if args.run:
+        sel = set(hits if args.all_matching else [latest])
+        full_runs = [r for r in full_runs if r in sel]
     print(f"[INFO] full 模式合并 run 数 = {len(full_runs)}")
+    print(f"[INFO] 输出目录： resume={outdir_resume}   full={outdir_full}")
+    if args.drop_iters > 0:
+        print(f"[INFO] 隐去初始化段：前 {args.drop_iters} 轮不绘（TB 每 10 轮 1 点"
+              f" ⇒ 约前 {max(args.drop_iters // 10, 1)} 个采样点；可在图上 x 轴看到标注）")
+    else:
+        print("[INFO] --drop-iters 0 ⇒ 绘制全部数据点（含初始化段）")
 
-    for mode, outdir, suffix in (("resume", OUT_RESUME, "(latest)"), ("full", OUT_FULL, "(full)")):
+    for mode, outdir, suffix in (("resume", outdir_resume, "(latest)"),
+                                 ("full", outdir_full, "(full)")):
         if mode == "full" and SKIP_FULL:
             print("[INFO] LLP_SKIP_FULL=1，跳过 full 模式")
             continue
@@ -578,7 +725,7 @@ def main() -> int:
             print("[INFO] 只有 1 个 run，full 模式与 resume 等价，跳过")
             continue
         print(f"======== 生成 {mode} 曲线 -> {outdir} ========")
-        p = Plotter(mode, outdir, full_runs, latest)
+        p = Plotter(mode, outdir, full_runs, latest, drop_iters=args.drop_iters)
         for fn in (p.fig_overview, p.fig_reward_terms, p.fig_amp_diagnostics,
                    p.fig_foot_diagnostics, p.fig_terminations_perf, p.fig_amp_task_split):
             try:

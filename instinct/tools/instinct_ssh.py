@@ -313,7 +313,10 @@ def setup_remote_env() -> int:
 def ssh_run(command: str, timeout: int = 3600, quiet: bool = False, tty: bool = False) -> int:
     """执行远程命令并回显。"""
     pexpect = _pexpect()
-    child = pexpect.spawn("ssh", _ssh_opts(tty) + [command], encoding="utf-8", timeout=timeout)
+    # ⚠️ `codec_errors="replace"`：训练日志里常含**非 UTF-8 字节**（Kit/PhysX 的原始输出、
+    #    进度条），pexpect 默认会抛 `UnicodeDecodeError: ... invalid continuation byte`
+    #    并**把已经跑完的远程命令结果丢掉**（实测：V9e 启动成功、但回读输出时崩）。
+    child = pexpect.spawn("ssh", _ssh_opts(tty) + [command], encoding="utf-8", codec_errors="replace", timeout=timeout)
     if not quiet:
         child.logfile_read = sys.stdout
     _authenticate(child, pexpect, timeout, not quiet)
@@ -333,7 +336,7 @@ def ssh_run(command: str, timeout: int = 3600, quiet: bool = False, tty: bool = 
 def ssh_run_capture(command: str, timeout: int = 3600) -> tuple[int, str]:
     """执行远程命令并返回 (exit_status, output)。"""
     pexpect = _pexpect()
-    child = pexpect.spawn("ssh", _ssh_opts() + [command], encoding="utf-8", timeout=timeout)
+    child = pexpect.spawn("ssh", _ssh_opts() + [command], encoding="utf-8", codec_errors="replace", timeout=timeout)
     _authenticate(child, pexpect, timeout, False)
     try:
         child.expect(pexpect.EOF, timeout=timeout)
@@ -354,7 +357,7 @@ def _scp(src: str, dst: str, recursive: bool, timeout: int = 3600) -> int:
     if recursive:
         args.append("-r")
     args += [src, dst]
-    child = pexpect.spawn(args[0], args[1:], encoding="utf-8", timeout=timeout)
+    child = pexpect.spawn(args[0], args[1:], encoding="utf-8", codec_errors="replace", timeout=timeout)
     child.logfile_read = sys.stdout
     if child.expect(["[Pp]assword:", pexpect.EOF, pexpect.TIMEOUT]) == 0:
         child.sendline(creds()["PASSWORD"])

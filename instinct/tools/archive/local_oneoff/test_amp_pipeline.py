@@ -30,6 +30,7 @@ T3. 测试用的 λ/c 等数字**直接取自 `amp_walk_ppo_cfg.py`**（复用�
 from __future__ import annotations
 
 import importlib
+import math
 import sys
 from pathlib import Path
 
@@ -90,6 +91,19 @@ OBS_FORMAT = {
 _fails: list[str] = []
 _n = 0
 
+#: ⭐ 两种 policy 观测布局（见 `amp_walk_v9_env_cfg.OBSERVATION_DIMS` 与 `mirror.py SCAN_LAYOUTS`）：
+#:   v1~v8 = 626（527 射线，扫描居中）、v9 = 378（279 射线，扫描中心前移 1.5 m）。
+POLICY_LAYOUTS: dict[str, tuple[int, int]] = {"626": (626, 527), "378": (378, 279)}
+POLICY_FORMAT_378 = dict(OBS_FORMAT["policy"], height_scan=(279,))
+POLICY_FORMATS = {"626": dict(OBS_FORMAT["policy"]), "378": POLICY_FORMAT_378}
+
+
+def obs_format_for(tag: str) -> dict:
+    """把 `OBS_FORMAT` 的 policy 段换成指定布局（其余专家段不动）。"""
+    fmt = dict(OBS_FORMAT)
+    fmt["policy"] = POLICY_FORMATS[tag]
+    return fmt
+
 
 def check(name: str, cond: bool, detail: str = "") -> None:
     global _n
@@ -112,8 +126,37 @@ def load_module_by_path(path: Path, name: str):
 
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
+    # ⚠️ 必须先注册进 `sys.modules`：`@dataclass` 内部会回查 `cls.__module__`，
+    #    不注册就报 `AttributeError: 'NoneType' object has no attribute '__dict__'`。
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def preload_instinctlab_stubs() -> None:
+    """让 `algorithms.py` 能在**本机**（没装 isaaclab）加载。
+
+    `algorithms.py` 里有 `from instinctlab.utils.mirror import MirrorSpec`；
+    直接 import 会执行 `instinctlab/__init__.py` → 拖进 isaaclab/Kit ⇒ 本机必挂。
+    这里把 `instinctlab` 及其子包注册成**空壳包**（只给 `__path__`），
+    这样 `instinctlab.utils.mirror` 能按路径加载，而 `__init__.py` 一个都不执行。
+    """
+    import types
+
+    pkg_root = INSTINCTLAB_SRC / "instinctlab"
+    for name, sub in (
+        ("instinctlab", ""),
+        ("instinctlab.utils", "utils"),
+        ("instinctlab.utils.wrappers", "utils/wrappers"),
+        ("instinctlab.utils.wrappers.instinct_rl", "utils/wrappers/instinct_rl"),
+    ):
+        if name in sys.modules:
+            continue
+        mod = types.ModuleType(name)
+        mod.__path__ = [str(pkg_root / sub)]
+        sys.modules[name] = mod
+    if "instinctlab.utils.mirror" not in sys.modules:
+        load_module_by_path(pkg_root / "utils/mirror.py", "instinctlab.utils.mirror")
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +181,13 @@ class DummyActorCritic(nn.Module):
         self.action_std = torch.ones(n, NUM_ACTIONS, device=obs.device)
         return self.action_mean.clone()
 
+    def act_inference(self, obs):
+        return torch.zeros(obs.shape[0], NUM_ACTIONS, device=obs.device)
+
+    def update_distribution(self, obs, masks=None, hidden_states=None):
+        """⚠️ `mirror_loss()` 里会回读：`ac.act(...)` 覆盖分布后要还原。"""
+        self.act(obs, masks, hidden_states)
+
     def evaluate(self, obs, masks=None, hidden_states=None):
         return torch.zeros(obs.shape[0], 1, device=obs.device)
 
@@ -148,10 +198,29 @@ class DummyActorCritic(nn.Module):
         pass
 
 
-def make_obs_pack(command: torch.Tensor) -> dict:
+class ReadoutActorCritic(DummyActorCritic):
+    """μ_π(o) = o[:, sl]（确定性线性读出）—— 给镜像损失一个**可手算的非退化**取值。
+
+    选不同的 `sl` 就能造出「等变」与「非等变」两种情形：
+      · `sl` = joint_pos_rel 段 ⇒ M_π 与 M_act 完全一致 ⇒ 损失应为 **0**（正对照）；
+      · `sl` = height_scan 前缀 ⇒ 前缀不是关节向量，两侧变换不同 ⇒ 损失 **> 0**。
+    """
+
+    def __init__(self, sl: slice):
+        super().__init__()
+        self.sl = sl
+
+    def act(self, obs, masks=None, hidden_states=None):
+        self.action_mean = obs[:, self.sl].clone()
+        self.action_std = torch.ones_like(self.action_mean)
+        return self.action_mean.clone()
+
+
+def make_obs_pack(command: torch.Tensor, obs_dim: int = POLICY_OBS_SIZE,
+                  cmd_slice: slice = COMMAND_SLICE) -> dict:
     n = command.shape[0]
-    policy = torch.zeros(n, POLICY_OBS_SIZE)
-    policy[:, COMMAND_SLICE] = command
+    policy = torch.zeros(n, obs_dim)
+    policy[:, cmd_slice] = command
     return {
         "policy": policy,
         "critic": torch.zeros(n, 3),
@@ -160,10 +229,10 @@ def make_obs_pack(command: torch.Tensor) -> dict:
     }
 
 
-def build_alg(mix_module, **mix_kwargs):
-    """构造一个真实的 `WasabiPPOAmpMix`。"""
+def build_alg(mix_module, fmt: dict | None = None, ac=None, **mix_kwargs):
+    """构造一个真实的 `WasabiPPOAmpMix`（`fmt` 可换 policy 观测布局）。"""
     alg = mix_module.WasabiPPOAmpMix(
-        DummyActorCritic(),
+        ac if ac is not None else DummyActorCritic(),
         discriminator_kwargs={"hidden_sizes": [16, 8], "nonlinearity": "ReLU"},
         discriminator_reward_coef=mix_kwargs.pop("discriminator_reward_coef"),
         discriminator_reward_type="quad",
@@ -175,7 +244,7 @@ def build_alg(mix_module, **mix_kwargs):
     alg.init_storage(
         NUM_ENVS,
         num_transitions_per_env=4,
-        obs_format=OBS_FORMAT,
+        obs_format=fmt if fmt is not None else OBS_FORMAT,
         num_actions=NUM_ACTIONS,
         num_rewards=1,
     )
@@ -292,6 +361,77 @@ def test_lerp_pipeline(mix_module, lam: float, coef: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# T3. 镜像损失 × 两种观测布局
+# ---------------------------------------------------------------------------
+
+
+def test_mirror_loss_layouts(mix_module) -> None:
+    """⭐ 镜像损失在 626（v1~v8）与 378（v9）两种布局下都要能跑。
+
+    回归背景：`mirror.py` 曾把布局写死成 626 ⇒ v9（378）一开镜像损失就在
+    **第一次 `PPO.update()`** 崩：`ValueError: policy obs 最后一维应为 626，收到 378`。
+    这里直接用构造出的 obs 打这条路径（不跑完整 `update`，避开 minibatch 内部字段）。
+    """
+    import joint_order  # （本机工具，已在 sys.path 里）
+
+    print("\nT3. ⭐ 镜像损失 × 两种观测布局（626 / 378）—— 回归 v9 的 PPO.update() 崩溃")
+    joints = list(joint_order.ISAACLAB_ORDER)
+    check("关节名 = 29 个（= 策略输出维）", len(joints) == NUM_ACTIONS, f"got {len(joints)}")
+
+    # 0) 开了镜像损失却没给关节名 ⇒ 启动即 fail-fast
+    try:
+        alg0 = build_alg(mix_module, use_mirror_loss=True, discriminator_reward_coef=0.5)
+        alg0.mirror_loss(torch.randn(4, POLICY_OBS_SIZE))
+        check("fail-fast: use_mirror_loss 却没给 mirror_joint_names", False, "没有抛异常")
+    except ValueError as e:
+        check("fail-fast: use_mirror_loss 却没给 mirror_joint_names",
+              "mirror_joint_names" in str(e), str(e)[:60])
+
+    for tag, (dim, scan) in POLICY_LAYOUTS.items():
+        n_jp = scan + 12                      # joint_pos_rel 段起点（scan 后：cmd/lin/grav/ang）
+        fmt = obs_format_for(tag)
+        obs = torch.randn(6, dim)
+
+        def primed(a):
+            """⭐ 先把 `action_mean` 置为 μ_π(o)。
+
+            `mirror_loss()` 读的是 `ac.action_mean` 而不是自己再前向一次：
+            它的 docstring 写明「= μ_π(o)（`compute_losses` 刚算过）」。
+            ⚠️ 所以忘调 `act()` 不会报错，而是**静默拿上一次（或初始）的均值**
+            去算损失 —— 单测里就撞到过（损失变成了 ~29 而不是 0）。
+            """
+            a.actor_critic.act(obs, masks=None, hidden_states=None)
+            return a
+
+        # 1) 非等变读出（取 height_scan 前缀）⇒ 损失应为**有限正数**
+        alg = build_alg(
+            mix_module, fmt=fmt, ac=ReadoutActorCritic(slice(0, NUM_ACTIONS)),
+            use_mirror_loss=True, mirror_joint_names=joints,
+            mirror_loss_coeff=0.1, discriminator_reward_coef=0.5,
+        )
+        l1 = float(primed(alg).mirror_loss(obs))
+        check(f"{tag}: mirror_loss 跑通且有限正数", math.isfinite(l1) and l1 > 1e-6, f"got {l1:.6g}")
+        check(f"{tag}: mirror_coef 记录 = 0.1", abs(float(alg.mirror_coef) - 0.1) < 1e-12,
+              f"got {alg.mirror_coef}")
+
+        # 2) 等变读出（取 joint_pos_rel 段）⇒ 损失应为 0（**正对照**）
+        alg2 = build_alg(
+            mix_module, fmt=fmt, ac=ReadoutActorCritic(slice(n_jp, n_jp + NUM_ACTIONS)),
+            use_mirror_loss=True, mirror_joint_names=joints,
+            mirror_loss_coeff=0.1, discriminator_reward_coef=0.5,
+        )
+        l2 = float(primed(alg2).mirror_loss(obs))
+        check(f"{tag}: 等变读出（μ = joint_pos_rel 段）损失 ≈ 0", l2 < 1e-10, f"got {l2:.3g}")
+
+        # 3) 拿错布局的 obs ⇒ fail-fast，而不是静默算错
+        try:
+            alg.mirror_loss(torch.randn(6, dim + 100))
+            check(f"{tag}: 观测维度不符 ⇒ fail-fast", False, "没有抛异常")
+        except ValueError as e:
+            check(f"{tag}: 观测维度不符 ⇒ fail-fast", "最后一维" in str(e), str(e)[:50])
+
+
+# ---------------------------------------------------------------------------
 # T2. OnPolicyRunner 的 module:Class 解析
 # ---------------------------------------------------------------------------
 
@@ -400,10 +540,12 @@ def main() -> int:
     if not ALGORITHMS_PY.is_file():
         print(f"找不到 {ALGORITHMS_PY}")
         return 1
+    preload_instinctlab_stubs()
     mix_module = load_module_by_path(ALGORITHMS_PY, "amp_mix_algorithms")
     lam, coef = test_config_numbers()
     print()
     test_lerp_pipeline(mix_module, lam, coef)
+    test_mirror_loss_layouts(mix_module)
     test_runner_module_class()
 
     print()

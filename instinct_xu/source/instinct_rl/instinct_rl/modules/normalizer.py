@@ -57,6 +57,28 @@ class EmpiricalNormalization(nn.Module):
         return (x - self._mean) / (self._std + self.eps)
 
     @torch.jit.unused
+    def normalize(self, x, update: bool = False):
+        """白化输入；**默认不更新统计量**（与 `forward` 的区别：`forward` 在 training 时会自动 `update`）。
+
+        用途（AMP 判别器的"状态白化"改造，2026-10-03）：
+        * 我们要让统计量**只用 expert/参考侧**数据累积（对齐 AMP_mjlab 的 `amp_normalizer`），
+          而 `Discriminator.forward` 里 `actor_states` 与 `reference_states` **都会流经** normalizer
+          ⇒ 直接走 `forward` 会被策略分布污染（策略越跑偏、统计量越被带偏 ⇒ 反而更难分辨）；
+        * GP 需要在**归一化空间**求 `‖∂d/∂x̃‖`（原始空间会因 `∂d/∂x = (∂d/∂x̃)/σ` 而爆量级）。
+
+        Args:
+            x: 输入张量。
+            update: 是否顺便更新统计量（默认 False）。
+
+        Returns:
+            白化后的张量 `(x − μ)/(σ + eps)`；`eps` 同时充当 **σ 下限**（防近常数维被放大）。
+        """
+        if update:
+            with torch.no_grad():
+                self.update(x)
+        return (x - self._mean) / (self._std + self.eps)
+
+    @torch.jit.unused
     def update(self, x):
         """Learn input values without computing the output values of them"""
 

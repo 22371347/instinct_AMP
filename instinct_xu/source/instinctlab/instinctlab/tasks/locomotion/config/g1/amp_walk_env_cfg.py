@@ -163,6 +163,12 @@ AMP_STATE_TERMS = (
 AMP_STATE_DIMS = ((AMP_STATE_HISTORY, 3), (290,), (290,), (30,), (30,))
 AMP_STATE_SIZE = sum(math.prod(d) for d in AMP_STATE_DIMS)     # == 670
 
+# ⚠️ 上面两行是 **history=10** 的字面量（`290 = 10×29`、`30 = 10×3`），只为文档/自检用，
+#    运行时判别器的输入维度由 obs 群自动推断（`wasabi.py` 的 `actor_state_key="amp_policy"`）。
+#    改帧数时这两行**不会**自动跟着变：
+#      * `history=2`（论文 (s_t, s_{t+1})）= 2×67 = **134**，见 `amp_walk_v12_env_cfg.py`
+#       （V12 在 env cfg 的 `__post_init__` 里新建 obs 群覆盖 history，不动本基线）。
+
 
 @configclass
 class AmpWalkMotionCfg(AmassMotionCfgBase):
@@ -595,12 +601,64 @@ class G1AmpWalkTeacherEnv(G1OmniLocoTeacherEnv):
         # 2) 奖励项数量：确认 `G1AmpWalkRewardsCfg` 真的生效（而不是继承了 OmniLoco 的）
         terms = getattr(self.reward_manager, "active_terms", None)
         n_rewards = len(terms) if terms is not None else -1
+        # 指令分布诊断：`zero_frac_in_low` **不参与契约断言**（只有 `rel_standing_envs`
+        # 被断言为 0.0），所以"原地指令减半"这种改动只能靠打印核对 —— 直接打出来。
+        _cmd = self.cfg.commands.base_velocity
         print(
             f"[AMP-WALK PASS] policy={sum(self.expected_policy_dims)} "
             f"(height_scan={self.expected_scan_rays} + base_lin_vel), action=29, scale=1.0, "
             f"cmd_ranges={self.expected_command_ranges} (directional), "
+            f"cmd_low/zero={getattr(_cmd, 'prob_low', float('nan')):.2f}/"
+            f"{getattr(_cmd, 'zero_frac_in_low', float('nan')):.2f}, "
             f"foot_bodies={'LL_FOOT/LR_FOOT' if has_foot_bodies else 'ankle_roll_link(FALLBACK)'}, "
             f"rewards={n_rewards}"
+        )
+        print(f"[AMP-WALK INFO] 奖励项（{n_rewards}）：{', '.join(sorted(terms)) if terms else '?'}")
+        # ⭐ 逐项权重：**跨版本核对用**（同一行、按名字排序 ⇒ 直接 diff 两轮日志即可看出
+        #    到底改了哪些项的权重，不必再靠读源码猜继承链）：
+        #      grep 'AMP-WALK WEIGHTS' /root/train_amp_walk_v1[12]_4096.log
+        if terms:
+            try:
+                _pairs = ", ".join(
+                    f"{n}={float(self.reward_manager.get_term_cfg(n).weight):g}"
+                    for n in sorted(terms)
+                )
+                print(f"[AMP-WALK WEIGHTS] {_pairs}")
+            except Exception as _e:  # noqa: BLE001 —— 纯诊断，绝不能因为它影响启动
+                print(f"[AMP-WALK WEIGHTS] (打印失败: {type(_e).__name__}: {_e})")
+        # --- 数据层镜像增广的状态 + 关节顺序自检（V10 起启用；只打印，不断言）----------
+        # 增广的**标签正确性**完全依赖 "`symmetric_augmentation_joint_mapping` 的索引口径
+        # 与 motion_reference buffer 的关节顺序一致"。我们的映射是用
+        # `build_joint_mirror(OMNI_LOCO_JOINT_ORDER)` 现算的（与镜像损失同一套代码），
+        # 而 `OMNI_LOCO_JOINT_ORDER` 又由 OmniLoco 的契约断言等于动作项的关节顺序
+        # ⇒ 这里直接把"实际关节顺序 == OMNI_LOCO_JOINT_ORDER"打出来做交叉验证。
+        # ⚠️ 注意：运行时**必须从 `scene.sensors` 拿**（`scene.motion_reference` 这种属性
+        #    访问方式在 InteractiveScene 上并不一定存在 ⇒ 早先的探针因此误报 OFF）。
+        _sensors = getattr(self.scene, "sensors", None)
+        _ref = _sensors.get("motion_reference") if isinstance(_sensors, dict) else None
+        if _ref is None:
+            _ref = getattr(self.scene, "motion_reference", None)
+        _ref_cfg = getattr(_ref, "cfg", None)
+        _jm = getattr(_ref_cfg, "symmetric_augmentation_joint_mapping", None)
+        try:
+            _cond = bool(_ref._symmetric_augmentation_conditions_met) if _ref is not None else None
+        except Exception as _exc:
+            _cond = f"?({_exc!r})"
+        try:
+            _mask = float(_ref._env_symmetric_augmentation_mask.float().mean())
+        except Exception:
+            _mask = None
+        try:
+            from .omni_loco_env_cfg import OMNI_LOCO_JOINT_ORDER
+
+            _order_ok = tuple(robot.joint_names) == tuple(OMNI_LOCO_JOINT_ORDER)
+            _order_msg = "一致" if _order_ok else "❌不一致（增广标签会错！）"
+        except Exception as _exc:  # pragma: no cover - 诊断路径不该拖垮启动
+            _order_msg = f"无法核对（{_exc!r}）"
+        print(
+            f"[AMP-WALK INFO] 数据层镜像增广：映射={'已设' if _jm is not None else '未设'}，"
+            f"运行时条件={_cond}，被镜像 env 比例={_mask}；"
+            f"joint 顺序 vs OMNI_LOCO_JOINT_ORDER：{_order_msg}"
         )
         if not has_foot_bodies:
             # 这是**预期**情况，不是异常：`LL_FOOT`/`LR_FOOT` 在 URDF 里是 ankle_roll_link

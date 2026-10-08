@@ -145,14 +145,31 @@ class DirectionalVelocityCommand(UniformVelocityCommand):
                 self.vel_command_b[nonzero, 0] = mag * torch.cos(theta)
                 self.vel_command_b[nonzero, 1] = mag * torch.sin(theta)
 
-        # --- 2) 纯侧向：vx == 0 ---------------------------------------------------
+        # --- 2) 纯侧向：vx == 0；**|vy| 从 `side_vel_min` 起** ----------------------
+        # ⭐ 2026-10-06（用户要求）：原来的 `vy ~ U(lin_vel_y)` 会采到 |vy| < 0.1 的指令，
+        #   而所有“静止/低速”门控（`track_default_pose_on_stand`、`disable_style_on_stand`、
+        #   `feet_lateral_width/crossing` 的 w_act）用的是 `‖(vx,vy)‖ + |ωz| ≤ low_vel`
+        #   ⇒ 这类侧向指令会被**当成静止**处理，监督信号自相矛盾。
+        #   ⇒ 改成：`|vy| ~ U(side_vel_min, max(|lo|,|hi|))` + 随机符号
+        #     （等价于在 **两个尾段** [−M,−m] ∪ [m,M] 上均匀），`m` 默认 0.15 > low_vel。
         side_mask = (m >= p_low) & (m < p_side)
         if side_mask.any():
             idx = env_ids[side_mask]
             k = int(idx.numel())
             self.vel_command_b[idx, 0] = 0.0
-            self.vel_command_b[idx, 1] = uni(k, *r.lin_vel_y)
-            self.vel_command_b[idx, 2] = uni(k, *r.ang_vel_z)
+            _lo, _hi = float(r.lin_vel_y[0]), float(r.lin_vel_y[1])
+            _m = float(getattr(self.cfg, "side_vel_min", 0.0) or 0.0)
+            _M = max(abs(_lo), abs(_hi))
+            if _m > 0.0 and _m < _M:
+                mag = uni(k, _m, _M)
+                sign = torch.where(torch.rand(k, device=dev) < 0.5, -1.0, 1.0)
+                self.vel_command_b[idx, 1] = sign * mag
+            else:  # `side_vel_min=0` ⇒ 与加这个字段之前**逐字一致**（完全向下兼容）
+                self.vel_command_b[idx, 1] = uni(k, _lo, _hi)
+            # `side_ang_vel_range`（可选，V13 新增）：给“纯侧移”档一个**独立的** ωz 口径。
+            # `None` ⇒ 沿用 `ranges.ang_vel_z`，与加这个字段之前**逐字一致**。
+            _side_wz = getattr(self.cfg, "side_ang_vel_range", None) or r.ang_vel_z
+            self.vel_command_b[idx, 2] = uni(k, *_side_wz)
 
         # --- 3) 纯前后：vy == 0 ---------------------------------------------------
         lin_mask = (m >= p_side) & (m < p_lin)
@@ -206,7 +223,13 @@ class DirectionalVelocityCommandCfg(UniformVelocityCommandCfg):
     """纯前后命令概率（$v_y\\equiv0$），覆盖前后直行与转弯行走。"""
     prob_back: float = 0.10
     """持续直线后退概率（$v_y=0$、$v_x<0$、$\\omega_z\\approx0$）。"""
-
+    # -- 纯侧向分支（V13 新增；默认 None = 旧行为）------------------------------
+    side_ang_vel_range: tuple[float, float] | None = None
+    #: ⭐ 纯侧向档的 `|vy|` 下限（m/s）。**必须 > `low_vel`**：静止门控是 `‖(vx,vy)‖+|ωz| ≤ low_vel`，
+    #: 所以 |vy| ≤ low_vel 的侧向指令会被当成静止（监督自相矛盾）。`0.0` = 关掉该限制（旧行为）。
+    side_vel_min: float = 0.0
+    """纯侧向档的 $\omega_z$ 范围。`None` ⇒ 沿用 `ranges.ang_vel_z`（与加该字段前完全一致）；
+    设为 `(0.0, 0.0)` 即得严格意义的“纯侧移”（原地不转）。"""
     # -- 低速分支 ---------------------------------------------------------------
     low_vel: float = 0.1
     """低速命令的最大幅值（m/s 或 rad/s）。"""

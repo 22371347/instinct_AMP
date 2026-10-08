@@ -36,9 +36,12 @@
     #    离线单测（不开窗）：python tools/test_keyboard_teleop.py
 
     # 5) ⭐ 高亮 height_scan 的扫描区域（**默认就开**，随机器人平移 + 偏航）
-    #    橙色框 = 3.0(前后) x 1.6(左右) m 的地面矩形，即 527 条射线的落点范围；
-    #    内部淡橙线 = 0.5 m 网格；前边缘向外伸出的短段 = “这一侧是前方”。
-    #    几何取自源码 `omni_loco_env_cfg.py:86`（GridPatternCfg(0.1, (3.0, 1.6))）。
+    #    橙色框 = 地面矩形，即全部射线的落点范围；内部淡橙线 = 0.5 m 网格；
+    #    前边缘向外伸出的短段 = “这一侧是前方”。
+    #    ⚠️ 几何随**布局**变（`--obs-mode` 或根据策略输入维度自动选）：
+    #      · amp626（v1~v8）= 3.0×1.6 m，31×17 = 527 条，**居中在躯干正下方**；
+    #      · amp378（v9）  = 3.0×0.8 m，31×9  = 279 条，**中心前移 1.5 m**（落点 x∈[0,3]）。
+    #    来源：`omni_loco_env_cfg.py:86` 与 `instinct_xu/.../amp_walk_v9_env_cfg.py`。
     python tools/g1_mujoco_play.py --policy /path/to/policy.onnx --duration 0 --no-show-scan
     #    离线几何单测（不开窗）：python tools/test_scan_visual.py
 """
@@ -49,6 +52,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -272,16 +276,68 @@ class ObsBuilder:
         return np.concatenate(parts, axis=-1)
 
 
-class AmpWalk626ObsBuilder:
-    """`Instinct-Amp-Walk-G1-v0` 的 **626 维** actor 特权观测拼接。
+# ---------------------------------------------------------------------------
+# AMP-Walk 观测布局表 —— **版本间唯一会变的就是 height_scan 的宽度与前移量**
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class AmpWalkLayout:
+    """一个版本的 actor 观测布局。
 
-    与上面的 `ObsBuilder`（InstinctLab parkour：8 帧历史 + scale 0.25/0.05）
-    完全不同：本任务是**单帧、无额外缩放、无历史**，按 `G1AmpWalkPolicyObsCfg`
-    的**声明顺序**拼接：
+    ⚠️ 除 `height_scan` 外，其余 7 项的**项名/顺序/维数在各版本完全一致**：
+    `velocity_command(3) + base_lin_vel(3) + projected_gravity(3) + base_ang_vel(3)
+     + joint_pos_rel(29) + joint_vel(29) + last_action(29) = 99`
+    ⇒ `obs_dim = scan_dim + 99`。
+    """
 
-        [ height_scan(527) | velocity_command(3) | base_lin_vel(3)
+    name: str
+    scan_ny: int                     # 侧向条数（左右范围/分辨率 + 1）
+    scan_nx: int                     # 前向条数
+    scan_size: tuple[float, float]   # (前后, 左右) m —— GridPatternCfg 的 size
+    scan_forward: float              # ⭐ 扫描中心相对躯干的前移量 m（0.0 = 居中）
+    with_lin_vel: bool = True        # ⭐ 非扫描尾段里是否含 base_lin_vel(3)
+    #   AMP-Walk（626/378）含 base_lin_vel ⇒ 尾段 99；
+    #   OmniLoco 基座（`LocoTeacherPolicyObsCfg`，623）**不含** ⇒ 尾段 96。
+
+    @property
+    def tail_dim(self) -> int:
+        return 99 if self.with_lin_vel else 96
+
+    @property
+    def scan_dim(self) -> int:
+        return self.scan_ny * self.scan_nx
+
+    @property
+    def obs_dim(self) -> int:
+        return self.scan_dim + self.tail_dim
+
+
+#: 版本 → 布局。**环境侧改了扫描几何就必须同步这里**，否则切片/叠加框都会错。
+AMP_WALK_LAYOUTS: dict[str, AmpWalkLayout] = {
+    # v1~v8：3.0×1.6 / res 0.1 → 31×17 = 527，居中（offset.pos=(0,0,20)）
+    "amp626": AmpWalkLayout("amp626", scan_ny=17, scan_nx=31,
+                            scan_size=(3.0, 1.6), scan_forward=0.0),
+    # v9(MVP)：3.0×0.8 / res 0.1 → 31×9 = 279，**中心前移 1.5 m**（落点 x∈[0,3]）
+    "amp378": AmpWalkLayout("amp378", scan_ny=9, scan_nx=31,
+                            scan_size=(3.0, 0.8), scan_forward=1.5),
+    # ⭐ OmniLoco 基座（`Instinct-Unified-OmniLoco-G1-v0`）：527+96 = **623**。
+    #   扫描几何与 amp626 相同，但**尾段没有 base_lin_vel**（基座是纯速度跟踪任务，
+    #   没有这个特权量）。从零重训的 T0 实验要用它做 MuJoCo 验收。
+    "loco623": AmpWalkLayout("loco623", scan_ny=17, scan_nx=31,
+                             scan_size=(3.0, 1.6), scan_forward=0.0,
+                             with_lin_vel=False),
+}
+
+
+class AmpWalkObsBuilder:
+    """AMP-Walk 的 actor 特权观测拼接（**布局可变**：626/527 或 378/279）。
+
+    布局由 `layout`（`AmpWalkLayout`）决定 —— 见上面的 `AMP_WALK_LAYOUTS`。
+    除 `height_scan` 的宽度外，各项的语义/顺序/取法与 v1~v8 完全一致，
+    按 `G1AmpWalkPolicyObsCfg` 的**声明顺序**拼接：
+
+        [ height_scan(527 或 279) | velocity_command(3) | base_lin_vel(3)
           | projected_gravity(3) | base_ang_vel(3)
-          | joint_pos_rel(29) | joint_vel(29) | last_action(29) ] = 626
+          | joint_pos_rel(29) | joint_vel(29) | last_action(29) ] = 626 或 378
 
     每一项的语义都对着源码钉过（不是猜的）：
 
@@ -301,18 +357,24 @@ class AmpWalk626ObsBuilder:
     全部转发自 `isaaclab.envs.mdp`；`height_scan` 的具体公式见
     `isaaclab/envs/mdp/observations.py` 的 `height_scan`（offset 默认 0.5）。
 
-    ⚠️ **height_scan 是特权量**：MuJoCo 里没有 527 条射线的地形扫描器。
-    平地近似成常数是**精确**的（每条射线都命中 z=0 地面，公式退化成
-    `torso_z - 0.5`）；地形不平坦时这个近似不成立，回放结论不可信。
+    ⚠️ **height_scan 是特权量**：MuJoCo 里没有地形扫描器。平地近似成常数是
+    **精确**的（每条射线都命中 z=0 地面，公式退化成 `torso_z - 0.5`，
+    **与扫描尺寸/前移量无关**）；地形不平坦时这个近似不成立，回放结论不可信。
     """
 
+    #: 旧默认（v1~v8 的 527）；实例化时会被 `self.layout.scan_dim` 覆盖。
     N_SCAN = 527          # 31 x 17：0.1 m 分辨率、3.0 x 1.6 m
     SCAN_OFFSET = 0.5     # IsaacLab `height_scan` 默认 offset（我们的 ObsTerm 没传 → 0.5）
     SCAN_CLIP = (-1.0, 1.0)
 
     def __init__(self, model, data, default_joint_pos_mjcf, n_joint=29,
-                 torso_body_name="torso_link", obs_joint_order="npz"):
+                 torso_body_name="torso_link", obs_joint_order="npz",
+                 layout: "AmpWalkLayout | None" = None):
         import mujoco
+
+        #: 观测布局（默认 v1~v8 的 626/527，保持旧调用行为不变）
+        self.layout = layout if layout is not None else AMP_WALK_LAYOUTS["amp626"]
+        self.N_SCAN = self.layout.scan_dim
 
         try:
             from joint_order import (ISAACLAB_ORDER, MUJOCO_ORDER, NPZ_ORDER,
@@ -349,7 +411,8 @@ class AmpWalk626ObsBuilder:
                 f"MJCF 里找不到 body '{torso_body_name}' —— height_scan 需要它的 z 坐标"
             )
         self.torso_body_id = bid
-        print(f"[obs] AMP-Walk 626 维：height_scan={self.N_SCAN} "
+        print(f"[obs] AMP-Walk {self.layout.obs_dim} 维（布局 {self.layout.name}）："
+              f"height_scan={self.N_SCAN} "
               f"(平地常数 torso_z-{self.SCAN_OFFSET})，torso_body_id={bid}")
         print(f"[obs] 观测关节块用 **{obs_joint_order}** 序"
               f"（与动作的 OMNI_LOCO 序不同；重排={'生效' if not np.array_equal(self.mj_to_obs, np.arange(n_joint)) else 'no-op'}）")
@@ -372,10 +435,12 @@ class AmpWalk626ObsBuilder:
         jp = d.qpos[7:7 + self.n_joint][self.mj_to_obs] - self.default_policy
         jv = d.qvel[6:6 + self.n_joint][self.mj_to_obs]
         # 8) last_action（policy 序）
-        return np.concatenate(
-            [scan, cmd, lin_b, grav, ang_b, jp, jv,
-             np.asarray(last_action, dtype=np.float64)]
-        )
+        #    ⭐ 尾段是否含 base_lin_vel 由布局决定（基座 623 没有这一项）
+        parts = [scan, cmd]
+        if self.layout.with_lin_vel:
+            parts.append(lin_b)
+        parts += [grav, ang_b, jp, jv, np.asarray(last_action, dtype=np.float64)]
+        return np.concatenate(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -467,10 +532,24 @@ def onnx_info(path: str) -> None:
 #
 # 平地时扫描区域就是**地面上一个 3.0（前后）× 1.6（左右）m 的矩形**，
 # 中心随机器人 (x, y) 平移、随航向（yaw）旋转。下面画的正是它。
-SCAN_SIZE_XY = (3.0, 1.6)       # (前后, 左右) m —— GridPatternCfg 的 size
+SCAN_SIZE_XY = (3.0, 1.6)       # (前后, 左右) m —— GridPatternCfg 的 size（默认=v1~v8）
 SCAN_RESOLUTION = 0.1           # m —— GridPatternCfg 的 resolution
+SCAN_FORWARD = 0.0              # ⭐ 扫描中心相对躯干的前移量 m（v9 = 1.5）
 SCAN_TORSO_BODY = "torso_link"  # 挂载点
 SCAN_ALIGNMENT = "yaw"          # 与 IsaacLab 的 ray_alignment 对齐
+
+
+def apply_scan_layout(layout) -> None:
+    """把可视化用的扫描几何切到某个布局（`AMP_WALK_LAYOUTS[...]`）。
+
+    ⚠️ 下面几个是**模块级全局**（绘图函数与离线单测 `test_scan_visual.py` 都读它们），
+    所以启动时按 `--obs-mode` 调一次；单测可对不同布局各调一次再断言。
+    """
+    global SCAN_SIZE_XY, SCAN_FORWARD, SCAN_NY, SCAN_NX, SCAN_GRID_RAYS
+    SCAN_SIZE_XY = tuple(float(v) for v in layout.scan_size)
+    SCAN_FORWARD = float(layout.scan_forward)
+    SCAN_NY, SCAN_NX = int(layout.scan_ny), int(layout.scan_nx)
+    SCAN_GRID_RAYS = SCAN_NY * SCAN_NX
 
 SCAN_COLOR_EDGE = np.array([1.00, 0.35, 0.05, 0.90], dtype=np.float32)  # 边框（亮橙）
 SCAN_COLOR_GRID = np.array([1.00, 0.60, 0.30, 0.35], dtype=np.float32)  # 内部网格（淡）
@@ -511,8 +590,13 @@ def scan_footprint_segments(data, torso_id: int, *, z: float = SCAN_DRAW_Z):
     half_x, half_y = SCAN_SIZE_XY[0] / 2.0, SCAN_SIZE_XY[1] / 2.0
 
     def to_world(ux: float, uy: float) -> np.ndarray:
-        """扫描系 (x=前后, y=左右) → 世界坐标（落在地面上）"""
-        return np.array([p[0], p[1], z]) + R[:, 0] * ux + R[:, 1] * uy
+        """扫描系 (x=前后, y=左右) → 世界坐标（落在地面上）
+
+        ⚠️ `SCAN_FORWARD` = 扫描中心相对躯干的**前移量**（v9 = 1.5 m）：
+        IsaacLab 的 `offset.pos=(forward, 0, 20)` 意味着射线束整体前移，
+        所以这里在前向分量上加上它。镜像损失不受影响（左右仍关于躯干对称）。
+        """
+        return np.array([p[0], p[1], z]) + R[:, 0] * (ux + SCAN_FORWARD) + R[:, 1] * uy
 
     segments: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
@@ -557,23 +641,24 @@ def draw_scan_footprint(scn, data, torso_id: int, *, z: float = SCAN_DRAW_Z) -> 
 
 def scan_geometry_text() -> str:
     """启动时打印扫描区域几何（便于和云端配置对账）。"""
+    fwd = (
+        "居中在躯干正下方"
+        if abs(SCAN_FORWARD) < 1e-9
+        else f"中心**前移 {SCAN_FORWARD:.2f} m**（落点 x∈[{SCAN_FORWARD - SCAN_SIZE_XY[0] / 2:+.2f}, {SCAN_FORWARD + SCAN_SIZE_XY[0] / 2:+.2f}] m）"
+    )
     return (
         f"[scan] 高程图扫描区域 = {SCAN_SIZE_XY[0]:.1f}(前后) x {SCAN_SIZE_XY[1]:.1f}(左右) m，"
         f"res {SCAN_RESOLUTION} m → "
-        f"{int(SCAN_SIZE_XY[0] / SCAN_RESOLUTION) + 1} x {int(SCAN_SIZE_XY[1] / SCAN_RESOLUTION) + 1} = "
-        f"{SCAN_GRID_RAYS} 条射线\n"
+        f"{SCAN_NY} x {SCAN_NX} = {SCAN_GRID_RAYS} 条射线；{fwd}\n"
         f"       挂载 {SCAN_TORSO_BODY}，ray_alignment='{SCAN_ALIGNMENT}'"
         f"（只跟航向，不随俯仰/横滚倾斜）\n"
         f"       平地时 = 地面上的矩形，中心随机器人平移、随航向旋转（橙色框=边界，前边缘外伸段=前方）"
     )
 
 
-# 527：由上面的 size/resolution 推导，不是硬写的常数
-SCAN_GRID_RAYS = (
-    int(SCAN_SIZE_XY[0] / SCAN_RESOLUTION) + 1
-) * (
-    int(SCAN_SIZE_XY[1] / SCAN_RESOLUTION) + 1
-)
+#: 射线条数：默认布局（v1~v8 的 527）；`apply_scan_layout()` 会按布局重算
+SCAN_NY, SCAN_NX = 17, 31
+SCAN_GRID_RAYS = SCAN_NY * SCAN_NX
 
 
 # ---------------------------------------------------------------------------
@@ -581,9 +666,14 @@ SCAN_GRID_RAYS = (
 # ---------------------------------------------------------------------------
 
 #: 训练时的速度指令范围，= `instinct_xu` 的 `AMP_WALK_COMMAND_RANGES`
-#: （`tasks/locomotion/config/g1/amp_walk_env_cfg.py:92`）。
+#: （`tasks/locomotion/config/g1/amp_walk_env_cfg.py` 的 `(-1.0, 1.2) / (-0.5, 0.5) / (-0.8, 0.8)`）。
 #: 键盘遥控**必须**夹在这个范围内：超出范围属于分布外指令，摔了不代表策略差。
-CMD_LIMITS: tuple[tuple[float, float], ...] = ((-2.0, 2.0), (-1.5, 1.5), (-2.8, 2.8))
+#:
+#: ⚠️ 2026-10-06 修正：这里原先是 `((-2.0, 2.0), (-1.5, 1.5), (-2.8, 2.8))`
+#:    （OmniLoco 基线的旧口径），**与 AMP-Walk 的训练范围不一致** —— 键盘按几下
+#:    就能把 vx 拧到 2.0、wz 拧到 2.8（训练上限的 1.7~3.5 倍），回放现象会被
+#:    误判成「策略差」。注释早就写着「= 训练范围」，数值却是旧的。
+CMD_LIMITS: tuple[tuple[float, float], ...] = ((-1.0, 1.2), (-0.5, 0.5), (-0.8, 0.8))
 
 #: 键码 → 动作名。**两种键码语义都注册**：
 #:   · GLFW 键码：`glfw.KEY_W == 87`
@@ -689,6 +779,25 @@ def reset_state(model, data) -> None:
         mujoco.mj_resetDataKeyframe(model, data, 0)
     else:
         mujoco.mj_resetData(model)
+    mujoco.mj_forward(model, data)
+
+
+def apply_init_vel(model, data, init_vx: float) -> None:
+    """诊断用（P1 探针）：给根节点注入初始**前向**速度（世界系 x，m/s）。
+
+    为什么要它：`cmd=+0.8` 时策略实际只跑 0.014 m/s（原地踏步）。要区分两件事：
+      (a) 策略的**固定点里根本没有**"前进"这个解（一给速度就刹停）；
+      (b) 固定点**存在**，但策略学不会从静止加速上去（自举/探索问题）。
+    办法就是把初速直接置成指令值，看它是"维持"还是"刹车"。
+
+    ⚠️ 必须在 `reset_state()`（内含 `mj_forward`）**之后**调用，并再 forward 一次，
+    否则 `data.xpos` 等派生量仍是旧值（与 `reset_state` 的 docstring 同一个坑）。
+    """
+    if abs(float(init_vx)) < 1e-9:
+        return
+    import mujoco   # 模块级没有 mujoco（`play()` 内是局部导入），这里必须自己导
+
+    data.qvel[0] = float(init_vx)
     mujoco.mj_forward(model, data)
 
 
@@ -818,6 +927,9 @@ def play(args) -> int:
     # 复位到初始状态（含必须的 `mj_forward`，见 `reset_state` 的 docstring；
     # `R` 键走的是同一个函数，逻辑只有一份）
     reset_state(model, data)
+    apply_init_vel(model, data, args.init_vx)
+    if abs(args.init_vx) > 1e-9:
+        print(f"[init] P1 探针：已注入初始前向速度 v0={args.init_vx:+.2f} m/s（世界系 x）")
 
     n_joint = model.nu
     default_joint_pos = default_qpos[7 : 7 + n_joint].copy()
@@ -844,28 +956,56 @@ def play(args) -> int:
     obs_mode = args.obs_mode
     if obs_mode == "auto":
         dim = getattr(policy, "input_dim", None) if policy else None
-        if dim == 626:
-            obs_mode = "amp626"
+        # ⭐ 按策略输入维度自动选布局：626 → v1~v8 的 527 扫描；378 → v9 的 279 扫描
+        by_dim = {lay.obs_dim: name for name, lay in AMP_WALK_LAYOUTS.items()}
+        if dim in by_dim:
+            obs_mode = by_dim[dim]
         elif dim is None:
             if args.selftest_obs:
-                obs_mode = "amp626"   # 自检默认校验本任务的 626 维
+                obs_mode = "amp626"   # 自检默认校验 v1~v8 的 626 维
             else:
                 raise SystemExit(
                     "--obs-mode auto 无法从策略文件推断观测维度（torch 分支 / 动态维度）。\n"
-                    "请显式指定：--obs-mode amp626（本任务）或 --obs-mode legacy（parkour）"
+                    f"请显式指定：--obs-mode {' 或 '.join(AMP_WALK_LAYOUTS)}（本仓库 AMP-Walk），"
+                    "或 --obs-mode legacy（InstinctLab parkour）"
                 )
         else:
             obs_mode = "legacy"
     if policy is None and not args.selftest_obs:
         obs_builder = None
-    elif obs_mode == "amp626":
-        obs_builder = AmpWalk626ObsBuilder(model, data, default_joint_pos, n_joint=n_joint,
-                                           obs_joint_order=args.obs_joint_order)
+    elif obs_mode in AMP_WALK_LAYOUTS:
+        # ⭐ AMP-Walk：先把可视化几何切到同一布局（否则叠加的橙框会误导），再建 builder
+        amp_layout = AMP_WALK_LAYOUTS[obs_mode]
+        apply_scan_layout(amp_layout)
+        obs_builder = AmpWalkObsBuilder(model, data, default_joint_pos, n_joint=n_joint,
+                                        obs_joint_order=args.obs_joint_order, layout=amp_layout)
     else:
         obs_builder = ObsBuilder(model, data, default_joint_pos, history=args.history)
+    _dim_txt = (f"{obs_builder.layout.obs_dim}"
+                if (obs_builder is not None and obs_mode in AMP_WALK_LAYOUTS) else "?")
     print(f"[obs] obs_mode={obs_mode}"
           + (f"  策略期望维度={getattr(policy, 'input_dim', None)}" if policy else "")
-          + f"  （自检：实际拼出 {626 if obs_mode == 'amp626' else '?'} 维）")
+          + f"  （自检：实际拼出 {_dim_txt} 维）")
+
+    # ⭐ 观测分段表：**按当前布局推导**（v1~v8: 527 / v9: 279）——
+    #    下面所有“分段排查/周期打印”都用它，不再写死 527/626。
+    _n0 = int(getattr(obs_builder, "N_SCAN", 527))
+    _o = _n0 + 3                                   # 扫描 + 指令之后
+    SEG: list[tuple[str, int, int]] = [
+        ("height_scan", 0, _n0),
+        ("velocity_command", _n0, _o),
+    ]
+    if bool(getattr(getattr(obs_builder, "layout", None), "with_lin_vel", True)):
+        SEG.append(("base_lin_vel", _o, _o + 3))
+        _o += 3
+    SEG += [
+        ("projected_gravity", _o, _o + 3),
+        ("base_ang_vel", _o + 3, _o + 6),
+        ("joint_pos_rel", _o + 6, _o + 35),
+        ("joint_vel", _o + 35, _o + 64),
+        ("last_action", _o + 64, _o + 93),
+    ]
+    SEGD: dict[str, tuple[int, int]] = {nm: (a, b) for nm, a, b in SEG}
 
     # 动作重排：策略输出是 IsaacLab(policy) 序，MJCF 的 ctrl 是 MJCF 序。
     # 两套顺序不同（IsaacLab 肩优先左右交错；MJCF 按 body 遍历）→ 不重排会完全错位。
@@ -890,7 +1030,7 @@ def play(args) -> int:
     #   契约校验会打印 `scale=1.0`，与我们的 cfg 一致。
     scale_mode = args.action_scale_mode
     if scale_mode == "auto":
-        scale_mode = "unity" if obs_mode == "amp626" else "beyondmimic"
+        scale_mode = "unity" if obs_mode in AMP_WALK_LAYOUTS else "beyondmimic"
     if scale_mode == "unity":
         action_scale = np.ones(n_joint, dtype=np.float64)
         print(f"[ctrl] action_scale = 1.0（unity，与 IsaacLab 的 scale=1.0 一致）")
@@ -909,27 +1049,24 @@ def play(args) -> int:
     if args.selftest_obs:
         mujoco.mj_forward(model, data)
         obs = obs_builder.build(cmd, last_action)
-        segs = [
-            ("height_scan", 527), ("velocity_command", 3), ("base_lin_vel", 3),
-            ("projected_gravity", 3), ("base_ang_vel", 3), ("joint_pos_rel", 29),
-            ("joint_vel", 29), ("last_action", 29),
-        ]
-        print(f"\n[selftest] 总维度 = {len(obs)}（本任务期望 626）")
-        off = 0
-        for name, n in segs:
-            chunk = obs[off:off + n]
-            print(f"  {name:18s} [{off:3d}:{off + n:3d}] n={n:3d}  "
+        print(f"\n[selftest] 总维度 = {len(obs)}（布局 {obs_builder.layout.name}，期望 {obs_builder.layout.obs_dim}）")
+        # ⭐ 直接用上面的 `SEG`（唯一真相源，按布局推导）—— 原来这里又写死了一遍
+        #    "尾段必含 base_lin_vel"，对 623 的基座会把 projected_gravity 标成
+        #    base_lin_vel，误导排查。不许再出现第二份分段表。
+        for name, a, b in SEG:
+            chunk = obs[a:b]
+            print(f"  {name:18s} [{a:3d}:{b:3d}] n={b - a:3d}  "
                   f"min={chunk.min(): .4f} max={chunk.max(): .4f}  "
                   f"head={np.array2string(chunk[:3], precision=4)}")
-            off += n
-        g = obs[527 + 3 + 3: 527 + 3 + 3 + 3]
+        g = obs[SEGD["projected_gravity"][0]: SEGD["projected_gravity"][1]]
         print(f"\n[selftest] 符号关键检查：")
         print(f"  projected_gravity = {np.array2string(g, precision=4)}"
               f"   → 直立时应接近 (0, 0, -1)；若是 (0,0,+1) 则符号错了")
-        print(f"  height_scan[0]    = {obs[0]:.4f}   → 平地应 ≈ torso_z - {0.5}")
-        print(f"  joint_pos_rel[:3] = {np.array2string(obs[527 + 3 + 3 + 3 + 3:][:3], precision=4)}"
+        print(f"  height_scan[0]    = {obs[0]:.4f}   → 平地应 ≈ torso_z - {0.5}"
+              f"（与扫描尺寸/前移量无关）")
+        print(f"  joint_pos_rel[:3] = {np.array2string(obs[SEGD['joint_pos_rel'][0]:][:3], precision=4)}"
               f"   → 按 IsaacLab(肩优先交错) 序，即 left/right shoulder pitch, waist pitch")
-        print(f"  base_ang_vel      = {np.array2string(obs[527 + 3 + 3 + 3:527 + 3 + 3 + 3 + 3], precision=4)}")
+        print(f"  base_ang_vel      = {np.array2string(obs[SEGD['base_ang_vel'][0]: SEGD['base_ang_vel'][1]], precision=4)}")
         return 0
 
     # PD 增益：优先用 MJCF 的位置执行器增益，否则用给定默认值
@@ -999,8 +1136,17 @@ def play(args) -> int:
     t_next = t_start
     lag_reports = 0
 
+    # --- 指令跟踪统计：判「原地踏步」的客观量（指令 vs 实际速度/位移）---
+    tr_n = 0
+    tr_cmd = np.zeros(2, dtype=np.float64)
+    tr_vx = tr_vy = 0.0
+    tr_x0, tr_y0 = float(data.qpos[0]), float(data.qpos[1])
+    tr_skipped = args.track_skip <= 0.0
+    tr_skip_step = max(0, int(round(args.track_skip * float(args.policy_hz))))
+
     total_txt = "inf" if infinite else str(n_steps)
     print(f"[run] {total_txt} policy steps @ {args.policy_hz} Hz (decimation={decimation}, dt={dt})")
+    print("[track] 判据：给 +0.8 前进指令时，实际 vx 均值应接近 +0.8；若≈0 即「原地踏步」")
     try:
         for step in range(n_steps):
             # --- 键盘遥控：每步覆盖 cmd / 处理复位 / 关窗即退出 ---
@@ -1013,7 +1159,13 @@ def play(args) -> int:
                     # ⚠️ 复位必须同时清 `last_action`：不清的话策略会把「上一段生命
                     #    末期的大动作」当作第一帧输入，直接指数发散（见 §13 坑 2）。
                     reset_state(model, data)
+                    apply_init_vel(model, data, args.init_vx)
                     last_action = np.zeros(n_joint, dtype=np.float64)
+                    # 跟踪统计也要重新起算，否则位移会跨生命期累加
+                    tr_n = 0
+                    tr_cmd = np.zeros(2, dtype=np.float64)
+                    tr_vx = tr_vy = 0.0
+                    tr_x0, tr_y0 = float(data.qpos[0]), float(data.qpos[1])
                     print("[teleop] 已复位到初始 keyframe（last_action 已清零）")
                 if step % 25 == 0 and viewer_ctx is not None:
                     viewer_ctx.set_texts(teleop.hud())
@@ -1031,11 +1183,8 @@ def play(args) -> int:
                 # 非有限值会把 ctrl 变成 NaN、让仿真彻底崩 —— 这里定位到**具体哪一段**
                 o1 = obs.reshape(-1)
                 if not np.isfinite(o1).all():
-                    print(f"  ❌ step {step}: obs 出现非有限值，分段排查：")
-                    for nm, a, b in [("height_scan", 0, 527), ("velocity_command", 527, 530),
-                                     ("base_lin_vel", 530, 533), ("projected_gravity", 533, 536),
-                                     ("base_ang_vel", 536, 539), ("joint_pos_rel", 539, 568),
-                                     ("joint_vel", 568, 597), ("last_action", 597, 626)]:
+                    print(f"  ❌ step {step}: obs 出现非有限值，分段排查（布局 {obs_builder.layout.name}）：")
+                    for nm, a, b in SEG:
                         seg = o1[a:b]
                         print(f"     {nm:18s} |max|={np.abs(seg).max():.4g} "
                               f"finite={np.isfinite(seg).all()}")
@@ -1052,19 +1201,23 @@ def play(args) -> int:
                     idx = np.nonzero(~np.isfinite(act))[0]
                     print(f"  ❌ step {step}: 策略输出出现非有限值，关节下标 {idx.tolist()}"
                           f"（policy 序）→ obs 幅值 |max|={np.abs(o1).max():.4g}")
-                    print(f"     obs 分段 |max|: scan={np.abs(o1[:527]).max():.4g} "
-                          f"cmd={np.abs(o1[527:530]).max():.4g} "
-                          f"lin_b={np.abs(o1[530:533]).max():.4g} "
-                          f"grav={np.abs(o1[533:536]).max():.4g} "
-                          f"ang_b={np.abs(o1[536:539]).max():.4g} "
-                          f"jp={np.abs(o1[539:568]).max():.4g} "
-                          f"jv={np.abs(o1[568:597]).max():.4g} "
-                          f"la={np.abs(o1[597:626]).max():.4g}")
+                    print("     obs 分段 |max|: " + "  ".join(
+                        f"{nm}={np.abs(o1[a:b]).max():.4g}" for nm, a, b in SEG))
                     break
                 if step % 50 == 0:
-                    print(f"    [obs] |max|={np.abs(o1).max():6.3f} (scan={np.abs(o1[:527]).max():.3f} "
-                          f"lin_b={np.abs(o1[530:533]).max():.3f} ang_b={np.abs(o1[536:539]).max():.3f} "
-                          f"jp={np.abs(o1[539:568]).max():.3f} jv={np.abs(o1[568:597]).max():.3f})"
+                    # ⭐ 不能写死 base_lin_vel：基座布局（loco623）没有这一段
+                    _ang = SEGD["base_ang_vel"]
+                    _jp = SEGD["joint_pos_rel"]
+                    _jv = SEGD["joint_vel"]
+                    _lin_txt = ""
+                    if "base_lin_vel" in SEGD:
+                        _l = SEGD["base_lin_vel"]
+                        _lin_txt = f"lin_b={np.abs(o1[_l[0]:_l[1]]).max():.3f} "
+                    print(f"    [obs] |max|={np.abs(o1).max():6.3f} (scan={np.abs(o1[:_n0]).max():.3f} "
+                          f"{_lin_txt}"
+                          f"ang_b={np.abs(o1[_ang[0]:_ang[1]]).max():.3f} "
+                          f"jp={np.abs(o1[_jp[0]:_jp[1]]).max():.3f} "
+                          f"jv={np.abs(o1[_jv[0]:_jv[1]]).max():.3f})"
                           f"  [act] min={act.min(): .3f} max={act.max(): .3f}")
             else:
                 act = np.zeros(n_joint)
@@ -1082,6 +1235,19 @@ def play(args) -> int:
                     dq = data.qvel[6 : 6 + n_joint]
                     data.ctrl[:] = kp * (target - q) - kd * dq
                 mujoco.mj_step(model, data)
+
+            # --- 累计「指令 vs 实际」：世界系 pelvis 线速度 + 位移 ---
+            # `--track-skip`：跳过起步瞬态（注入初速后前几秒是过渡段，会污染均值）
+            if (not tr_skipped) and step >= tr_skip_step:
+                tr_skipped = True
+                tr_n = 0
+                tr_cmd = np.zeros(2, dtype=np.float64)
+                tr_vx = tr_vy = 0.0
+                tr_x0, tr_y0 = float(data.qpos[0]), float(data.qpos[1])
+            tr_n += 1
+            tr_cmd += np.asarray(cmd[:2], dtype=np.float64)
+            tr_vx += float(data.qvel[0])
+            tr_vy += float(data.qvel[1])
 
             if viewer_ctx is not None:
                 # 每帧重画扫描区域（user_scn 是“只读物理”的叠加层，不影响碰撞）
@@ -1109,8 +1275,12 @@ def play(args) -> int:
                     t_next = now
 
             if step % (100 if infinite else max(1, n_steps // 10)) == 0:
+                _mvx = tr_vx / tr_n if tr_n else 0.0
+                _mvy = tr_vy / tr_n if tr_n else 0.0
                 print(f"  step {step:>6}/{total_txt}  height={data.qpos[2]:.3f}  "
-                      f"|v|={np.linalg.norm(data.qvel[:3]):.3f}")
+                      f"|v|={np.linalg.norm(data.qvel[:3]):.3f}  "
+                      f"cmd=({cmd[0]:+.2f},{cmd[1]:+.2f}) 实际均值=({_mvx:+.3f},{_mvy:+.3f})  "
+                      f"Δx={data.qpos[0] - tr_x0:+.3f}m")
     except KeyboardInterrupt:
         print("\n[interrupted]")
     finally:
@@ -1124,6 +1294,18 @@ def play(args) -> int:
     sim_s = (step + 1) * dt * decimation
     print(f"[pace] 仿真 {sim_s:.2f} s / 墙上 {wall_s:.2f} s = {sim_s / max(1e-9, wall_s):.2f}x 实时"
           + ("（目标 1.00x）" if realtime else "（--no-realtime，全速跑）"))
+
+    # --- 指令跟踪汇总（回放判据：指标好 ≠ 真的走了）---
+    if tr_n > 0:
+        mcmd, mvx, mvy = tr_cmd / tr_n, tr_vx / tr_n, tr_vy / tr_n
+        dx, dy = float(data.qpos[0]) - tr_x0, float(data.qpos[1]) - tr_y0
+        eff = f"，跟踪效率 = {mvx / mcmd[0] * 100:.0f}%" if abs(mcmd[0]) > 1e-6 else ""
+        print("[track] ===== 指令跟踪汇总 =====")
+        print(f"        指令均值 vx={mcmd[0]:+.3f} vy={mcmd[1]:+.3f} m/s")
+        print(f"        实际均值 vx={mvx:+.3f} vy={mvy:+.3f} m/s{eff}")
+        print(f"        净位移   Δx={dx:+.3f} m  Δy={dy:+.3f} m  （窗口 {max(0.0, sim_s - args.track_skip):.2f} s）")
+        print(f"        稳态跟踪误差 |cmd-actual|_xy = {np.hypot(mcmd[0] - mvx, mcmd[1] - mvy):.3f} m/s")
+        print("        ⇒ 指令 ≈ +0.8 而实际 ≈ 0 即「原地踏步」：策略问题，不是回放问题")
 
     if args.record and frames:
         out = Path(args.record)
@@ -1150,9 +1332,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dump-model", action="store_true", help="打印模型结构后退出")
     ap.add_argument("--onnx-info", action="store_true", help="打印 ONNX 策略 IO 后退出")
     ap.add_argument(
-        "--obs-mode", choices=["auto", "amp626", "legacy"], default="auto",
-        help="观测拼接方式：auto=按策略输入维度自动判定（626→amp626）；"
-             "amp626=本任务 Instinct-Amp-Walk（单帧 626 维）；legacy=InstinctLab parkour（8 帧堆叠）",
+        "--obs-mode", choices=["auto", *AMP_WALK_LAYOUTS, "legacy"], default="auto",
+        help="观测拼接方式：auto=按策略输入维度自动判定（626→amp626 / 378→amp378）；"
+             "amp626=v1~v8（单帧 626 维、527 条射线、扫描居中）；"
+             "amp378=v9（单帧 378 维、279 条射线、扫描中心前移 1.5 m）；"
+             "legacy=InstinctLab parkour（8 帧堆叠）",
     )
     ap.add_argument(
         "--joint-order", choices=["isaaclab", "as-is"], default="isaaclab",
@@ -1193,7 +1377,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--policy", help="策略文件 (.onnx / .pt)")
     ap.add_argument("--policy-type", choices=["auto", "onnx", "torch"], default="auto")
     ap.add_argument("--cmd", nargs=3, type=float, default=[0.0, 0.0, 0.0], metavar=("VX", "VY", "WZ"),
-                    help="速度指令 (默认 0.5 0.0 0.0)")
+                    help="速度指令 (默认 0.0 0.0 0.0；训练范围 vx[-1.0,1.2] vy[-0.5,0.5] wz[-0.8,0.8])")
     ap.add_argument("--duration", type=float, default=10.0,
                     help="回放时长（秒）；**0 = 无限运行直到关闭窗口**（键盘遥控时用）")
     ap.add_argument("--speed", type=float, default=1.0,
@@ -1210,6 +1394,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-checkered-floor", action="store_true",
                     help="不给地面补棋盘材质（保持 MJCF 原样；地面会是纯色）")
     ap.add_argument("--policy-hz", type=float, default=50.0, help="策略频率（InstinctLab=50Hz）")
+    ap.add_argument("--init-vx", type=float, default=0.0,
+                    help="P1 探针：复位后给根节点注入初始前向速度 (m/s，世界系 x)。"
+                         "用于区分'策略不会前进'与'策略不会从静止起步加速'")
+    ap.add_argument("--track-skip", type=float, default=0.0,
+                    help="跟踪统计跳过开头 N 秒（默认 0 = 全程）；配合 --init-vx 看稳态。")
     ap.add_argument("--history", type=int, default=8, help="观测历史帧数（对齐训练配置）")
     ap.add_argument("--action-scale", type=float, default=0.25,
                     help="回退用的全局 joint_pos 动作尺度（仅在执行器数 != 29 时生效）")

@@ -50,12 +50,77 @@ def build_actuator_block() -> str:
         lines.append(
             f"    <!-- {group} | effort_limit={effort:.0f} N·m | velocity_limit={vlim:.0f} rad/s -->"
         )
+        # ⭐ `forcerange` 对齐训练侧的 `effort_limit_sim`（MuJoCo 的 <position> 默认不限力矩）。
         lines.append(
             f'    <position name="{name.replace("_joint", "")}_act" joint="{name}" '
-            f'kp="{kp:.6f}" kv="{kd:.6f}" ctrllimited="false"/>'
+            f'kp="{kp:.6f}" kv="{kd:.6f}" ctrllimited="false" '
+            f'forcerange="{-effort:.6f} {effort:.6f}"/>'
         )
     lines.append("  </actuator>")
     return "\n".join(lines)
+
+
+#: 每个执行器组对应的**转子惯量**（与训练侧 `beyondmimic_g1_29dof_actuators` 的 `armature=` 逐组一致）
+ARMATURE_BY_GROUP: dict[str, float] = {
+    "legs_pitch_yaw": P.ARMATURE_7520_14,     # hip_pitch / hip_yaw
+    "legs_roll_knee": P.ARMATURE_7520_22,     # hip_roll / knee
+    "waist_yaw": P.ARMATURE_7520_14,
+    "feet": 2.0 * P.ARMATURE_5020,            # ankle_pitch / ankle_roll
+    "waist": 2.0 * P.ARMATURE_5020,           # waist_roll / waist_pitch
+    "arms_5020": P.ARMATURE_5020,             # shoulder_* / elbow / wrist_roll
+    "arms_4010": P.ARMATURE_4010,             # wrist_pitch / wrist_yaw
+}
+
+
+def armature_for(joint_name: str) -> float:
+    act = P.actuator_for(joint_name)
+    if act is None:
+        raise KeyError(joint_name)
+    group = act[4]
+    if group not in ARMATURE_BY_GROUP:
+        raise KeyError(f"组 {group!r} 没有对应 armature")
+    return ARMATURE_BY_GROUP[group]
+
+
+def patch_joint_physics(text: str) -> tuple[str, int]:
+    """把基础 MJCF 的 `<default><joint damping=0.5 armature=0.01 frictionloss=0.1>`
+    **逐关节覆盖**掉（per-joint 属性优先于 `<default>`）。
+
+    为什么要覆盖（对齐训练侧）：
+      * 训练侧 IsaacLab 的关节 **armature 是 per-joint**（`beyondmimic_g1_29dof_actuators`
+        的 `armature=`，即 0.0036 / 0.0102 / 0.0251 三档）。
+      * 训练侧**没有额外的关节阻尼/摩擦**：阻尼完全由 PD 的 `damping=`（即 kv）承担；
+        URDF 里也没有 `<dynamics>`（即 friction=armature=0），且执行器配置未设 `friction`。
+      * 而基础 MJCF 是**全局** `damping=0.5 / armature=0.01 / frictionloss=0.1`
+        ⇒ 回放里关节明显更“粘”、转子惯量也偏大 ⇒ **摆腿更费劲 ⇒ 步幅偏小、频率偏高**
+        （这正是“回放看着是小碎步”的可疑来源之一）。
+    """
+    patched = 0
+    missing: list[str] = []
+
+    def repl(m: re.Match) -> str:
+        nonlocal patched
+        name, rest = m.group(1), m.group(2)
+        if 'type="free"' in rest:      # 浮动基的 free joint 不做处理
+            return m.group(0)
+        try:
+            arm = armature_for(name)
+        except KeyError:
+            missing.append(name)
+            return m.group(0)
+        for key, val in (("armature", f"{arm:.9f}"), ("damping", "0"), ("frictionloss", "0")):
+            if re.search(rf'\b{key}="[^"]*"', rest):
+                rest = re.sub(rf'\b{key}="[^"]*"', f'{key}="{val}"', rest)
+            else:
+                rest = f'{rest} {key}="{val}"'
+        patched += 1
+        return f'<joint name="{name}"{rest}/>'
+
+    text = re.sub(r'<joint\s+name="([^"]+)"([^>]*?)/>', repl, text)
+    if missing:
+        print(f"[warn] {len(missing)} 个关节未匹配到执行器组（物理参数未改）: {missing[:6]}", file=sys.stderr)
+    print(f"[joint] 逐关节覆盖 armature/damping/frictionloss：{patched} 个")
+    return text, patched
 
 
 def build_keyframe_block() -> str:
@@ -127,6 +192,9 @@ def generate(base: Path, out: Path) -> Path:
     # 2) 模型名加后缀，避免与原始模型混淆
     text = re.sub(r'<mujoco model="([^"]*)"', r'<mujoco model="\1_play"', text, count=1)
 
+    # 2.5) ⭐ 逐关节覆盖 armature/damping/frictionloss（对齐训练侧，见 patch_joint_physics）
+    text, _n_joint = patch_joint_physics(text)
+
     # 3) 注入地面 + 光照（裸 MJCF 无场景，不加会穿地掉落）
     text, injected = inject_ground(text, base)
     if injected:
@@ -194,6 +262,49 @@ def verify(path: Path) -> bool:
         else:
             print("  ❌ kv 与期望不符（可能 MuJoCo 的 <position> 不支持 kv）")
             ok = False
+
+        # ⭐ 力矩上限（对齐训练侧 effort_limit_sim）
+        limited = int(np.sum(m.actuator_forcelimited.astype(bool)))
+        exp_eff = np.array([P.actuator_for(n)[2] for n in names])
+        fr = m.actuator_forcerange
+        if limited == m.nu and np.allclose(fr[:, 1], exp_eff, rtol=1e-6):
+            print(f"  ✅ forcerange 写入正确（{limited}/{m.nu}，上限 {exp_eff.min():.0f}~{exp_eff.max():.0f} N·m）")
+        else:
+            print(f"  ❌ forcerange 不对：limited={limited}/{m.nu}")
+            ok = False
+
+    # ⭐ 逐关节 armature / damping / frictionloss（对齐训练侧：per-joint armature、无额外阻尼/摩擦）
+    bad_arm, bad_dmp, bad_fric = [], [], []
+    for i in range(m.njnt):
+        jn = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, i)
+        if jn is None or int(m.jnt_type[i]) != mujoco.mjtJoint.mjJNT_HINGE:
+            continue
+        dof = int(m.jnt_dofadr[i])
+        try:
+            exp_arm = armature_for(jn)
+        except KeyError:
+            continue
+        if abs(float(m.dof_armature[dof]) - exp_arm) > 1e-9:
+            bad_arm.append((jn, float(m.dof_armature[dof]), exp_arm))
+        if abs(float(m.dof_damping[dof])) > 1e-12:
+            bad_dmp.append((jn, float(m.dof_damping[dof])))
+        if abs(float(m.dof_frictionloss[dof])) > 1e-12:
+            bad_fric.append((jn, float(m.dof_frictionloss[dof])))
+    if bad_arm:
+        print(f"  ❌ armature 不符（{len(bad_arm)} 个），例：{bad_arm[:3]}")
+        ok = False
+    else:
+        print("  ✅ 逐关节 armature 与训练侧一致")
+    if bad_dmp:
+        print(f"  ❌ 仍有额外关节阻尼（{len(bad_dmp)} 个），例：{bad_dmp[:3]}")
+        ok = False
+    else:
+        print("  ✅ 无额外关节阻尼（阻尼全部由 PD 的 kv 承担）")
+    if bad_fric:
+        print(f"  ❌ 仍有 frictionloss（{len(bad_fric)} 个），例：{bad_fric[:3]}")
+        ok = False
+    else:
+        print("  ✅ 无 frictionloss")
 
     if m.nkey == 1:
         print(f"  ✅ keyframe '{mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_KEY, 0)}'")

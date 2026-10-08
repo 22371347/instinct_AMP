@@ -1,8 +1,11 @@
 """`instinctlab/utils/mirror.py` 的单测（只需 torch，CPU 即可；不用起 Isaac Sim）。
 
-在云端跑：
+跑法（**云端**优先，本地有 torch 也能跑）：
     /opt/conda/envs/isaaclab/bin/python /root/test_mirror_ops.py
-本地若无 torch 则在云端跑即可。
+    python instinct/tools/test_mirror_ops.py          # 本地（自动定位仓库里的 mirror.py）
+    LLP_MIRROR_PY=/path/to/mirror.py python ...       # 手动指定被测文件
+
+⭐ 覆盖**两种布局**：626（v1~v8，扫描居中）与 378（v9，279 条射线、中心前移 1.5 m）。
 
 ⚠️ 这里的 `JOINTS` 用 **npz 序**（左腿→右腿→腰→左臂→右臂）—— 因为它是
 AMP_mjlab 核对报告里逐位确认过的顺序，方便对照。
@@ -14,7 +17,9 @@ AMP_mjlab 核对报告里逐位确认过的顺序，方便对照。
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+from pathlib import Path
 
 import torch
 
@@ -23,9 +28,28 @@ import torch
 #    拉进来 ⇒ 非交互环境里会**卡在 EULA 交互提示**
 #    （实测现象：输出全空、进程一直挂着、`Do you accept the EULA? (Yes/No):`）。
 #    这里按**文件路径**直接加载，保持这是纯 CPU 单测。
-_MIRROR_PY = "/root/gpufree-data/instinct_xu/source/instinctlab/instinctlab/utils/mirror.py"
+#: 被测文件：优先环境变量，其次**本地仓库路径**，最后云端固定路径（同一个文件）。
+_MIRROR_CANDIDATES = [
+    os.environ.get("LLP_MIRROR_PY", ""),
+    str(Path(__file__).resolve().parent.parent.parent
+        / "instinct_xu/source/instinctlab/instinctlab/utils/mirror.py"),
+    "/root/gpufree-data/instinct_xu/source/instinctlab/instinctlab/utils/mirror.py",
+]
+
+
+def _readable(p: str) -> bool:
+    """⚠️ `Path.is_file()` 在没权限的路径上会抛 PermissionError（不是返回 False）。"""
+    try:
+        return bool(p) and Path(p).is_file() and os.access(p, os.R_OK)
+    except OSError:
+        return False
+
+
+_MIRROR_PY = next((p for p in _MIRROR_CANDIDATES if _readable(p)), "")
+assert _MIRROR_PY, f"找不到 mirror.py，已尝试：{_MIRROR_CANDIDATES}"
+print(f"被测文件：{_MIRROR_PY}")
 _spec = importlib.util.spec_from_file_location("llp_mirror_under_test", _MIRROR_PY)
-assert _spec is not None and _spec.loader is not None, f"找不到 {_MIRROR_PY}"
+assert _spec is not None and _spec.loader is not None, f"无法加载 {_MIRROR_PY}"
 mirror_mod = importlib.util.module_from_spec(_spec)
 # ⚠️ 必须先注册进 `sys.modules`：`@dataclass` 内部会做
 #    `sys.modules.get(cls.__module__).__dict__`，不注册就报
@@ -182,6 +206,87 @@ if torch.cuda.is_available():
           spec.mirror_obs(obsd).device == dev and spec.mirror_joints(qd).device == dev)
 else:
     print("  (无 CUDA，跳过；⚠️ 训练在 CUDA 上跑，请勿只跑 CPU 就认为安全)")
+
+# ---------------------------------------------------------------------------
+# [8] ⭐ 布局参数化：626（v1~v8）与 378（v9，扫描中心前移 1.5 m）都要支持
+#     回归背景：v9 首跑在第一次 PPO.update() 崩在
+#     `ValueError: policy obs 最后一维应为 626，收到 378`（mirror.py 写死了布局）。
+# ---------------------------------------------------------------------------
+POLICY_FORMAT_626 = {
+    "height_scan": (527,), "velocity_command": (3,), "base_lin_vel": (3,),
+    "projected_gravity": (3,), "base_ang_vel": (3,),
+    "joint_pos_rel": (29,), "joint_vel": (29,), "last_action": (29,),
+}
+POLICY_FORMAT_378 = dict(POLICY_FORMAT_626, height_scan=(279,))
+
+print("\n[8] ⭐ from_obs_format：626（居中）与 378（前移 1.5 m）都要支持")
+for tag, fmt, dim, ny, nx, vs in (("626", POLICY_FORMAT_626, 626, 17, 31, 527),
+                                  ("378", POLICY_FORMAT_378, 378, 9, 31, 279)):
+    s = MirrorSpec.from_obs_format(JOINTS, fmt)
+    check(f"{tag}: obs_dim = {dim}", s.obs_dim == dim, f"got {s.obs_dim}")
+    check(f"{tag}: 扫描布局 = {ny}x{nx}（{vs} 条）", (s.scan_ny, s.scan_nx) == (ny, nx),
+          f"got {s.scan_ny}x{s.scan_nx}")
+    check(f"{tag}: 分段共 {len(fmt)} 项、首项 = height_scan",
+          len(s.segments) == len(fmt) and s.segments[0][0] == "height_scan")
+    check(f"{tag}: cmd 段起始偏移 = {vs}", s.segments[1][1].start == vs,
+          f"got {s.segments[1][1].start}")
+
+    # --- 扫描镜像：侧向翻转、前向不动（前移量不改变镜像规则）---
+    sc = torch.arange(vs, dtype=torch.float32).reshape(ny, nx)
+    m = s.mirror_scan(sc.reshape(-1)).reshape(ny, nx)
+    check(f"{tag}: scan 侧向翻转 out[iy,ix] == in[{ny}-1-iy,ix]",
+          bool(torch.equal(m, sc.flip(dims=(0,)))))
+    check(f"{tag}: scan 前向（列）不动", bool(torch.equal(m[:, 0], sc.flip(dims=(0,))[:, 0])))
+    check(f"{tag}: scan 镜像对合",
+          bool(torch.allclose(s.mirror_scan(s.mirror_scan(sc.reshape(-1))), sc.reshape(-1))))
+
+    # --- 整段观测：对合性 + 关键段符号 ---
+    obs_ = torch.randn(4, dim)
+    check(f"{tag}: M_obs(M_obs(o)) == o",
+          bool(torch.allclose(s.mirror_obs(s.mirror_obs(obs_)), obs_, atol=1e-6)),
+          f"max|Δ| = {(s.mirror_obs(s.mirror_obs(obs_)) - obs_).abs().max():.1e}")
+    o_ = torch.zeros(dim)
+    o_[vs + 0], o_[vs + 1], o_[vs + 2] = 1.0, 2.0, 3.0
+    mo_ = s.mirror_obs(o_)
+    check(f"{tag}: cmd (vx,vy,wz) → (vx,−vy,−wz)",
+          (float(mo_[vs]), float(mo_[vs + 1]), float(mo_[vs + 2])) == (1.0, -2.0, -3.0),
+          f"得到 {(float(mo_[vs]), float(mo_[vs + 1]), float(mo_[vs + 2]))}")
+    o_d = torch.zeros(dim)
+    o_d[vs + 12:vs + 41] = q_def                      # joint_pos_rel
+    o_d[vs + 70:vs + 99] = q_def                      # last_action
+    mo_d = s.mirror_obs(o_d)
+    check(f"{tag}: joint_pos_rel / last_action 里的默认姿态是不动点",
+          bool(torch.allclose(mo_d[vs + 12:vs + 41], q_def, atol=1e-6)
+               and torch.allclose(mo_d[vs + 70:vs + 99], q_def, atol=1e-6)))
+
+    # --- 错维度必须 fail-fast（而不是静默错镜像）---
+    try:
+        s.mirror_obs(torch.randn(4, dim + 1))
+        check(f"{tag}: 整段维度不符时 fail-fast", False, "没有抛异常")
+    except ValueError as e:
+        check(f"{tag}: 整段维度不符时 fail-fast", "最后一维" in str(e), str(e)[:60])
+
+print("\n[9] from_obs_format 的 fail-fast（宁可启动报错，也不要静默错镜像）")
+try:
+    MirrorSpec.from_obs_format(JOINTS, {"height_scan": (527,), "unknown_term": (3,)})
+    check("未登记项名 → KeyError", False, "没有抛异常")
+except KeyError as e:
+    check("未登记项名 → KeyError", "不认识" in str(e), str(e)[:60])
+try:
+    MirrorSpec.from_obs_format(JOINTS, {"height_scan": (300,)})
+    check("未登记的扫描条数 → KeyError", False, "没有抛异常")
+except KeyError as e:
+    check("未登记的扫描条数 → KeyError", "SCAN_LAYOUTS" in str(e), str(e)[:60])
+try:
+    MirrorSpec.from_obs_format(JOINTS, {"joint_pos_rel": (29,)})
+    check("缺 height_scan → KeyError", False, "没有抛异常")
+except KeyError as e:
+    check("缺 height_scan → KeyError", "找不到" in str(e), str(e)[:60])
+# 兼容入口：from_joint_names 必须仍给出旧 626 布局（v1~v8 的老代码不受影响）
+s_legacy = MirrorSpec.from_joint_names(JOINTS)
+check("from_joint_names 兼容入口 = 626 / 17x31",
+      (s_legacy.obs_dim, s_legacy.scan_ny, s_legacy.scan_nx) == (626, 17, 31),
+      f"got {s_legacy.obs_dim}/{s_legacy.scan_ny}x{s_legacy.scan_nx}")
 
 print("\n" + "=" * 74)
 print(f"结果：PASS {PASS} / FAIL {FAIL}")

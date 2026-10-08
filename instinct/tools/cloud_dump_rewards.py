@@ -1,93 +1,110 @@
 #!/usr/bin/env python3
-"""把 TB events 里 **全部** `Episode_Reward/*` 的实测数值打出来（在云端跑）。
+"""打印某个 run 实际落盘的 `params/env.yaml` 生效奖励权重表（name → weight）。
 
-用途：核对「某奖励项是否真的作用在奖励函数内 / 权重调整后实际贡献多少」。
-只打印，不做任何判断。
+为什么需要它
+------------
+cfg 源码里有**继承 + `__post_init__` 覆盖**，肉眼看源码无法确定"训练时到底生效
+了多少项、权重多少"。而 `params/env.yaml` 是 Hydra 在开跑那一刻 dump 的**快照**，
+是唯一的权威事实来源。
 
-用法（云端）：
-  python cloud_dump_rewards.py --dirs <run1> [<run2> ...] [--tail-frac 0.1]
+用法（云端，本地也行）：
+    python3 /root/cloud_dump_rewards.py <run_dir 或它的父目录> [过滤子串]
 
-- 多目录会按 step 合并（用于「原始 run + 续训 run」拼接完整曲线）。
-- 输出列：term / 末值 / 末段均值 / 全程最大 / 全程最小 / 数据点数
-  「末段均值」= 最后 `--tail-frac` 比例的数据点均值，抗单点噪声。
-- 数值是 **normalize 后的 per-second 值**（与训练日志打印一致）。
+    # 例：只看最新的 T0 基座
+    python3 /root/cloud_dump_rewards.py \
+        /root/gpufree-data/instinct_xu/logs/instinct_rl/g1_unified_omni_loco
+
+输出：按 |weight| 降序排列，`×` 标记已关闭项（weight == 0）。
 """
-import argparse
+
+from __future__ import annotations
+
 import glob
 import os
-import shutil
-import tempfile
+import sys
 
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-
-
-def load_tags(dirs):
-    """返回 {tag: [(step, value), ...]}，多目录按 step 合并排序。"""
-    series = {}
-    for d in dirs:
-        files = sorted(glob.glob(os.path.join(d, "events.out.tfevents.*")))
-        if not files:
-            print(f"[warn] 目录内没有 events 文件: {d}")
-            continue
-        # 云端 events 可能在被写入，先拷到 /tmp 再读，避免读到半截。
-        tmp = tempfile.mkdtemp(prefix="dumprew_")
-        local = []
-        for f in files:
-            dst = os.path.join(tmp, os.path.basename(f))
-            shutil.copy2(f, dst)
-            local.append(dst)
-        for f in local:
-            acc = EventAccumulator(f, size_guidance={"scalars": 0})
-            acc.Reload()
-            for tag in acc.Tags().get("scalars", []):
-                pts = [(e.step, e.value) for e in acc.Scalars(tag)]
-                series.setdefault(tag, []).extend(pts)
-        shutil.rmtree(tmp, ignore_errors=True)
-    for tag in series:
-        series[tag].sort(key=lambda p: p[0])
-    return series
+try:
+    import yaml
+except Exception as exc:  # pragma: no cover
+    print(f"[FATAL] 需要 PyYAML：{exc}")
+    sys.exit(3)
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--dirs", nargs="+", required=True, help="run 目录（可多个，按 step 合并）")
-    ap.add_argument("--tail-frac", type=float, default=0.1, help="末段比例，默认 0.1")
-    ap.add_argument("--prefix", default="Episode_Reward/", help="只看以此开头的 tag")
-    ap.add_argument("--all", action="store_true", help="打印全部 tag，而不只是 Episode_Reward/*")
-    args = ap.parse_args()
+def find_env_yaml(root: str, filt: str = "") -> list[str]:
+    """在 root 下递归找 params/env.yaml；filt 非空时按子串过滤。"""
+    hits = sorted(glob.glob(os.path.join(root, "**", "params", "env.yaml"), recursive=True))
+    if filt:
+        hits = [h for h in hits if filt in h]
+    return hits
 
-    series = load_tags(args.dirs)
-    if not series:
-        print("没有读到任何 scalar tag")
-        return
 
-    tags = sorted(t for t in series if args.all or t.startswith(args.prefix))
-    print(f"目录数 = {len(args.dirs)}   匹配 tag 数 = {len(tags)}")
-    print(f"{'tag':<42}{'末值':>12}{'末段均值':>12}{'全程max':>12}{'全程min':>12}{'点数':>7}")
-    print("-" * 97)
-    rows = []
-    for tag in tags:
-        pts = series[tag]
-        if not pts:
-            continue
-        vals = [v for _, v in pts]
-        n_tail = max(1, int(len(vals) * args.tail_frac))
-        tail = vals[-n_tail:]
-        rows.append(
-            (
-                tag,
-                vals[-1],
-                sum(tail) / len(tail),
-                max(vals),
-                min(vals),
-                len(vals),
-            )
-        )
-    # 按「末段均值的绝对值」从大到小排，方便看谁在起作用
-    for tag, last, tailavg, mx, mn, n in sorted(rows, key=lambda r: -abs(r[2])):
-        name = tag.replace(args.prefix, "")
-        print(f"{name:<42}{last:>12.5f}{tailavg:>12.5f}{mx:>12.5f}{mn:>12.5f}{n:>7}")
+def load_env_yaml(path: str) -> dict:
+    """读 OmegaConf dump 出来的 env.yaml。
+
+    ⚠️ 它是 `OmegaConf.save()` 的产物，含 `!!python/tuple`（甚至
+    `!!python/object:*`）标签 —— `yaml.safe_load` 会直接报
+    `could not determine a constructor for the tag '...python/tuple'`。
+    这里先注册 tuple 构造器安全加载；若还有别的标签，退回 `unsafe_load`
+    （文件是训练进程自己写的，可信）。
+    """
+
+    class _L(yaml.SafeLoader):
+        pass
+
+    _L.add_constructor(
+        "tag:yaml.org,2002:python/tuple",
+        lambda loader, node: tuple(loader.construct_sequence(node, deep=True)),
+    )
+    with open(path) as f:
+        raw = f.read()
+    try:
+        return yaml.load(raw, Loader=_L) or {}
+    except yaml.constructor.ConstructorError:
+        return yaml.unsafe_load(raw) or {}
+
+
+def main() -> int:
+    root = sys.argv[1] if len(sys.argv) > 1 else "."
+    filt = sys.argv[2] if len(sys.argv) > 2 else ""
+
+    hits = find_env_yaml(root, filt)
+    if not hits:
+        print(f"[FATAL] 在 {root} 下找不到 params/env.yaml（过滤={filt!r}）")
+        print("  提示：确认 run 目录名，或用 ls -dt <root>/*/ 看一眼。")
+        return 2
+
+    # 多个命中时选最新的（按 mtime）
+    p = max(hits, key=lambda h: os.path.getmtime(h))
+    if len(hits) > 1:
+        print(f"[note] 命中 {len(hits)} 份 env.yaml，取最新的一份")
+    print(f"# env.yaml = {p}")
+    print(f"# mtime    = {__import__('datetime').datetime.fromtimestamp(os.path.getmtime(p)):%Y-%m-%d %H:%M:%S}")
+
+    with open(p) as f:
+        d = load_env_yaml(p)
+    rew = d.get("rewards", {}) or {}
+    if not rew:
+        print("[FATAL] env.yaml 里没有 `rewards` 段")
+        return 2
+
+    rows: list[tuple[str, object]] = []
+    for k, v in rew.items():
+        w = v.get("weight") if isinstance(v, dict) else None
+        rows.append((str(k), w))
+
+    def key(item: tuple[str, object]) -> tuple[float, str]:
+        w = item[1]
+        return (-(abs(w) if isinstance(w, (int, float)) else 0.0), item[0])
+
+    rows.sort(key=key)
+    nz = [r for r in rows if isinstance(r[1], (int, float)) and r[1] != 0.0]
+    print(f"共 {len(rows)} 项，其中非零 {len(nz)} 项：")
+    for k, w in rows:
+        mark = "  " if isinstance(w, (int, float)) and w != 0.0 else "× "
+        ws = f"{w:+.6g}" if isinstance(w, (int, float)) else str(w)
+        print(f"  {mark}{k:34s} {ws}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

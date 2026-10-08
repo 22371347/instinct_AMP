@@ -64,6 +64,14 @@ class LocoTrackingMonitorTerm(MonitorTerm):
                         command[:, axis_index] < edges[bin_index + 1]
                     )
                 log[f"command_bins/{axis}_{bin_name}_fraction"] = mask.float().mean()
+                # ⭐ 2026-10-06：**实际速度均值**。
+                #    只报 rmse 会被"跨档聚合平均"骗过去（本项目已三次误判）：
+                #    聚合 vxy_rmse≈0.39 看起来还行，实际是高速档（24% 样本）
+                #    跑了 0.01 m/s、误差 0.66 被低速档稀释掉了。必须能直接读出
+                #    "给了 0.8 实际跑多少"。
+                log[f"command_bins/{axis}_{bin_name}_vel_mean"] = self._mean(
+                    velocity_yaw[mask, axis_index]
+                )
                 log[f"command_bins/{axis}_{bin_name}_vxy_rmse"] = torch.sqrt(
                     self._mean(torch.sum(error[mask].square(), dim=1))
                 )

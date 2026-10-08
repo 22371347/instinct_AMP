@@ -168,6 +168,23 @@ class InstinctRlVecEnvWrapper(VecEnv):
         # move extra observations to the extras dict
 
         extras["observations"] = obs_pack
+        # ⭐ 真值旁路：算法层只拿得到**观测**，而 `disable_style_on_stand` 等诊断需要
+        # **真值**指令/上一步动作。实测“从 policy 观测里按切片反推指令”**偏移量是错的**
+        # （`cmd_slice_speed ≈ 1.72` 而按分档设计应 ≈0.26）⇒ 在这里注入真值，
+        # 彻底不依赖切片。⚠️ 诊断旁路，绝不能影响训练（异常只记录不抛）。
+        try:
+            _cm = getattr(self.unwrapped, "command_manager", None)
+            _am = getattr(self.unwrapped, "action_manager", None)
+            extras["amp_debug"] = {
+                "command": (
+                    _cm.get_command("base_velocity").detach()
+                    if _cm is not None and "base_velocity" in _cm.active_terms
+                    else None
+                ),
+                "prev_action": _am.action.detach() if _am is not None else None,
+            }
+        except Exception as _exc:  # pragma: no cover - 诊断路径
+            extras["amp_debug"] = {"command": None, "prev_action": None, "error": repr(_exc)}
         # move time out information to the extras dict
         # this is only needed for infinite horizon tasks
         if not self.unwrapped.cfg.is_finite_horizon:

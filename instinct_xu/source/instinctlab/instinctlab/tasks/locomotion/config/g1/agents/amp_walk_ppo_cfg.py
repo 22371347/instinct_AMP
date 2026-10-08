@@ -91,12 +91,52 @@ class AmpWalkAlgorithmCfg(AlgorithmCfg):
     # --- 风格奖励的函数形式（v8 起：LLP 论文的 r = -log(1 - quad(d))）-----------
     # ⚠️ 同样**必须在算法 @configclass 里显式声明**，否则 `to_dict()` 不会带上它们。
     #: "raw"（默认，与父类一致）| "log_quad"（r = -log(1-D)，D = clamp(1-(d-1)^2/4, 0)）
-    #: ⚠️ 用 "log_quad" 时**必须**把 `discriminator_reward_type` 设为 "wasserstein"
+    #: | "bounded_quad"（⭐ V29：**对齐 AMP_mjlab** 的 `clamp(1 - k(d-1)^2, 0, 1)`，
+    #:   有界、且 d<=-1 时恰为 0 ⇒ 从**形状**上消除“奖励离群”这个失效模式）
+    #: ⚠️ 用 "log_quad" / "bounded_quad" 时**必须**把 `discriminator_reward_type` 设为 "wasserstein"
     #:    （那是父类里唯一**原样返回 d** 的分支）。二者不匹配会 fail-fast。
     amp_reward_form = "raw"
+    #: ⭐ V29（对齐 AMP_mjlab 的数据管线）：`True` ⇒ 判别器的**参考批独立随机重采 (T,B)**，
+    #: 不再使用“与策略同相位的那一步”的参考状态（mjlab 的 `AMPLoader` 是 clip 轮换 + 帧内随机）。
+    #: ⚠️ 必须在本 @configclass 里显式声明，否则 `to_dict()` 会静默丢掉它。
+    amp_expert_independent_sampling = False
+
+    # ---- ⭐⭐ V30：判别器“AMP_mjlab 原始配方”（2026-10-05）------------------------
+    #: `True` ⇒ GP **只在 expert/reference 侧**求梯度（mjlab：
+    #: `compute_grad_pen(*sample_amp_expert, lambda_=10)`）。旧口径（False）= actor+expert 合并。
+    discriminator_gp_expert_only = False
+    #: 判别器优化器的 **trunk** weight decay（mjlab = 1e-3）。⚠️ 优化器级，不是 loss 项。
+    discriminator_optimizer_trunk_weight_decay = 0.0
+    #: 判别器优化器的 **head（最后一层）** weight decay（mjlab = 1e-2）。
+    discriminator_optimizer_head_weight_decay = 0.0
+    #: 专家批来自**离线运动数据集**（mjlab `AMPLoader` 口径）的文件路径；
+    #: 形如 `/root/amp_expert_states.pt`（键 `states_pair`，形状 `(N, 390)`）。
+    #: `None` = 用活体影子机器人（旧行为）。
+    amp_expert_buffer_path = None
     #: `-log(1-D)` 在 d=1 处会 +inf（D 恰好=1，而 MSELoss 的参考侧目标就是 +1）
     #: ⇒ 把 D 夹到 1-eps，奖励上界 = -log(eps) ≈ 13.8。
     amp_reward_eps = 1.0e-6
+    #: ⭐ `quad` 曲率 `D = clamp(1 − k·(d−1)², 0, 1−eps)`（默认 0.25 = 历史值）。
+    #: ⚠️ 下端 clamp 位置 = `1 − sqrt(1/k)`：k=0.25 ⇒ `d ≤ −1.0` 起进死区；
+    #:    k=0.125 ⇒ `d ≤ −1.83`。V19b 用 0.125（V19a 实测 d 展宽后有 5% 越过 −1.0）。
+    amp_quad_k = 0.25
+
+    # --- 探索噪声的**上限**（v9 起）：防 σ 无界膨胀 -------------------------------
+    #: `None` = 不钳上限（v1~v8 的既有行为）。给数值时，桥接层会在 `PPO.update`
+    #: 之后额外调一次 `actor_critic.clip_std(min=clip_min_std, max=clip_max_std)`。
+    #: ⚠️ 动机：`instinct_rl` 只钳 σ **下限**（`ppo.py:216` 仅 `min=`），而
+    #:    `entropy_coef` 会把 σ 一路推高 —— v8 实测 σ 涨到 **1.04 rad**（±60°），
+    #:    在 `action_scale=1.0` 下就是直接加在关节目标上的噪声 ⇒ 训练发散。
+    #: ⚠️ 同样必须显式声明，否则 `to_dict()` 不会带上它。
+    clip_max_std = None
+    #: ⭐ σ 上限的**退火周期**（V26 新增；单位 = 本 run 的 `update()` 次数）。
+    #: `None` = 不退火（σ 上限恒为 `clip_max_std`，即 v11~v24 的行为）。
+    #: 给 N 时：上限从「**本 run 第一次 update 时的 σ**」线性降到 `clip_max_std`，
+    #: 用 N 次 update 走完，之后维持 `clip_max_std`。
+    #: 动机（V26）：从 σ≈0.57 的 ckpt 热启动时，一次性硬夹到 0.20 会让奖励分布
+    #: **整体上移 ~4/步**（噪声税 −5.26 → −0.58）⇒ value function 突跳 ⇒ 用退火摊平。
+    #: ⚠️ 同 `clip_max_std`：必须显式声明，否则 `to_dict()` 不会带上它（静默失效）。
+    clip_max_std_schedule = None
     # ⚠️ 必须显式设 `[1.0]`：`PPO.__init__` 收到**空列表**时会把系数退化成标量 1.0，
     # 而 `process_env_step` 里是
     # `coef * v * self.auxiliary_reward_per_env_reward_coefs` —— 标量只能靠广播侥幸对上，
@@ -124,6 +164,24 @@ class AmpWalkAlgorithmCfg(AlgorithmCfg):
     discriminator_optimizer_kwargs = {"lr": 1.0e-4, "betas": [0.9, 0.999]}
     discriminator_weight_decay_coef = 3.0e-4
     discriminator_logit_weight_decay_coef = 0.04
+
+    # --- ⭐ 判别器输入白化（V22，2026-10-03）：AMP_mjlab `amp_normalizer` 的等价物 ----
+    #: 真正开启白化还需在 `discriminator_kwargs` 里接上 normalizer，例如：
+    #:     {"hidden_sizes": [...], "nonlinearity": "ReLU",
+    #:      "normalizer_class_name": "EmpiricalNormalization",
+    #:      "normalizer_kwargs": {"eps": 0.01, "until": None}}
+    #: 这里默认 **不开**（= V1~V21 的既有行为，零回退风险）。
+    #: `amp_normalizer_expert_only=True` = 统计量（mean/var）**只由 expert/reference 侧**累积。
+    #: ⚠️ 必须为 `True`：`Discriminator.forward` 默认会顺手更新统计量，而 rollout 期每个
+    #:    env step 都会拿**策略数据**前向一次算风格奖励（`wasabi.py: compute_auxiliary_reward`）
+    #:    ⇒ 不关掉的话统计量会被策略分布带偏（实测漂移 1.51），白化等于没做。
+    amp_normalizer_expert_only = True
+    #: ⭐ GP（Lipschitz 惩罚）在哪个空间求 `‖∂d/∂x‖`：`"raw"`（历史行为）| `"normalized"`。
+    #: ⚠️ **白化开启时必须用 `"normalized"`**：原始空间里 `∂d/∂x = (∂d/∂x̃)/(σ+eps)`，
+    #:    单维放大上限 = `1/eps`；实测 GP 项被放大 311×（未训）~1.2e6×（饱和）
+    #:    ⇒ 判别器损失被完全支配。归一化空间下 GP 项与"无白化旧配置"同量级
+    #:    （1.0×~3.2×）⇒ `discriminator_gradient_penalty_coef` 可沿用。
+    amp_grad_pen_space = "raw"
 
     # --- AMP_mjlab 的 `min_normalized_std = [0.05]*29` 的**等价物** -------------
     # instinct_rl 的 `ActorCritic.std` 是绝对标准差（`init_noise_std * ones`），

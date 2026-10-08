@@ -29,7 +29,11 @@ for L in $(ls -t /root/train_amp_walk_*.log 2>/dev/null | head -"$N"); do
   T="${T#train_amp_walk_}"
   # 只留 "520/5000" 这种短形式 —— 全句 "Learning iteration 520/5000" 会把表头挤歪
   IT="$(grep -oE 'Learning iteration [0-9]+/[0-9]+' "$L" 2>/dev/null | tail -1 | sed 's/Learning iteration //')"
-  D="$(ls -dt "$LOGROOT"/*"$T"/ 2>/dev/null | head -1)"
+  # ⚠️ run 目录名 = `<启训时间戳>_<cfg.run_name>_<--run_name 的 tag>_from<fork 时间戳>`
+  #    ⇒ tag 在**中间**，所以必须用 *包含* 匹配（`*"$T"*/`），
+  #      旧写法 `*"$T"/`（后缀匹配）会自动失败 ⇒ 明明在训练却显示 `<无对应run目录> / ckpt×0>`
+  #      （2026-10-06 实测：v33 各臂全中这一条）。
+  D="$(ls -dt "$LOGROOT"/*"$T"*/ 2>/dev/null | head -1)"
   D="${D%/}"
   if [[ -n "$D" ]]; then
     C="$(ls "$D"/model_*.pt 2>/dev/null | sed 's#.*/##' | sort -t_ -k2 -n | tail -1)"
