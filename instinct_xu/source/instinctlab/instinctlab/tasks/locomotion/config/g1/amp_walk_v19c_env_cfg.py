@@ -1,34 +1,42 @@
-"""V19c 的环境侧：**V19b 全部保留**，只改三处奖励（都是"把漏洞堵上 / 把过贵的罚降下来"）。
+"""V19c：**V19b 全部保留，只改三处奖励**（加"实测在动"门控 / 降 `action_rate_l2` / 提高站立姿态罚；2026-10-03）。
+起点 = **热启动 V19b 的最新 checkpoint**（保留判别器 ⇒ AMP 口径与 V19b 逐字相同），只改激励结构、不重学。
 
-起点：**热启动 V19b 的最新 checkpoint**（保留判别器 —— AMP 口径与 V19b 逐字相同）
-⇒ 目的是"保留已经学会的抬脚步态，只改激励结构"，而不是从头再学。
+## ⚠️ 本层对**今天**仍有影响的部分
 
-| # | 项 | V19b | **V19c** | 为什么 |
-|---|---|---|---|---|
-| ① | `feet_air_time` 的**实测运动门控** | 无（只有命令门控） | **`motion_threshold=0.15`、`motion_ang_scale=0.5`** | 命令门控只挡住"指令≈0"；挡不住"指令 0.6 m/s 但不前进、原地左右脚交替抬放刷单支撑分红"（用户实测观察到静止/慢速时也在原地交替站） |
-| ② | `action_rate_l2` | −0.10 | **−0.06**（回到 V17 值） | 用户看 MuJoCo 判断"动作幅度/频率在正常范围内" ⇒ 该项在过度收费：raw 从 V18 的 5.6 升到 V19b 的 ~15 ⇒ 罚额 −1.5/步，占正奖励 Σ≈2.4 的 **60%** |
-| ③ | `track_default_pose_on_stand` | −0.3 | **−0.5** | 该术语**只在指令接近 0 时生效**（`active = exp(−cmd_speed/0.25)`），内容 = `4·mean|q−q_def| + 0.5·mean|dq|` ⇒ 加大它能直接抑制"站立时抬脚/晃腿" |
+* **无 —— 表中三项今天均已失效**（① 被 T1a2、② 被 T1a 白名单、③ 被 V23 覆盖）。
+* 仍"活着"的是**结论**：③ 所在的那类"**只在低速段生效的项，其价格会被'该省的动作'过度征收**"
+  → `docs/amp_walk/EXPERIMENTS.md` §B1。
 
-## ① 门控细节（为什么要用"实测"速度）
+## 本层改动一览
 
-```
-gate_cmd    = 1[ ‖v_cmd,xy‖ > 0.1 ]                      # 原有
-gate_motion = 1[ ‖v_actual,yaw‖_xy + 0.5·|ω_z,actual| > 0.15 ]   # ⭐ 新增
-reward = score · 1[恰好单支撑] · gate_cmd · gate_motion
-```
-`motion_ang_scale=0.5` 把**原地转身**也算"在动"（转身本来就要迈步，不该被掐掉）；
-新探针 `Step/air_time_motion_gate_off_frac` 直接告诉你有多少步被这道门关掉。
-`motion_threshold = 0` 可完全关闭（= V19b 行为）。
+| # | 项 | V19b → **V19c** | 现状（今天实际生效）|
+|---|---|---|---|
+| ① | `feet_air_time` 的**实测运动门控** | 无（只有命令门控）→ **`motion_threshold=0.15` / `motion_ang_scale=0.5`**（转原地转身也算"在动"）| ❌ **已被 T1a2 覆盖** → 换回 `feet_air_time_positive_biped`（`+1` / `threshold=0.5`），**无任何门控** |
+| ② | `action_rate_l2` | −0.10 → **−0.06**（回 V17 值）| ❌ **已被 T1a 白名单（抄 T0 值）覆盖** → **−0.05** |
+| ③ | `track_default_pose_on_stand` | −0.3 → **−0.5** | ❌ **已被 V23 覆盖** → **−0.8** + 逐关节权重（knee/ankle 2.0、`vel_scale 0.8`…）|
+| ④ | 起点 | 热启动 V19b 最新 ckpt | 已不适用（今天由 T1l 的起点决定）|
 
-## ② 代价：`action_rate_l2` 降权会削弱"防抖"
+## 推理与判读（已归档，勿在本文件重复）
 
-V18 当年是**因为 V17 抖动变大**才把该项从 −0.06 提到 −0.10 的。本轮按用户实测判断回调，
-但**必须盯住 raw 值**：若 raw `action_rate`（= `Episode_Reward/action_rate_l2 / 0.06`）
-继续往上超过 ~18–20 而步态指标不涨，说明抖动回来了 ⇒ 应恢复 −0.10 或改用
-**只罚高频分量**的版本（`(a_t − 2a_{t−1} + a_{t−2})²`，把"有意的慢速大幅摆动"豁免）。
+* ① 的动机：命令门控只挡"指令≈0"，挡不住"指令 0.6 m/s 却不前进、**原地左右脚交替抬放刷单支撑分红**"
+  （用户实测观察到静止/慢速时也在原地交替站）→ `docs/amp_walk/EXPERIMENTS.md` §B1
+* ⭐ ① 的**后续反证（重要）**：这道"实测根速度瞬时幅值"门在 V19c/V19d/V20 三代的**关闭率只有
+  0.46% / 0.46% / 0.63~0.95% ⇒ 形同虚设**（踏步时根速度前后摇摆的瞬时幅值本来就在 0.3~1 m/s）
+  ⇒ 后来改成"方向投影 + EMA 低通"的**进度判据** → `RESULTS_v19cd_v20_stand_probes.md` §2.3 + §B1
+* ② 的两难：降权会削弱"防抖"（V18 当年正是因 V17 抖动变大才把该项提到 −0.10）；须盯 raw `action_rate`
+  （= `Episode_Reward/action_rate_l2 / 0.06`）超过 ~18–20 而步态指标不涨 ⇒ 回退，或改"只罚高频分量"版
+  → §B5 + **勘误记录（三）**（2026-10-08 反证：放松它会让**直腿/碎步模态更容易出现**，方向与目标相反）
+* ③ 的语义：`active = exp(−cmd_speed/0.25)`，内容 = `4·mean|q−q_def| + 0.5·mean|dq|` ⇒ **只在指令≈0 时生效**
+  → §B1
+* ⚠️ 三处改动可从不同探针分离读出（① `air_time_motion_gate_off_frac` / `in_band_frac`；
+  ② `Episode_Reward/action_rate_l2`；③ `track_default_pose_on_stand`）⇒ 事后仍可归因 → §E3
 
-⚠️ 三处改动可分别从不同探针读出（① `air_time_motion_gate_off_frac` / `in_band_frac`；
-② `Episode_Reward/action_rate_l2`；③ `track_default_pose_on_stand`），因此事后仍可归因。
+⚠️ 其余逐字不动：V19b 的步态目标带实现（`tau 0.08` / `soft 0.3` / `good_lo,hi 0.4,1.0` / `weight 4.0`）、
+   21 项结构、5 clip 数据集、四档全向指令（今天 = 5 clip + 全向分档指令，**grep 旁证、未运行期核对**）。
+   ⚠️ 算法侧本层不动 → 见 `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V19c-G1-v0` 的「算法侧」节。
+
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V19c-G1-v0`
 """
 
 from __future__ import annotations

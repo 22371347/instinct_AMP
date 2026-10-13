@@ -1,92 +1,50 @@
-"""AMP 行走教师 **v2** 配置：奖励集换成 AMP_mjlab 的 12 项配方。
+"""V2：把奖励集换成 AMP_mjlab 的 12 项配方（删 9 项 + 对齐 3 个权重）。
 
-为什么要有 v2
--------------
-v1（`amp_walk_env_cfg.G1AmpWalkRewardsCfg`）的奖励集是
-`G1FlatRewardsCfg`（学长做**越障**动作测试时攒下的 16 项）→ 覆盖 3 项权重 → 新增 5 项
-= **21 项**。它和 AMP_mjlab `amp_loco` 的奖励表并不等价，实测后果：
+## ⚠️ 本层对**今天**仍有影响的部分（其余已被后层覆盖，见下表）
 
-* 训练 5000/10000 迭代后，机器人出现**单脚支撑 + 跳跃**的异常步态；
-* 回合 464/1000 步，**66% 回合因触地终止**；
-* 脚距均值 0.348（超过 0.30 上限，宽站姿）。
+* ⭐ **唯一至今存活的实质改动 = 删除 `stand_still`**：今天 T1l 的「已删除(None)」只有
+  `stand_still` 一项（V9h 曾明确「刻意不恢复」）；本层删的另外 8 项**已被后层陆续恢复**。
+* 本层提出的「12 项 = AMP_mjlab `amp_loco` 配方」框架**已被后层扩展回 21 项**
+  （今天非零 17 项）⇒ 今天**不再等于**该配方。
+* 仍在被引用的**方向性结论**：`action_rate_l2` 是奖励集里**最大的单项成本**
+  （−0.646/s，而全部任务正向项合计才 ~+1.6/s）；`joint_deviation_*` 是「关节漂到限位」的
+  **唯一持续刹车**。
+* 契约不变性（动作 29D / 观测 626-99-670 / 50 Hz / 无 clip）**今天仍成立** → `INTERFACE_CONTRACT.md`。
 
-本文件**只做两件事**，且**不改任何奖励函数本体、不改任何现有文件**：
+## 本层改动一览
 
-1. **删除** 9 个「AMP_mjlab 奖励表里根本没有、纯由越障基类继承而来」的项
-   （`AMP_WALK_V2_REMOVED_TERMS`，用置 `None` 的方式，这是本仓库既定机制：
-   `G1FlatEnvCfg.__post_init__` 的 run_name 生成器对其中 4 项都写了 `is not None` 保护）；
-2. **对齐** 3 个与 AMP_mjlab 数值不一致的权重（`AMP_WALK_V2_WEIGHT_FIXES`）。
+| # | 改动 | 现状（今日 T1l 实际生效）|
+|---|---|---|
+| ① | 置 `None` **删 9 项**（`AMP_WALK_V2_REMOVED_TERMS`）：`feet_air_time` / `joint_deviation_{knee,hip,arms,torso}` / `flat_orientation_l2` / `stand_still` / `lin_vel_z_l2` / `dof_torques_l2` | **仅 `stand_still` 仍为 None** ✅ → 其余 8 项已恢复：`feet_air_time +1`(thr0.5)、`flat_orientation_l2 −1`、`lin_vel_z_l2 −0.1`、`dof_torques_l2 −4e-6`、`joint_deviation_{hip,arms} −0.1`、`joint_deviation_{knee,torso} +0` |
+| ② | 对齐 3 个权重（`AMP_WALK_V2_WEIGHT_FIXES`）：`action_rate_l2 −0.05→−0.01`、`dof_pos_limits −1→−10`、`dof_acc_l2 −2e-7→−2.5e-7` | **三项均已被覆盖** → `action_rate_l2` **−0.05**；`dof_pos_limits` **−1（仅踝）**；`dof_acc_l2` **−2e-7（仅髋/膝）** |
+| ③ | 保留 9 项已对齐项（合计 12 项）| 部分仍在：`track_base_height +1.5` ✅、`track_lin_vel_xy_exp +1.5` ✅、`termination_penalty −200` ✅；已被改名/改值：`track_ang_vel_z +1.2→+1.0`、`track_default_pose_on_stand −1.0→−0.8`、`body_ang_vel_xy +0.7→0`、`feet_lateral_width −10→−1`、`feet_crossing −20→−2`、`feet_slide −0.25→−0.1` |
 
-删除的理由（逐项）
-------------------
-======================== ======== ==========================================
-被删项                    v1 权重  为什么删
-======================== ======== ==========================================
-``feet_air_time``        +1.0     函数内 `sum(in_contact) == 1` 才给分 →
-                                   **构造上奖励单脚支撑**。AMP_mjlab 的
-                                   amp_loco 奖励表无此项（只在其 velocity
-                                   任务里有）。实测贡献仅 +0.018/s，但方向
-                                   本身是错的。
-``joint_deviation_knee`` −0.05    ⚠️ **理由有错，见 `PLAN_amp_walk.md` §12**：
-``joint_deviation_hip``  −0.1     当时写的是「把关节往直腿 default 拽」，但
-``joint_deviation_arms`` −0.1     实测 default 是**屈膝**姿态（膝 0.669 rad
-``joint_deviation_torso``−0.1     ≈ 38°），所以这个理由站不住。真正的代价是：
-                                 这 4 项是**不带门控的“把关节拉住 default”罚”，
-                                 正是「关节漂到限位」的唯一持续刹车。
-``flat_orientation_l2``  −1.0     与新增的 `body_ang_vel_xy` 语义重叠；
-                                   AMP_mjlab 只保留后者。
-``stand_still``          −0.8     与新增的 `track_default_pose_on_stand`
-                                   （−1.0，还带关节速度阻尼）语义重叠。
-``lin_vel_z_l2``         −0.1     抑制竖直速度 → **直接压制跳跃的起跳/落地**；
-                                   AMP_mjlab 靠 `track_root_height` + 3D
-                                   锚点速度跟踪覆盖，无此单独项。
-``dof_torques_l2``       −4e-6    数值上纯装饰（实测 −0.018/s），AMP_mjlab 无。
-======================== ======== ==========================================
+**刻意保留的 4 条偏离（今天多数仍成立）**
 
-对齐的 3 个权重（AMP_mjlab → 本仓库）
--------------------------------------
-=================== ========= ========== ================================
-项                  v1 权重    v2 权重    AMP_mjlab 对应
-=================== ========= ========== ================================
-``action_rate_l2``  −0.05     **−0.01**  ``action_rate_l2`` = −0.01（**5×**）
-``dof_pos_limits``  −1.0      **−10.0**  ``joint_pos_limits`` = −10.0
-``dof_acc_l2``      −2.0e-7   **−2.5e-7**``joint_acc_l2`` = −2.5e-7
-=================== ========= ========== ================================
+1. `track_lin/ang_vel` 的 `std` 仍 **0.5**（mjlab 是 1.0/3.14）—— ✅ 今天仍 0.5。
+2. `dof_pos_limits` 仍**只作用踝关节**（mjlab 全关节）—— ✅ 今天仍只踝。
+3. `dof_acc_l2` 仍**只作用髋/膝**（mjlab 全关节）—— ✅ 今天仍只髋/膝。
+4. `feet_lateral_width`/`feet_crossing` 实测**几乎不激活**（`max_cost=0.10` 封顶）
+   ⇒ ⚠️ 宽站姿问题**不会**因本文件自动解决 —— 参数至今仍在。
 
-``action_rate_l2`` 是这次最关键的一项：它实测是**最大单项成本**（−0.646/s，
-而全部任务正向项合计才 ~+1.6/s）。跳跃恰好是「一次爆发 + 长时间不需要动作」的
-**低动作频率**策略，走路则是持续换腿 —— 5× 的过强惩罚本身就在鼓励跳跃。
+## 推理与判读（已归档，勿在本文件重复）
 
-保留（已与 AMP_mjlab 对齐的 9 项）
----------------------------------
-`track_lin_vel_xy_exp`(+1.5)、`track_ang_vel_z_exp`(+1.2)、`track_base_height`(+1.5)、
-`body_ang_vel_xy`(+0.7)、`track_default_pose_on_stand`(−1.0)、`feet_lateral_width`(−10.0)、
-`feet_crossing`(−20.0)、`termination_penalty`(−200.0)、`feet_slide`(−0.25)。
-⇒ v2 共 **12 项**，与 AMP_mjlab `amp_loco` 的项数一致。
+* `feet_air_time`「函数内 `sum(in_contact)==1` ⇒ 构造上奖励单脚支撑」→ `EXPERIMENTS.md` §B2
+* `joint_deviation_*` 的删除理由「把关节往直腿 default 拽」**已被证伪**（default 实为**屈膝**）
+  → `EXPERIMENTS.md` §P3；真正的代价是「这 4 项是关节漂移的唯一持续刹车」（结论仍有效）
+* 删 `lin_vel_z_l2`（压制跳跃起跳/落地）、`dof_torques_l2`（数值上纯装饰 −0.018/s）、
+  `flat_orientation_l2`（与 `body_ang_vel_xy` 语义重叠）、`stand_still`（与
+  `track_default_pose_on_stand` 语义重叠）的逐项性价比 → 见该版 run 日志
+* `action_rate_l2` 5× 过强「鼓励跳跃」的频率论证 → 见该版 run 日志（机制版已归档 §B5）
 
-**刻意保留的偏离**（本次不动，避免一次改太多导致归因不清）
---------------------------------------------------------
-1. `track_lin_vel_xy_exp` / `track_ang_vel_z_exp` 的 `std` 仍为 **0.5**
-   （AMP_mjlab 是 1.0 / 3.14）—— 与学长同族 OmniLoco/Vault 教师保持形状一致，
-   便于日后对照与蒸馏；且 `std` 变小是**更严**的要求，不是放宽。
-2. `dof_pos_limits` 仍**只作用于踝关节**（AMP_mjlab 是全关节）。
-3. `dof_acc_l2` 仍**只作用于髋/膝**（AMP_mjlab 是全关节）。
-4. `feet_lateral_width` / `feet_crossing` 实测**几乎不激活**（−0.0014 / −0.0001，
-   `max_cost=0.10` 封顶），因此宽站姿问题**不会**因为本文件而自动解决。
+⚠️ 其余逐字不动：**接口契约与 v1 逐字相同**（动作/观测/时序/执行器，见 `INTERFACE_CONTRACT.md`）
+   ⇒ v2 的 ckpt 与 v1 **互换**（可从 `model_5000.pt` 直接续训）、teacher 侧接口
+   （含 `model_*.pt` + `params/agent.yaml` 的 run 目录）不受影响。
+   ⚠️ 唯一**不兼容点**：奖励语义变了 ⇒ v1 的 value function 不再准确，续训初期
+   回报会先掉再涨（**预期**现象）。
 
-接口契约**完全不变**（本文件不碰契约）
--------------------------------------
-动作 29D / 顺序 / `scale=1.0` / default offset / `clip=None`、观测 626 / 99 / 670、
-时序 50 Hz、执行器 —— 全部继承 `G1AmpWalkEnvCfg`，**逐项与 `INTERFACE_CONTRACT.md` 相同**。
-因此：
-
-* v2 的 checkpoint 结构与 v1 **完全互换**，可以从 `model_5000.pt` 直接续训；
-* `G1AmpWalkTeacherEnv` 契约校验器**直接复用**（期望值全是类属性）；
-* **蒸馏 teacher 侧接口不受影响** —— 仍是「含 `model_*.pt` + `params/agent.yaml` 的
-  run 目录」，`obs_format` / `num_actions=29` / normalizer 类型全都不变。
-
-⚠️ 与 v1 唯一的不兼容点：**奖励语义变了**，所以 v1 的 value function 不再准确
-（critic 需要重新适应），续训初期回报会先掉再涨，这是**预期**现象。
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V2-G1-v0`
 """
 
 from __future__ import annotations

@@ -1,55 +1,47 @@
-"""V9e：在 **v9d**（= v9c 的 σ/AMP 参数 + **镜像损失 ON**）之上，按分析结论做两项针对性改动。
+"""V9e：在 v9d 之上做两项针对性改动 —— ① **复原** `feet_air_time`（15 → 16 项）
+② 原地指令占比减半（18% → 9%）。
 
-## 相对 v9d 的两处改动
+## ⚠️ 本层对**今天**仍有影响的部分
 
-### ① 复原 `feet_air_time`（奖励集 15 → 16 项）⭐ 修补"没有任何一项奖励迈步"的缺口
+* ⭐ **复原的 `feet_air_time` 今天仍在**：T1l = `+1` / `threshold=0.5` / `func=feet_air_time_positive_biped`
+  （= 本层从基类复原的那条；中途 V18 换成目标带版，T1a2 又换回本条）。
+* ⭐ **`zero_frac_in_low = 0.3` 今天仍生效**（V18 又设回 0.3）；但配套 `prob_low` 已被 V18 由 0.30 改为
+  **0.20** ⇒ 本层"18% → 9%"是**当时口径**，不要当今天的值。
+* （算法侧）σ 参数 / `ampc 0.25` / `arms=0` 已被 T1a2 覆盖；但**镜像损失本身今天仍在**（T1a 链 ON）。
 
-用基类 `G1FlatRewardsCfg` 的原定义（权重 +1.0、`threshold=0.5 s`、`.*_ankle_roll_link`），
-函数是 `locomotion_mdp.feet_air_time_positive_biped`，语义（逐字读源码）：
+## 本层改动一览
 
-```
-single_stance = (sum(in_contact) == 1)                     # 必须**恰好一只脚着地**
-reward = min over feet of in_mode_time（单脚支撑时）否则 0
-reward = clamp(reward, max=0.5)                            # 单脚支撑越久越接近 0.5
-reward *= (||cmd_xy|| > 0.1)                               # 站立/零指令不给分
-```
+| # | 改动 | 现状（今天实际生效）|
+|---|---|---|
+| ① | **复原** `feet_air_time`（奖励集 15 → 16 项）：基类 `G1FlatRewardsCfg` 原定义（`+1.0`、`threshold=0.5`、`.*_ankle_roll_link`）| ✅ 仍生效（同 func / 同 threshold）|
+| ② | 低速档里"精确 (0,0,0)"比例 `zero_frac_in_low` **0.6 → 0.3**（`prob_low` 仍 0.30）| ✅ 仍 = **0.3**；⚠️ `prob_low` 已被 V18 改为 **0.20** |
+| ③ | （算法侧）镜像损失 ON、σ = `0.2 / 0.0025 / 0.3`、`ampc 0.25`、`arms=0` | ❌ 已被 T1a2 覆盖；镜像损失**今天仍在** |
 
-⇒ 三个正好对症的性质：
-1. **双脚同时着地/同时离地（= 对称跳跃）拿 0 分** ⇒ 直接打击 v9 的"原地跳"退化解；
-2. 奖励"**单脚支撑持续时间**" ⇒ 鼓励真正的交替支撑相；
-3. 零指令门控 ⇒ 与下面的②同向（"不动"这件事不再被奖励，也不再从这一项拿分）。
+**① 的语义（逐字读源码，今天仍适用）**：单脚支撑 = `sum(in_contact)==1`（**恰好一只脚着地**）；
+奖励 = 单脚支撑时长 `clamp(max=0.5)`，再乘零指令门控 `(||cmd_xy|| > 0.1)`。
+⇒ 对症三点：(a) 双脚同时着地/离地（对称跳跃）拿 0 分；(b) 奖励"单脚支撑持续时间"；(c) 零指令不给分（与 ② 同向）。
+⚠️ 该项是 v2 采用 AMP_mjlab 12 项配方时被整项删掉、这里**复原**（非新设计）；
+⚠️ **已知局限（今天仍成立）**：**单脚跳**（只用一条腿）在支撑相仍满足 `single_stance` ⇒ 本项**不**抑制单脚跳。
 
-⚠️ 已知局限：**单脚跳**（只用一条腿）在支撑相仍然满足 `single_stance` ⇒ 本项**不**抑制单脚跳；
-   ~~那一条由**镜像损失**负责~~ ⚠️ **该说法已被 V9h 实测推翻（2026-09-29）**：V9h@4770 镜像损失
-   只有 0.0368，步态却是"单脚侧身跳着走" ⇒ **镜像损失拦不住单侧步态**。机理：它约束的是
-   `π(M(o)) ≈ M(π(o))`（策略**函数**的对称性），而单侧步态访问到的状态其镜像态**从未被访问**
-   ⇒ 约束可以在"没去过的状态"上被满足。⇒ 真正的补丁是 V9j 的
-   `feet_swing_time_penalty`（罚"某只脚腾空过久"），见 `rewards_amp.py`。
-⚠️ 该项当初在 v2 采用 AMP_mjlab 12 项配方时被整项删掉，这里**复原**，不是新设计。
+## 推理与判读（已归档，勿在本文件重复）
 
-### ② 原地（精确 0）指令占比减半：18% → 9%
+* ⚠️ **勘误（2026-10-08，务必照此口径）**：「镜像损失拦不住单侧步态」—— 该说法**已被 V9h 实测推翻**
+  （2026-09-29：V9h@4770 镜像损失只有 0.0368，步态却是"单脚侧身跳着走"）。**根因不是**"策略访问不到镜像态
+  （off-distribution）"，而是 **V9h 当时只给了前向速度指令**（纯 `(0, 0.7)`，`vy=wz=0`）⇒ 状态分布集中在
+  "直行流形"上、**没有镜像场景的计算空间 ⇒ 该约束无法正常生效**；侧向/转向是 **V10 的"③ 指令扩展"**才引入的。
+  → `docs/amp_walk/EXPERIMENTS.md` §A1（含旁证：**不能**拿 0.0368 反推"策略已左右对称"）
+* 旧 `feet_air_time_positive_biped` 的**两个结构性漏洞**（短到几毫秒也给分 / 越长越给）→ §B2
+* ② 的算术（零指令 env 里 `track_lin_vel_xy_exp` 变成"别动才给分"，而 `track_default_pose_on_stand` 门控 ≈1
+  ⇒ 每 5 个 env 就有 1 个在教"站住 + 保持默认位姿"）；契约事实：`rel_standing_envs` 仍 0.0、
+  `zero_frac_in_low` **不参与** `_validate_teacher_contract` ⇒ 改它不会 fail-fast → 见该版 run 日志
+* 「从已塌陷 ckpt 续训基本出不来自吸引子」→ §C4；"单脚侧身跳着走"→ §C3
+* ⏱️ 判读建议（≥3000 轮再比步态；看 `vx_*_vxy_rmse` / `Episode_Reward/feet_air_time`（>0 = 真的单脚交替）/ `base_contact`）→ 见该版 run 日志
 
-`prob_low` 仍是 0.30，只把低速档里"精确 (0,0,0)"的比例 `zero_frac_in_low` 0.6 → **0.3**：
-- 减半前：0.30 × 0.6 = **18%** 的 env 被命令"原地不动"。在这些 env 里
-  `track_lin_vel_xy_exp` 变成"**别动才给分**"（动一下就掉），而 `track_default_pose_on_stand`
-  的门控 `exp(−cmd_speed/0.25)` ≈ 1（**完全生效**）⇒ 等于每 5 个 env 就有 1 个在教
-  "站住 + 保持默认位姿"；
-- 减半后：**9%**，前向指令（≥0.1 m/s）的覆盖从 ~70% 提到 ~79%。
-- ⚠️ 契约校验只断言 `rel_standing_envs == 0.0`（我们不动它），`zero_frac_in_low` **不参与校验**
-  ⇒ 改它不会 fail-fast（已核对 `_validate_teacher_contract`）。
+⚠️ 其余逐字不动：`track_default_pose_on_stand` / `track_base_height` / `body_ang_vel_xy` / `track_ang_vel_z`
+   （本轮"单变量优先"只验"迈步奖励 + 减少原地指令"）；观测 / 指令范围 / 数据集与 v9 逐字相同。
 
-## 保持不动的（= v9d 的全部内容）
-
-- **镜像损失 ON**（`use_mirror_loss=True`）：防止不对称退化（v9b 的单脚跳）。
-- **σ 参数**：`init_noise_std 0.2` / `entropy_coef 0.0025` / `clip_max_std 0.3`
-  （实测 σ 从"顶在天花板 0.39"变成**收敛在 0.21**）。
-- **AMP 权重** `discriminator_reward_coef = 0.25`（实测 amp_d −0.80→−0.45、r_amp 0.22→0.65）。
-- `joint_deviation_arms = 0`（限位已不再触发）；观测/指令范围/数据集与 v9 逐字相同。
-- `track_default_pose_on_stand` / `track_base_height` / `body_ang_vel_xy` / `track_ang_vel_z`
-  **本轮不动**（保留"单变量优先"：这一轮只验证"迈步奖励 + 减少原地指令"）。
-
-⏱️ 判读建议：≥3000 轮再比步态；关键指标 = `vx_*_vxy_rmse`（跟踪误差）、
-`Episode_Reward/feet_air_time`（>0 说明真的在单脚支撑交替）、`base_contact`（摔倒率）。
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V9e-G1-v0`
 """
 
 from __future__ import annotations

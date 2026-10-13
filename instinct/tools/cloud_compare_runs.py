@@ -142,6 +142,11 @@ def main() -> int:
         ("Mean step action_abs_max", "动作幅度 |a| 最大值"),
         ("Mean episode Episode_Reward/feet_air_time", "  feet_air_time（/s；>0=在单脚支撑）"),
         ("Mean episode Episode_Reward/track_lin_vel_xy_exp", "  track_lin_vel_xy（/s，满分75）"),
+        # ⭐ T2（全权照抄 mjlab）的命名：同一件事换了个名字，两行都留着
+        ("Mean episode Episode_Reward/track_anchor_linear_velocity",
+         "  track_anchor_linear_velocity（/s，满分75；= T2 的 xy+v_z 跟踪）"),
+        ("Mean episode Episode_Reward/track_anchor_angular_velocity",
+         "  track_anchor_angular_velocity（/s；= T2 的 wz+ω_xy 跟踪）"),
         ("Mean episode Episode_Reward/track_ang_vel_z_exp", "  track_ang_vel_z（/s）"),
         ("Mean episode Episode_Reward/track_base_height", "  track_base_height（/s）"),
         ("Mean episode Episode_Reward/body_ang_vel_xy", "  body_ang_vel_xy（/s）"),

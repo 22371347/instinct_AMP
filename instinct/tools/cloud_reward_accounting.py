@@ -49,6 +49,9 @@ TREND_TAGS = (
     "Loss/mirror",
     "Episode_Reward/flat_orientation_l2",
     "Episode_Reward/feet_air_time",
+    # ⭐ T2（全权照抄 mjlab）的命名；旧名保留 ⇒ 两张臂都能读
+    "Episode_Reward/track_anchor_linear_velocity",
+    "Episode_Reward/track_anchor_angular_velocity",
     "Episode_Reward/track_lin_vel_xy_exp",
 )
 

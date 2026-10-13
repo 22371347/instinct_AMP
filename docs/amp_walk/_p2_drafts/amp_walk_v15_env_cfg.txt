@@ -1,0 +1,14 @@
+"""V15：环境**逐字沿用 V14**；唯一改动在算法侧（`discriminator_reward_coef` 0.25 → 1.0，风格分量 ×4）。
+
+## ⚠️ 本层对**今天**仍有影响的部分
+
+* **无 —— 已被后层整体覆盖**；今日生效值 `discriminator_reward_coef = 4.0`（非本层的 1.0）
+  ⇒ 本层改动一览仅①这一项（`agents/amp_walk_v15_ppo_cfg.py`）。
+
+## 推理与判读（已归档，勿在本文件重复）
+
+* ⭐ 「风格权重 ×4 能改善风格」**已实测证伪**（`amp_d` -0.433→-0.407 且伴随崩溃振荡）→ `EXPERIMENTS.md` §A3
+* 「均值倾角小 ≠ 任何时刻都竖直」+ 本层起的倾角分布探针（`Step/tilt_p95_deg`、`[LIMIT-TOP]` 等）→ 见该版 run 日志
+
+⚠️ `RewTerm(...)` 字面值 **≠ 生效值**（后层整体覆盖 `params`）→ 见 `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V15-G1-v0`（算法侧见同节）
+"""

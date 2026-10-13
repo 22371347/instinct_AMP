@@ -1,0 +1,39 @@
+"""**T1j**：解除"**相对夹角的常数拉力**"（相对 T1i 的唯一改动；2026-10-08）。
+
+## ⚠️ 本层对**今天**仍有影响的部分
+
+* ⭐⭐ **本层把 `joint_deviation_torso` 与 `joint_deviation_knee` 置 0（"解除常角拉力"），
+  这两项今天（T1k/T1l）仍是 0** ⇒ 本层**直接传给今天**的设定。
+* ⭐ **关联**：今天"模型坚持不曲膝"的候选之一正是**本层解绑了 `joint_deviation_knee`**（膝角失去常角拉力）
+  → §勘误记录（二）/（三）。
+* 倾角代理**改善约 30%**：`−Episode_Reward/flat_orientation_l2` 从 T1i ≈ **−0.0353** → T1j 实测 ≈ **−0.0247**。
+
+## 本层改动一览
+
+| # | 改动 | 现状（今天实际生效）|
+|---|---|---|
+| ① | `joint_deviation_torso` −0.1 → **0.0**（解除"骨盆−腰"常角拉力）| ✅ **今天仍是 0**（T1k/T1l 逐字沿用）|
+| ② | `joint_deviation_knee` −0.05 → **0.0**（解除"膝角"常角拉力）| ✅ **今天仍是 0**（T1k/T1l 逐字沿用）—— 见上方 ⭐ 关联 |
+| ③ | 其余（T1i 的 λ、`body_ang_vel_xy=0`、`flat_orientation_l2=−1.0`、`joint_deviation_hip/arms`、`dof_pos_limits` 标准版、环境/观测契约）**逐字不动** | `body_ang_vel_xy=0`、`flat_orientation_l2=−1.0` 今天仍是；λ〔算法侧〕→ 见 `Instinct-Amp-Walk-T1j-G1-v0` 的**「算法侧」节** |
+
+## 推理与判读（已归档，勿在本文件重复）
+
+* **要验证的机制**（2026-10-08 用户观察 + 代码核实）：AMP 风格行走时**大腿弯曲、但"大腿−骨盆"夹角
+  保持常数** ⇒ **骨盆与上身一同倾斜**；且**只在前进指令时出现、静止时正常**。
+* **作用域核实**：`joint_deviation_torso → waist_.*`（**含 `waist_pitch/roll`**）把"**骨盆−腰**"俯仰往常数 0 拉；
+  `joint_deviation_knee → .*_knee_joint` 把**膝角**往常数（默认屈膝）拉；`joint_deviation_hip` **只含
+  `hip_yaw/roll`、不含 `hip_pitch`**（髋俯仰无常角拉力，唯一覆盖它的是低速门控的 `track_default_pose_on_stand`）。
+* **历史笔记独立支持**：`amp_walk_v14_env_cfg.py:27`（`waist_pitch/roll` 限位仅 **±0.52 rad**，除踝外最挤）；
+  `amp_walk_v3_env_cfg.py:227-237`；`amp_walk_v9_env_cfg.py:3`（v8 期间 `waist_pitch` **长期贴限位**）。
+* **因果链**：AMP 要匹配参考的大腿/小腿**世界朝向**；而"腰−骨盆夹角""膝角"被往常数拉、`waist_pitch` 行程仅
+  ±0.52 ⇒ 调和的**唯一便宜出路是"整体倾斜"**；而整体倾斜在奖励表里**几乎免费**（`body_ang_vel_xy` 被置 0
+  且只罚角速度、`flat_orientation_l2 −1.0` 太弱）⇒ **前进时倾斜、静止时正常** ✓
+* **观测指标**：本臂**没有** margin 版倾角探针（属 `joint_pos_limits_margin`）；用所有臂都有的等价代理
+  `Episode_Reward/flat_orientation_l2`（`Σ(gx²+gy²)`，**每步均值**）⇒ 越小 = 倾角越小；基线 T1i ≈ **−0.0353**
+  （≈11°）、T1f ≈ −0.078（≈16°）；起点 = **热启动自 T1a2 的 `model_7000.pt`**（与 T1i/T1b/T1c/T1d 同起点）。
+
+⚠️ 本文件**不改动、不删除任何既有 cfg**（非破坏性）；其余逐字不动见上表 ③。
+
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-T1j-G1-v0`
+"""

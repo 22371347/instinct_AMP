@@ -1,13 +1,12 @@
-"""AMP 行走 **v4** 的环境配置 —— 与 v3 **完全相同**，只换 `run_name`。
+"""AMP 行走 **v4**：环境与 v3 **逐字相同**，只换 `run_name`（v3 的 `__post_init__` 会把 `run_name` 钉死）。
 
-为什么要单独一个文件：`G1AmpWalkV3EnvCfg.__post_init__` 会把 `run_name` 钉成 v3 的
-`AMP_WALK_V3_RUN_NAME`，直接复用 v3 会让 v4 的日志目录名带 `rew14_...` 但看不出
-"这轮加了镜像损失"，事后极易混淆。**只改 run_name，其余一律不动**（奖励集 14 项、
-指令分布、精选 7-clip 数据集、观测 626/99/670、动作契约全部继承 v3）。
+## ⚠️ 本层对**今天**仍有影响的部分
 
-⚠️ teacher 侧（蒸馏接口）直接复用 `G1AmpWalkV3TeacherEnv`：环境完全相同，
-   契验期望值也一样，没必要再复制一份。
-"""
+* **无 —— `run_name` 已被后层覆盖**（今天 = `G1AmpWalkT1l...`）⇒ 本文件只是"14 项奖励 / 7-clip 数据集 /
+  观测 626/99/670 / 动作契约"那一代配置的**重命名副本**；teacher 侧直接复用 `G1AmpWalkV3TeacherEnv`（环境相同、契验期望值也一样）。
+* 本版唯一实质改动在 agent cfg（`agents/amp_walk_v4_ppo_cfg.py`：镜像损失 + AMP 侧两处修正）⇒
+  是否仍生效见 `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V4-G1-v0` 的「算法侧」节。
+⚠️ `RewTerm(...)` 字面值 **≠ 生效值**（后层整体覆盖 `params`）→ `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V4-G1-v0`（算法侧见同节）"""
 
 from __future__ import annotations
 

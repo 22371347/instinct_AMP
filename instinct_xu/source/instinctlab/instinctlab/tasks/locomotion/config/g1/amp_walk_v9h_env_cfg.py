@@ -1,52 +1,22 @@
-"""V9h：**抗跳 + 恢复平衡刹车 + 补回被删的基类项**（唯一一项新设计是"竖直速度"）。
+"""V9h：抗跳 + 恢复平衡刹车 + 补回被删的基类项（唯一新设计 = 躯干竖直速度惩罚）。
 
-## 为什么这样改（V9g 的复盘）
+## ⚠️ 本层对**今天**仍有关键影响的一点（2026-10-08 核查确认）
 
-1. **V9g 的"95% 摔倒"是断崖窗口的快照，不是稳态**。日志显示 V9g 反复出现
-   `rew 37 → 0.31（len=79）` 这种**崩一下再恢复**的振荡，崩溃时刻伴随：
-   `amp_style_std 0.10 → 0.19~0.24`（风格奖励跨 env 离散度翻倍）、`d −0.39 → −0.51/−0.56`、
-   `|a| 0.48 → 0.58~0.61`。好轮次其实能到 `rew 45~46 / len 750~795`（≈ v9f 水平）。
-   ⇒ 曲线要按"包络"看，别拿单个快照下结论。
-2. 但 **V9g 把三个平衡刹车砍过头了**（`track_ang_vel_z 1.2→0.2`、`body_ang_vel_xy 0.7→0.2`、
-   `track_base_height 1.5→0.5`），同时把 `track_lin_vel` 抬到 3.0 ⇒ 跳跃性价比是我自己调出来的。
-3. **风格权重 ×4（`(1−λ)c` 0.0625→0.25）实测无效**：`amp_d` 从 −0.433 只变到 −0.407，
-   且伴随上条崩溃振荡 ⇒ 本版**回退到 0.75/0.25**（= v9e/v9f 的稳定值）。
+**`track_base_height` 的核宽 `std` 0.3 → 0.2 是本层引入的**
+（`AMP_WALK_V9H_BASE_HEIGHT_STD = 0.2`），并**一路继承到 T1a/T1a2/T1j/T1k/T1l**。
+后层只改 `weight` 不改 `params` ⇒ T1k 把 weight 恢复成 1.5 时，**std 仍留在 0.2**。
+⇒ 这就是 2026-10-08 由 T1l 的失败断言当场抓出的“隐藏偏离”（V5 原始值是 0.3 = AMP_mjlab 值）。
 
-## 本版奖励集：16 → **20 项**（4 项全部是"基类里本来就有、v2 被删掉"的，不是新设计）
+## 本层改动一览
 
-| 项 | 权重 | 作用 |
-|---|---|---|
-| `lin_vel_z_l2` | **−0.2** | ⭐ **躯干竖直速度**。跳：`vz≈±1 m/s` → `−0.2/步`；走：`vz≈±0.1` → 几乎免费。**直接给跳跃定价**（基类原值 −0.1，这里加倍） |
-| `dof_torques_l2` | −4.0e-6 | 髋/膝力矩（基类原值）⇒ "猛蹬"有代价 |
-| `joint_deviation_hip` | −0.1 | 髋 yaw/roll 偏差（基类原值）⇒ 腿不歪、不劈叉 |
-| `joint_deviation_knee` | −0.05 | 膝偏差（基类原值）⇒ 守住屈膝默认姿态 |
+| 类别 | 改动 |
+|---|---|
+| **会传给后代的参数** | `track_base_height` **0.5/std0.3 → 1.0/std0.2**；`track_ang_vel_z_exp` 0.2→**0.8**；`body_ang_vel_xy` 0.2→**0.5**；`track_default_pose_on_stand` 0.0→**−0.3**；`track_lin_vel_xy_exp`/`feet_air_time` 保持 3.0/2.0 |
+| **奖励集 16→20 项** | 4 项均从基类**复原**（非新设计）：`lin_vel_z_l2 −0.2`（基类值加倍）/ `dof_torques_l2` / `joint_deviation_hip` / `joint_deviation_knee`。刻意**不**恢复 `stand_still(−0.8)`（与 `track_default_pose_on_stand` 同族，重复惩罚）|
+| **推理与判读** | 已归档，**勿在本文件重复**：→ `docs/amp_walk/EXPERIMENTS.md` §C1（“95% 摔倒”只是断崖快照）/ §C2（三个刹车砍过头）/ §A3（风格权重 ×4 无效）/ §附待办第 6–7 条（`termination_penalty` 账目反推、`amp_stand_frac` 不一致）|
 
-**刻意不恢复 `stand_still`（−0.8）**：它和 `track_default_pose_on_stand` 是同一族（"命令小时别乱动关节"），
-本版后者已按用户意见以 −0.3 小权重保留 ⇒ 加它是重复惩罚，且可能压制"从站姿起步"。
-
-## 权重调整（相对 V9g）
-
-| 项 | V9g | **V9h** | 理由 |
-|---|---|---|---|
-| `track_ang_vel_z_exp` | 0.2 | **0.8** | 恢复旋转刹车 |
-| `body_ang_vel_xy` | 0.2 | **0.5** | 恢复躯干刹车 |
-| `track_base_height` | 0.5 / std 0.3 | **1.0 / std 0.2** | 跳 = 高度大幅振荡，收紧核直接定价 |
-| `track_default_pose_on_stand` | 0.0 | **−0.3** | 用户：小权重保留静止姿态稳定 |
-| `track_lin_vel_xy_exp` | 3.0 | 3.0 | 保住"动起来"的动力 |
-| `feet_air_time` | 2.0 | 2.0 | 唯一的步态时序项（"恰好单脚着地"） |
-
-## 判读（≥3000 轮）
-
-- ⭐ `Episode_Reward/feet_air_time` **> 0.05 /s**（离开 0.003 的"从未单脚支撑"区）⇒ 真的开始交替支撑；
-- `Episode_Termination/base_contact` **< 0.5**（V9f 0.38 / V9g 0.95）；
-- `Mean reward` 包络（不看单点）回到 ≥45；
-- 新增诊断 `Mean step amp_d_ref`（参考侧判别器输出）：**`gap = d_ref − d_actor` 是否明显** ⇒
-  直接回答"AMP 还有没有分辨力"，这是本版的核心观测目标。
-
-## 已知未解（下一轮要单独查）
-
-- `termination_penalty` 名义 −200，但账目反推每回合只有 ≈ −2.3（95% 摔倒时也一样）⇒ **摔倒可能几乎不痛**。
-- `amp_stand_frac` 实测 0.05，但 `prob_low=0.30` 的设计值应 ≈0.30 ⇒ 指令分档或门控读的量可能不一致。
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V9h-G1-v0`
 """
 
 from __future__ import annotations

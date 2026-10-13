@@ -183,6 +183,24 @@ class AmpWalkAlgorithmCfg(AlgorithmCfg):
     #:    （1.0×~3.2×）⇒ `discriminator_gradient_penalty_coef` 可沿用。
     amp_grad_pen_space = "raw"
 
+    #: ⭐ T1n：`True` ⇒ 热启动时**丢弃 checkpoint 里的判别器（含其优化器）**，
+    #: 让判别器在**新的输入度量空间**（白化）里从零学起。
+    #: 动机（2026-10-09）：T1l/T1m 的判别器已饱和（`amp_d = −0.94`、
+    #: `amp_style_zero_frac = 0.35~0.38`，即 35%+ 样本落在 `quad ≡ 0 且 dr/dd = 0`
+    #: 的死区）—— 饱和是 `MSE(d, ±1)` 的**极值不动点**，换度量空间也回不来。
+    #: 实现：桥接层 `WasabiPPOAmpMix.load_state_dict` 在调上游**之前**弹掉
+    #: `"discriminator"` / `"discriminator_optimizer"` ⇒ 上游走 `else: print("[Warning] ...")`
+    #: 分支，保留全新模块。**顺带解决**新增白化 buffer 触发的严格加载 missing-keys。
+    #: ⚠️ 必须在此显式声明，否则 `to_dict()` 不会带上它（静默失效）。
+    fresh_discriminator_on_load = False
+
+    #: ⭐ **时序堆叠项的帧数**（项名 → 帧数），供镜像算子用。
+    #: ⚠️ **必须显式声明**（否则 `to_dict()` 会静默丢掉）：isaaclab 的 `group_obs_term_dim`
+    #: 报的是**已展平的标量**（`velocity_command`（4 帧×3）报成 `(12,)`）⇒ 帧结构在
+    #: `obs_format` 里根本不存在，镜像算子**推不出来**（T1o 首发即因此 fail-fast 退出）。
+    #: `None` / 未列出的项 = 单帧（= 626/378 的历史行为，零回归）。
+    policy_obs_frames = None
+
     # --- AMP_mjlab 的 `min_normalized_std = [0.05]*29` 的**等价物** -------------
     # instinct_rl 的 `ActorCritic.std` 是绝对标准差（`init_noise_std * ones`），
     # `PPO.update` 末尾会 `clip_std(min=clip_min_std)`；本配置 `init_noise_std=1.0`，

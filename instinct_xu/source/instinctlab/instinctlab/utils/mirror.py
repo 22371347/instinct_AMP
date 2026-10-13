@@ -162,6 +162,10 @@ class MirrorSpec:
     scan_nx: int = SCAN_NX
     #: `((项名, slice), ...)`，顺序 = 观测拼装顺序
     segments: tuple[tuple[str, slice], ...] = LEGACY_SEGMENTS
+    #: ⭐ **与 `segments` 一一对应**的帧数（= `history_length`）。
+    #: 空元组 = 全部按单帧处理（= 626/378 的历史行为）。
+    #: 见 `from_obs_format` 里对"时序项 shape = `(frames, dim)`"的约定说明。
+    frames: tuple[int, ...] = ()
 
     @staticmethod
     def from_joint_names(joint_names: list[str]) -> "MirrorSpec":
@@ -169,26 +173,86 @@ class MirrorSpec:
         return MirrorSpec(tuple(joint_names), perm, sign)
 
     @staticmethod
-    def from_obs_format(joint_names: list[str], policy_format) -> "MirrorSpec":
+    def from_obs_format(
+        joint_names: list[str], policy_format, frames_by_term: dict[str, int] | None = None
+    ) -> "MirrorSpec":
         """按**观测契约**（`obs_format['policy']`，有序 dict：项名 → shape）构造。
 
         ⚠️ v9 起的主路径：布局完全由契约推导 ⇒ 以后改扫描尺寸/增删项，
         只要在 `SCAN_LAYOUTS` / 规则表里登记过，镜像就自动跟上。
         不认识的项名直接 **fail-fast**（宁可启动报错，也不要静默错镜像）。
+
+        ⭐ `frames_by_term`：**时序堆叠项的帧数**（项名 → 帧数），由算法侧的
+        `policy_obs_frames` 传入。
+        ⚠️ **本仓库 isaaclab 报的 `group_obs_term_dim` 是已展平的标量**
+        （实测：`velocity_command`（4 帧×3）报成 `(12,)`，不是 `(4,3)`）
+        ⇒ 帧结构**在契约里根本不存在、无法推导** ⇒ 必须由配置显式声明。
+        不声明时只能按单帧处理（对堆叠项就是错镜像，所以下游有 fail-fast 兵底）。
         """
         perm, sign = build_joint_mirror(joint_names)
+        n_joints = len(joint_names)
         segments: list[tuple[str, slice]] = []
+        frames: list[int] = []
         offset = 0
         scan_dim: int | None = None
         for name, shape in dict(policy_format).items():
-            dim = 1
-            for s in shape:
-                dim *= int(s)
+            shape = tuple(int(s) for s in shape)
+            #: ⭐ **帧数的来源（优先级从高到低）**：
+            #:   ① `frames_by_term[name]` —— **本仓库唯一可靠的来源**：实测 isaaclab 的
+            #:      `group_obs_term_dim` 报的是**已展平的标量**（`velocity_command`（4×3）
+            #:      报成 `(12,)`）⇒ 帧结构在契约里不存在、推不出来。
+            #:   ② shape 有两维且其中一维等于已知的每帧维度（某些 fork 会报 `(frames, dim)`）。
+            #:   ③ 否则按**单帧**处理。
+            #: ⚠️ ③ 对"本应堆叠"的项就是错镜像，所以下面两个分支都有 fail-fast 兵底：
+            #:    关节项要求 `per_frame == 29`、向量项要求 `== 3` ⇒ 堆叠被当成单帧时会立刻报错。
+            #: ⚠️ 先算总维度（后面所有分支都要用；第一版写成"分支里再用 dim"，
+            #:    实际拿到的是**上一轮的残值** ⇒ `velocity_command` 用了 height_scan 的 279）。
+            _dim_total = 1
+            for _s in shape:
+                _dim_total *= _s
+            _expect = n_joints if name in JOINT_TERMS else (3 if name in VECTOR_TERM_SIGNS else None)
+            if frames_by_term and name in frames_by_term:
+                n_frames = int(frames_by_term[name])
+                if n_frames <= 0 or _dim_total % n_frames != 0:
+                    raise KeyError(
+                        f"观测项 {name!r}：dim={_dim_total} 不能被声明的 frames={n_frames} 整除"
+                    )
+                per_frame = _dim_total // n_frames
+            elif len(shape) == 1:
+                n_frames, per_frame = 1, shape[0]
+            elif len(shape) == 2 and shape[1] == _expect:
+                n_frames, per_frame = shape[0], shape[1]
+            elif len(shape) == 2 and shape[0] == _expect:
+                n_frames, per_frame = shape[1], shape[0]
+            else:
+                raise KeyError(
+                    f"观测项 {name!r} 的 shape={shape} 无法解析为 `(frames, dim)` 或 "
+                    f"`(dim, frames)`（每帧维度应为 {_expect}）。"
+                )
+            dim = n_frames * per_frame
             if name == SCAN_TERM:
                 if scan_dim is not None:
                     raise ValueError(f"观测里出现了多个 {SCAN_TERM!r} 项")
-                scan_dim = dim
-            elif name not in VECTOR_TERM_SIGNS and name not in JOINT_TERMS:
+                #: ⭐ T2(1500) 起 `height_scan` **也允许堆叠**（每帧 279 条射线）。
+                #: `SCAN_LAYOUTS` 的键是**每帧**射线数 ⇒ 这里必须存 `per_frame`，
+                #: 不是 `dim`（否则 1116 去查表会 fail-fast）。
+                scan_dim = per_frame
+            elif name in VECTOR_TERM_SIGNS:
+                #: ⚠️ fail-fast 抓“协议没按 (frames, dim) 报”的情形：
+                #: 若把堆叠后的 12 报成 `(12,)`，per_frame=12 ≠ 3 ⇒ 立刻报错，
+                #: 而不是静默用错误的符号向量去镜像（那会是极难发现的训练 bug）。
+                if per_frame != 3:
+                    raise KeyError(
+                        f"{name!r} 每帧应为 3 维，收到 per_frame={per_frame}（shape={shape}）。"
+                        f"时序堆叠项必须在 obs_format 里报成 `(frames, 3)`。"
+                    )
+            elif name in JOINT_TERMS:
+                if per_frame != n_joints:
+                    raise KeyError(
+                        f"{name!r} 每帧应为 {n_joints} 维（关节数），收到 per_frame={per_frame}"
+                        f"（shape={shape}）。时序堆叠项必须在 obs_format 里报成 `(frames, {n_joints})`。"
+                    )
+            else:
                 raise KeyError(
                     f"镜像算子不认识观测项 {name!r}（dim={dim}）⇒ 请在 `mirror.py` 的 "
                     f"VECTOR_TERM_SIGNS / JOINT_TERMS / SCAN_TERM 里登记它的镜像规则。"
@@ -196,6 +260,7 @@ class MirrorSpec:
                     f"关节={list(JOINT_TERMS)}"
                 )
             segments.append((str(name), slice(offset, offset + dim)))
+            frames.append(n_frames)
             offset += dim
         if scan_dim is None:
             raise KeyError(f"观测里找不到 {SCAN_TERM!r} 项")
@@ -205,7 +270,9 @@ class MirrorSpec:
                 f"已知 {SCAN_LAYOUTS}；新增扫描尺寸时请在此登记（ny=侧向、nx=前向）"
             )
         ny, nx = SCAN_LAYOUTS[scan_dim]
-        return MirrorSpec(tuple(joint_names), perm, sign, offset, ny, nx, tuple(segments))
+        return MirrorSpec(
+            tuple(joint_names), perm, sign, offset, ny, nx, tuple(segments), tuple(frames)
+        )
 
     # --- 单段 ---
     def mirror_joints(self, q: torch.Tensor) -> torch.Tensor:
@@ -237,18 +304,50 @@ class MirrorSpec:
 
     # --- 整段观测 ---
     def mirror_obs(self, obs: torch.Tensor) -> torch.Tensor:
-        """`obs` 最后一维 = `self.obs_dim`（v1~v8: 626；v9: 378）。返回同形状镜像观测。"""
+        """`obs` 最后一维 = `self.obs_dim`（v1~v8: 626；v9: 378；T1o: 663）。返回同形状镜像观测。
+
+        ⭐ **时序堆叠项**（`history_length > 1`）的镜像规则：
+        堆叠项在观测里是 `[frame_0(per_frame 长), frame_1, …, frame_{n-1}]` 的**连续块**，
+        且每一帧的镜像规则**相同** ⇒ 等价于"把每帧各自镜像后拼起来"，等价于把
+        `(perm, sign)`（或符号向量）**平铺 n 次**：
+            `perm_flat = perm.repeat(n)`，`sign_flat = sign.repeat(n)`
+        （因为 frame f 里的索引 i 全局是 `f*per + i`，镜像后应是 `f*per + perm[i]`）。
+        """
         if obs.shape[-1] != self.obs_dim:
             raise ValueError(f"policy obs 最后一维应为 {self.obs_dim}，收到 {obs.shape[-1]}")
         out = obs.clone()
-        for name, sl in self.segments:
+        for _i, (name, sl) in enumerate(self.segments):
+            n_frames = self.frames[_i] if self.frames else 1
             if name == SCAN_TERM:
-                out[..., sl] = self.mirror_scan(obs[..., sl])
+                if n_frames == 1:
+                    out[..., sl] = self.mirror_scan(obs[..., sl])
+                else:
+                    #: 堆叠的 height_scan（T2 的 1500：279×4）：**逐帧**做侧向翻转。
+                    #: `mirror_scan` 只动最后一维 ⇒ 把帧当成额外的 batch 维即可。
+                    #: ⚠️ `MirrorSpec` 上**没有** `scan_dim` 属性（只有 `scan_ny`/`scan_nx`）。
+                    _per_scan = self.scan_ny * self.scan_nx
+                    _v = obs[..., sl].reshape(*obs.shape[:-1], n_frames, _per_scan)
+                    out[..., sl] = self.mirror_scan(_v).reshape(
+                        *obs.shape[:-1], sl.stop - sl.start
+                    )
             elif name in JOINT_TERMS:
-                out[..., sl] = self.mirror_joints(obs[..., sl])
+                if n_frames == 1:
+                    out[..., sl] = self.mirror_joints(obs[..., sl])
+                else:
+                    # ⚠️⚠️ **不能用 `perm.repeat(n)`** —— `repeat` 平铺的是**值**，
+                    #     于是 frame f 的索引 i（全局 `f*29+i`）会被映射到 `perm[i]`
+                    #     （**丢掉了 +f*29 的帧内偏移**，等于把第 f 帧的关节映到第 0 帧）。
+                    #     正确做法：值 + 帧偏移。**`test_mirror_frames.py` 的对合检验就是
+                    #     为抓这个 bug 写的（第一版实现正是这么错的）。**
+                    _n_j = self.perm.numel()
+                    _off = torch.arange(n_frames, device=obs.device) * _n_j
+                    _perm = (self.perm.to(obs.device)[None, :] + _off[:, None]).reshape(-1)
+                    _sign = self.sign.repeat(n_frames).to(obs.device)
+                    out[..., sl] = _sign * obs[..., sl][..., _perm]
             else:
-                # 极 / 轴向量：y 反号 / (wx, wz) 反号
-                out[..., sl] = obs[..., sl] * obs.new_tensor(VECTOR_TERM_SIGNS[name])
+                # 极 / 轴向量：y 反号 / (wx, wz) 反号（时序堆叠 ⇒ 符号向量平铺 n 帧）
+                _sg = obs.new_tensor(VECTOR_TERM_SIGNS[name]).repeat(n_frames)
+                out[..., sl] = obs[..., sl] * _sg
         return out
 
     def mirror_action(self, act: torch.Tensor) -> torch.Tensor:

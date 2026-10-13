@@ -16,8 +16,12 @@ KEYSET = ["R:action_rate_l2", "R:dof_acc_l2", "R:dof_pos_limits",
           "R:flat_orientation_l2", "R:lin_vel_z_l2", "R:joint_deviation_torso",
           "R:joint_deviation_arms", "R:joint_deviation_hip", "R:joint_deviation_knee",
           "R:termination_penalty", "R:feet_lateral_width", "R:feet_crossing"]
-POS = ["R:track_lin_vel_xy_exp", "R:track_base_height", "R:feet_air_time",
-       "R:body_ang_vel_xy", "R:track_ang_vel_z_exp"]
+#: ⚠️ T2（全权照抄 mjlab）把两个跟踪项改了名字（`track_lin_vel_xy_exp` →
+#: `track_anchor_linear_velocity`、`track_ang_vel_z_exp` → `track_anchor_angular_velocity`）
+#: ⇒ 两张名字都留着（不存在的项由 `m0` 记 0，见下）。
+POS = ["R:track_lin_vel_xy_exp", "R:track_anchor_linear_velocity",
+       "R:track_base_height", "R:feet_air_time",
+       "R:body_ang_vel_xy", "R:track_ang_vel_z_exp", "R:track_anchor_angular_velocity"]
 PROBES = ["hf_acc_all", "hf_acc_legs", "hf_acc_arms",
           "stand_pose_vel_err", "stand_pose_pos_err",
           "air_time_hop_frac", "air_time_in_band_frac", "air_time_single_stance",
@@ -29,12 +33,24 @@ def m(v, k):
     return st.mean(s) if s else float("nan")
 
 
+def m0(v, k):
+    """同 `m`，但**缺失项记 0** —— 只用于"按项求和"的账目。
+
+    ⚠️ 必须区分两种缺失：该臂**主动删掉了**某一项（如 T2 照着 mjlab 删了
+    `feet_air_time`/`flat_orientation_l2`/`joint_deviation_*`）时，它在账目里就该是 0；
+    而探针类缺失仍应报 `nan`（别把"没测"当成"测得 0"）⇒ 探针走 `m`、求账走 `m0`。
+    （之前统一返回 nan，会让 T2 的"任务项合计"整列变成 NaN。）
+    """
+    s = v["series"].get(k)
+    return st.mean(s) if s else 0.0
+
+
 def pen_sum(v):
-    return sum(m(v, k) for k in KEYSET)
+    return sum(m0(v, k) for k in KEYSET)
 
 
 def pos_sum(v):
-    return sum(m(v, k) for k in POS)
+    return sum(m0(v, k) for k in POS)
 
 
 print("=" * 132)

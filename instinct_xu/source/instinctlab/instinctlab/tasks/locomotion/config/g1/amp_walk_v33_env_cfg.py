@@ -1,58 +1,61 @@
-"""V33 实验的环境配置：**结构级对齐 mjlab 的三臂**（S0 / S1 / A-cold），共用同一 fork 点。
+"""V33：**结构级对齐 mjlab 的三臂**（S0 / S1 / A-cold）+ 派生臂 S2~S8（2026-10-06 起，共用同一 fork 点）。
 
-## 实验设计（2026-10-06，用户确认）
+## ⚠️ 本层对**今天**仍有影响的部分
 
-fork 点 = V31 `model_11500.pt`（actor **热启动续训**，判别器**从零重学**，三臂同起点 / 同预算
-`11500 → 12500`（1000 iters）/ 同种子 / **同指令分布**）。
+* ⭐ **AMP 状态 = 396 维**（body 系 195/帧 × 2 帧 + ③ 补的"anchor 投影重力" 3 维/帧）
+  ⇒ 判别器输入布局今天仍沿用（`...amp13body2frame396gra...`）。
+* ⭐ **指令修正 `side_vel_min = 0.15`**（纯侧向档永不落入静止门）今天仍生效（单测 `test_side_vel_min.py` 14/14）。
+* ⭐ `track_lin_vel_xy_exp` 的 `func` 换成**无损诊断版** `track_lin_vel_xy_axis_diag`（返回值与原项逐样本
+  相等 ⇒ 训练奖励一分不变），今天仍是该项的 func。
+* **判别器口径**（S7 正则 + S8 的 `coef=4.0` / `adaptive` LR；**无白化 / raw GP**）**今天仍在用**
+  —— 经 V33-**S8** → T1a → … → T1l（见 `agents/amp_walk_t1a_ppo_cfg.py`）。
+* ❌ 奖励权重（`flat_orientation −4` / `air_time` / `track_lin 3` / `track_ang 1.5` / `arms 0`）与 λ 0.75/0.70 已被 T1a/T1a2/T1l 覆盖。
 
-| 臂 | 环境 cfg | 算法 cfg | 相对 V31 的差异 |
-|---|---|---|---|
-| **S0 结构包** | `G1AmpWalkV33SEnvCfg` | `G1AmpWalkV33SPPORunnerCfg` | 见下 ①②③ |
-| **S1 结构包+拆脚手架** | `G1AmpWalkV33S1EnvCfg` | 同 S0 | ① ② ③ + `feet_air_time 4→2`、`joint_deviation_arms −0.1→0` |
-| **A-cold 旧口径冷启动** | `G1AmpWalkV33AColdEnvCfg` | `G1AmpWalkV33AColdPPORunnerCfg` | 只换指令分布 + 丢判别器（旧 AMP 口径 390 / 无白化 / raw GP）|
+## 三臂 + 派生臂一览（每条臂一句话差异 —— 查"V33Sx 做了什么"从这里进）
 
-### 三臂共有的指令分布修正（**用户要求**，不是实验变量）
+| 臂 | 一句话差异（相对基准）| 环境 cfg |
+|---|---|---|
+| **S0 结构包** | 加 ③ anchor 投影重力（390→396）；①② 白化 + GP 归一化在算法 cfg | `G1AmpWalkV33SEnvCfg` |
+| **S1** | S0 + `feet_air_time 4→2`、`joint_deviation_arms −0.1→0`（拆脚手架）| `G1AmpWalkV33S1EnvCfg` |
+| **S2** | S0 环境侧不动，只把白化 `eps 0.1→0.01`（mjlab 原值，差异在算法 cfg）| `G1AmpWalkV33S2EnvCfg` |
+| **S3** | S0 + **去白化** + 定向削弱三项（air 2 / arms 0 / track_lin 2）| `G1AmpWalkV33S3EnvCfg` |
+| **S4** | S3 + `air_time 0`、`track_lin 3`、`track_ang 1.5`、λ 0.70 | `G1AmpWalkV33S4EnvCfg` |
+| **S5** | S3 + `air_time 1.0`（回退一半）+ `track_lin 3` / `track_ang 1.5`（跟踪优先）| `G1AmpWalkV33S5EnvCfg` |
+| **S6** | 环境侧 = S4 逐字，只把算法侧 `discriminator_reward_coef 1→4` | `G1AmpWalkV33S6EnvCfg` |
+| **S7** | 环境侧 = S5 逐字，只把判别器正则回归 mjlab（GP 5 / wd 3e-4 / logit_wd 0.04），判别器重学 | `G1AmpWalkV33S7EnvCfg` |
+| **S8** | 环境侧 = S5 逐字，算法侧 `coef 4.0` + `schedule adaptive`（配对）| `G1AmpWalkV33S8EnvCfg` |
+| **A-cold** | 旧口径冷启动：只换指令分布 + 丢判别器（390 / 无白化 / raw GP）| `G1AmpWalkV33BaseEnvCfg` |
 
-`commands.base_velocity.side_vel_min = 0.15`：原来的纯侧向档 `vy ~ U(−0.5, 0.5)` 会采到
-`|vy| ≤ 0.1`，而**所有**"静止/低速"门控（`track_default_pose_on_stand`、`disable_style_on_stand`、
-`feet_lateral_width/crossing` 的 `w_act`）用的是
+⚠️ **起点**：S0/S1/A-cold = V31 `model_11500.pt`；S3 起 V31 重新 fork（S3 与 S4 同起点）；S5/S7/S8 = S3/S5 `13500.pt`。
 
-        ‖(vx, vy)‖ + |ωz| ≤ low_vel (0.1)
+## 本层改动一览（环境侧）
 
-⇒ 这类侧向指令会**同时**被要求"侧移"和"立定回位"，监督信号自相矛盾。
-改成 `|vy| ~ U(0.15, 0.5)` + 随机符号后，纯侧向档**永不落入静止门**
-（单测 `instinct/tools/test_side_vel_min.py` 14/14 钉住；`side_vel_min=0` 时行为**逐位不变**）。
+| # | 改动 | 现状（今天实际生效）|
+|---|---|---|
+| ① | **判别器输入白化**（`EmpiricalNormalization`，expert-only 累积）〔算法 cfg〕| ❌ S3/S4 起**已去白化**（今天 = 无白化）|
+| ② | **GP 在归一化空间求**（`amp_grad_pen_space="normalized"`）〔算法 cfg〕| ❌ 已回 **`raw`**（今天 = 无白化 + raw GP）|
+| ③ | **AMP 状态补 3 维 anchor 投影重力**（390 → 396）| ✅ 今天仍生效（判别器输入 396）|
+| ④ | 三臂共有：`side_vel_min = 0.15` + `track_lin_vel_xy_exp` → 无损诊断版 | ✅ 都仍生效 |
+| ⑤ | S1 拆脚手架（`feet_air_time 4→2`、`joint_deviation_arms →0`）| ❌ 已被覆盖 → T1l：`air_time +1` / `arms −0.1` |
+| ⑥ | S3~S8 的奖励 / λ / coef 调整 | ❌ 已被 T1a/T1a2/T1l 覆盖（仅 `coef 4.0` / adaptive LR / S7 正则沿用至今）|
 
-### S0 = 结构级三件事（都是"机制对齐"，不是调参）
+## 推理与判读（已归档，勿在本文件重复）
 
-**① 判别器输入白化（真开）** —— 算法 cfg：`discriminator_kwargs` 加
-`normalizer_class_name="EmpiricalNormalization"`。
-机制一直在（`Discriminator` + `wasabi.py` 的 `normalize_input`/`forward_normalized`/GP 空间开关，
-V22 分支预留），但**主链从未打开**（ckpt 的 `discriminator` 里没有 `normalizer.*` 键 = 铁证）。
-统计量口径取 **expert/reference 侧单独累积**（`amp_normalizer_expert_only=True`，沿用 V30 值）：
-`ExpertBatch` 是**全数据集 i.i.d. 抽帧** ⇒ 白化变换是**由专家分布唯一确定**的固定仿射映射，
-actor / reference 走同一映射 ⇒ 判别器看到的是"同一把尺子"。
-（mjlab 是两侧都更新；本轮**刻意**保守：策略分布不参与定尺，少一个被污染的自由度。）
+* **① 白化的动机与后果**（expert-only 统计量 ⇒ 判别器看"同一把尺子"；后实测 S0 的白化把风格信号打塌 ⇒ S3 去白化）
+  · **② 必须与 ① 同时开**（归一化空间求 GP；原始空间 `∂d/∂x = (∂d/∂x̃)/σ` 在近常数维会爆量级）
+  · **S2/S3 去白化、S4↔S5 的 `air_time` 权衡、S6 崩溃、S7 负结果、S8 配对**
+  → `instinct/docs/v33_tracking_gait_analysis.md` §5.5/§5.7/§5.8 + 该版 run 日志
+* **③ 为什么补 anchor 投影重力**（原 390 维**全部**是"anchor 相对位姿 + 各刚体自身系速度" ⇒ 对整体旋转不变
+  ⇒ 判别器对"绕横轴转 20°"无感；V30 后仰 24°（参考前倾 9°）正是这个盲区）→ 见该版 run 日志；
+  该改动改变了判别器输入维度 ⇒ 专家数据集须按 396 维重导（`cloud_export_amp_expert.py --with_anchor_gravity`）
+* **④ 指令修正的监督矛盾**（纯侧向档 `vy ~ U(−0.5,0.5)` 会采到 `|vy| ≤ 0.1`，而所有"静止门控"共用
+  `‖(vx,vy)‖ + |ωz| ≤ low_vel` ⇒ 同时被要求"侧移"和"立定回位"）→ 见该版 run 日志 + 单测
 
-**② GP 在归一化空间求（必须与 ① 同时开）** —— `amp_grad_pen_space="normalized"`。
-在原始空间求得到 `∂d/∂x = (∂d/∂x̃)/σ`，`σ` 在近常数维 →0 ⇒ `‖∇d‖` 爆量级 ⇒ GP 项支配损失。
+⚠️ 其余逐字不动：观测布局（字段声明顺序 = 判别器输入拼接顺序）、`flat_orientation_l2 = −4`（V31 值）、
+   `style_lerp 0.75`、专家数据集；⚠️ **不扩充参考集**（用户实测：扩充反而导致风格混乱）⇒ 参考集本次不动。
 
-**③ AMP 状态补 3 维「anchor 投影重力」（390 → 396）** —— obs 组加 `anchor_gravity_b`。
-根因：现有 390 维**全部**是"anchor 相对位姿 + 各刚体自身系速度"⇒ 对**整体旋转不变**
-⇒ 判别器对"整段运动绕横轴转 20°"无感。V30 实测后仰 24°（参考是前倾 9°）正是这个盲区，
-姿态只能靠 `flat_orientation_l2` 一项定价。补的 `R_anchor^T·(0,0,-1)` 对**偏航**天然不变
-（重力平行于偏航轴）、对**俯仰/横滚**敏感 ⇒ 判别器第一次能"看见"绝对姿态。
-
-⇒ ③ 改变了判别器输入维度 ⇒ 必须重新导出**离线专家数据集**（396 维，见
-`instinct/tools/cloud_export_amp_expert.py --with_anchor_gravity`）。
-
-### S1 = S0 + 拆脚手架（两项都不是拍脑袋）
-
-* `feet_air_time` **4.0 → 2.0**：我们**自己加的**手写步态节奏器（mjlab 行走奖励集**没有**这项）。
-  V30 逐项会计显示它是"买后仰"的钱袋子（+0.33/步）。保留 2.0（而非 0）是守 hop 红线。
-* `joint_deviation_arms` **−0.1 → 0.0**：实测手臂是 default↔reference 差异最大部位
-  （`right_elbow 0.508`、`left_elbow 0.409` rad，且 default 落在参考范围**之外**），
-  该项把手往 default 拉 ⇒ 与 AMP 先验正面对撞。V9c 有先例。
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V33S-G1-v0`
 """
 
 from __future__ import annotations

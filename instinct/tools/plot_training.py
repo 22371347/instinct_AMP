@@ -105,9 +105,18 @@ NUM_REWARDS = int(os.environ.get("LLP_NUM_REWARDS", "1"))
 SMOOTH = int(os.environ.get("LLP_SMOOTH", "100"))
 DPI = int(os.environ.get("LLP_DPI", "130"))
 
-# `Episode_Reward/*` 全量候选（21 项 = 本任务 RewardManager 的 active_terms）。
-# 缺失项由 `available_reward_tags()` 动态过滤 —— 以后删/改奖励项不会打断绘图。
+# `Episode_Reward/*` —— ⚠️ **这只是"展示顺序提示"，不是白名单**。
+# 真正画哪些项由 `Trainer.reward_tags()` 从 TB 里**动态发现**（`Episode_Reward/*` 全拿）。
+# ⭐ 历史坑（2026-10-09）：T2（全权照抄 AMP_mjlab）把两个跟踪项改成了 mjlab 的名字
+#   （`track_lin_vel_xy_exp` → `track_anchor_linear_velocity`、
+#    `track_ang_vel_z_exp` → `track_anchor_angular_velocity`），
+#   而这里是硬编码的旧名字 ⇒ **这两条曲线整条从图上消失**，看起来像"奖励没设计速度跟踪"，
+#   实际是**画图遗漏**（训练日志里 `Episode_Reward/track_anchor_linear_velocity` 一直都在）。
 REWARD_TAGS = [
+    # ---- T2（mjlab 命名）----
+    "Episode_Reward/track_anchor_linear_velocity",
+    "Episode_Reward/track_anchor_angular_velocity",
+    # ---- T1 及更早 ----
     "Episode_Reward/track_lin_vel_xy_exp",
     "Episode_Reward/track_ang_vel_z_exp",
     "Episode_Reward/track_base_height",
@@ -379,6 +388,23 @@ class Plotter:
             self.tags_cache = sorted(t)
         return self.tags_cache
 
+    def reward_tags(self) -> list[str]:
+        """本 run（们）**实际存在**的 `Episode_Reward/*`（`REWARD_TAGS` 仅用于排顺序）。
+
+        ⚠️ 以前这里是**硬编码白名单** ⇒ 一旦某个臂改了奖励项名字，那条曲线会**静默消失**，
+        很容易被误读成"奖励设计漏了某项"（T2 的 `track_anchor_linear_velocity` 就是这样
+        从图上消失的，而它在训练日志里一直存在）。
+        现在：按 TB 里真实存在的 tag 发现，未登记的项按字母序排在后面。
+        """
+        have: set[str] = set(self.tags())
+        for d in self.runs:
+            have.update(available_tags(d))
+        known = [t for t in REWARD_TAGS if t in have]
+        extra = sorted(
+            t for t in have if t.startswith("Episode_Reward/") and t not in set(known)
+        )
+        return known + extra
+
     def find(self, substr: str, *, exclude: str | None = None) -> str | None:
         """按子串找 tag（用于不确定精确名字的量）。"""
         for t in self.tags():
@@ -433,8 +459,10 @@ class Plotter:
         self.save(fig, "01_overview.png")
 
     def fig_reward_terms(self):
-        tags = [t for t in REWARD_TAGS if self.latest_value(t)[1] is not None or
-                (self.mode == "full" and any(len(_series(d, t)[1]) for d in self.runs))]
+        # ⭐ 动态发现（不再是硬编码白名单）：T2 改名后的 `track_anchor_*` 以前会被静默丢掉
+        tags = [t for t in self.reward_tags()
+                if self.latest_value(t)[1] is not None
+                or (self.mode == "full" and any(len(_series(d, t)[1]) for d in self.runs))]
         n = max(len(tags), 1)
         cols = 3
         rows = (n + cols - 1) // cols
@@ -451,7 +479,18 @@ class Plotter:
         self.save(fig, "02_reward_terms.png")
 
     def fig_amp_diagnostics(self):
-        fig, axes = plt.subplots(2, 3, figsize=(20, 9))
+        """判别器诊断。
+
+        ⭐ 2026-10-10 新增 `amp_d` / `amp_d_ref` 以及两者的**差距图**（第 9 格）。
+        这两个量是「AMP 风格到底有没有在干活」的**唯一直接证据**：
+          - `amp_d`     = D(策略状态)  → +1 = 完全像参考
+          - `amp_d_ref` = D(参考状态)  → 判别器自己的「满分线」，恒 ≈ +1
+          - 差距 `amp_d_ref − amp_d` = **判别器还剩多少可分辨度**。
+            差距≈0 ⇒ D 贴死/摆烂（T1l：`amp_d_ref +0.93`）；
+            差距大 ⇒ D 在工作（T2 末期：`amp_d_ref +0.52` vs `amp_d −0.83`，gap≈1.35）。
+        ⚠️ 本仓库的 `amp_d` 是 **wasserstein 原始打分**（不是概率），量纲 ±~1，可为负。
+        """
+        fig, axes = plt.subplots(3, 3, figsize=(20, 13))
         fig.suptitle("AMP Discriminator Diagnostics", fontsize=13)
         for ax, (tag, title) in zip(axes.flat, [
             ("Loss/discriminator_loss", "discriminator_loss"),
@@ -460,9 +499,60 @@ class Plotter:
             ("Loss/logit_weight_decay", "logit_weight_decay"),
             ("Step/discriminator_reward", "discriminator_reward (aux, this repo)"),
             ("Step/amp_style_reward", "amp_style_reward = r_amp (log only, quad in [0,1])"),
+            ("Step/amp_d", "amp_d = D(policy state)   [+1 = reference-like]"),
+            ("Step/amp_d_ref", "amp_d_ref = D(reference state)   [should stay ~+1]"),
         ]):
             self._panel(ax, tag, title, smooth=50)
+        self._panel_amp_d_gap(axes[2, 2])
         self.save(fig, "03_amp_diagnostics.png")
+
+    def _panel_amp_d_gap(self, ax):
+        """`amp_d` 与 `amp_d_ref` **画在同一张图**上，并填色标出差距。
+
+        分开看两个数很费劲：并排一看就知道判别器是「在干活」还是「贴死/摆烂」。
+        """
+        s_d, v_d = self.get("Step/amp_d", smooth=50)
+        s_r, v_r = self.get("Step/amp_d_ref", smooth=50)
+        ax.set_title("amp_d vs amp_d_ref  (shaded = how much D prefers reference)", fontsize=10)
+        # ⚠️ 必须**纯 ASCII**：云端 matplotlib 只有 DejaVu Sans（无 CJK 字形）
+        ax.set_xlabel("iteration" if self.drop_iters <= 0
+                      else f"iteration  (first {self.drop_iters} iters hidden)")
+        ax.grid(alpha=0.3)
+        if len(v_d) == 0 and len(v_r) == 0:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=10)
+            return
+        if len(v_r):
+            ax.plot(s_r, v_r, lw=1.2, label="amp_d_ref (reference)")
+        if len(v_d):
+            ax.plot(s_d, v_d, lw=1.2, label="amp_d (policy)")
+        # 差距围填 + 末尾数值（读「现在还剩多少可分辨度」）
+        if len(v_d) and len(v_r):
+            x = np.union1d(s_d, s_r)
+            yd = np.interp(x, s_d, v_d)
+            yr = np.interp(x, s_r, v_r)
+            ax.fill_between(x, yd, yr, color="0.6", alpha=0.22)
+            ax.annotate(f"gap@end = {yr[-1] - yd[-1]:+.3f}",
+                        xy=(x[-1], 0.5 * (yd[-1] + yr[-1])), xytext=(-8, 0),
+                        textcoords="offset points", ha="right", va="center",
+                        fontsize=8, color="0.2",
+                        bbox=dict(boxstyle="round,pad=0.25", fc="white",
+                                  ec="0.7", alpha=0.85))
+        # y 轴：分位数裁剪（与 `_panel` 同法），但**保证 0 线与 +1 基准线可见**
+        if len(v_d) or len(v_r):
+            allv = np.concatenate([v for v in (v_d, v_r) if len(v)])
+            if len(allv) > 10:
+                lo, hi = np.nanpercentile(allv, [0.5, 99.5])
+            else:
+                lo, hi = float(np.min(allv)), float(np.max(allv))
+            lo, hi = min(lo, 0.0), max(hi, 1.0)
+            pad = 0.08 * (hi - lo) + 1e-9
+            ax.set_ylim(lo - pad, hi + pad)
+        for y, lab in ((0.0, " 0 = coin flip"), (1.0, " +1 = reference-like")):
+            ax.axhline(y, ls=":", lw=0.9, color="0.45")
+            ax.text(0.99, y, lab, transform=ax.get_yaxis_transform(),
+                    ha="right", va="bottom", fontsize=7, color="0.35")
+        ax.legend(fontsize=8, loc="best")
 
     def fig_foot_diagnostics(self):
         """⭐ 本任务最关键的设计风险点：步宽地板 / 交叉惩罚是否真的在起作用。
@@ -519,7 +609,7 @@ class Plotter:
             print(f"[INFO][{self.mode}] 05 无 Train/mean_reward 数据，跳过")
             return
         parts = []
-        for t in REWARD_TAGS:
+        for t in self.reward_tags():          # ⭐ 动态发现（含 T2 的 track_anchor_*）
             s, v = self.get(t, smooth=1)
             if len(v):
                 parts.append((s, v))

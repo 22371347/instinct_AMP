@@ -1,0 +1,44 @@
+"""AMP 行走 **v9（MVP）**：v8 续训发散后把变量收敛到四项的最小实现（2026-09-28）。
+
+## ⚠️ 本层对**今天**仍有影响的部分
+
+* ⭐ **`height_scan` = 3.0×0.8 m（279 射线）、中心前移 1.5 m** 今天仍生效
+  ⇒ 策略观测 **626 → 378**（`obs378` 沿用至 T1l；观测项名字/顺序未动）。
+* ⭐ **"越障侧与我们是同一个 `G1_29DOF_TORSOBASE_POPSICLE_CFG`（`default_joint_pos` 逐字相同）"
+  今天仍有效** ⇒ 动作语义 `q_target = default + 1.0·a`、`clip=None` 两边本来就一致。
+* ❌ MVP 指令集（仅前向 0~0.7）已被完全覆盖（V10 "③ 指令扩展" → V18 方案 B → V33 `side_vel_min`）。
+* ❌ `noise_std` 缩小（在算法 cfg）已被 T1a2 覆盖（`init_noise_std=1.0`）。
+
+## 本层改动一览
+
+| # | 改动 | 现状（今天实际生效）|
+|---|---|---|
+| ① | `height_scan` 3.0×0.8（**279**，`resolution=0.1`）+ **中心前移 1.5 m**（`AMP_WALK_V9_SCAN_FORWARD`，`ray_alignment="yaw"`）⇒ 观测 **626 → 378** = 279+3+3+3+3+29+29+29 | ✅ 仍生效（观测 378）|
+| ② | `default_joint_pos` / `offset` 对齐越障 | ⚪ **核查后本来就一致**，未改（见下）|
+| ③ | `noise_std` → AMP_mjlab 等效值（+ std 上限）〔算法 cfg〕| ❌ 已被 T1a2 覆盖 |
+| ④ | MVP 指令集（原地 + 前向 0~0.7）+ 仅前向数据集 | ❌ 已被 V10 / V18 / V33 覆盖 |
+
+**② 的核查（今天仍适用）**：两边同一个 POPSICLE cfg（`default_joint_pos` 逐字相同）；
+`JointPositionActionCfg.use_default_offset` **默认 True**（`actions_cfg.py:52`）⇒ 越障侧没写也等于 True；
+蒸馏教师 `perceptive_vault` 的 `scale` 也是 **1.0**（只有 `beyondmimic_vault` 用逐关节 `0.25·e/kp`）。
+
+**④ 当时口径**：低速/原地 **0.30**（幅值 ≤0.1、`wz=0`；其中 60% 给精确 (0,0,0) ⇒ 占全体 18%）；
+纯侧向 / 纯前后 / 持续后退 **0 / 0 / 0**；均匀 0.70（`vx∈(0,0.7) / vy=0 / wz=0`，`vy`/`wz` 范围钉成 (0,0) 以免留死配置）。
+⚠️ `rel_standing_envs` / `rel_heading_envs` 仍 **0.0**、`heading_command` 仍 False（否则 `DirectionalVelocityCommand` fail-fast）；
+`resampling_time_range` 仍 **(6, 15) s**。
+
+## 推理与判读（已归档，勿在本文件重复）
+
+* ⚠️ **`height_scan` 出处对账**：手上越障源码 `perceptive_vault_cfg.py:327-334` 写的是 `pos=(0,0,20)`（**居中**）；
+  学长口头确认他的更新版**中心在机器人正前方** ⇒ 本文件按**前移 1.5 m** 实现（用户 2026-09-28 确认）。
+  若日后拿到他的 `params/env.yaml`，只需核对/修改 `AMP_WALK_V9_SCAN_FORWARD` 一行 → 见该版 run 日志
+* "仅前向数据集 / 指令 ⇒ AMP 压制侧移后退（**改命令分布无法解决**，只能补参考运动数据）"
+  → `docs/amp_walk/EXPERIMENTS.md` §D1
+* "镜像损失在**只有前向速度**时无法正常生效"（本层 MVP 指令即纯前向，正是 §A1 的前提）→ §A1
+* "95% 摔倒"只是断崖快照（v9g 振荡）→ §C1；"单脚侧身跳着走"退化模态 → §C3
+
+⚠️ 其余逐字不动：除 `height_scan` 宽度外，v8 的环境（动作 / 观测项 / 奖励表）逐字沿用。
+
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V9-G1-v0`
+"""

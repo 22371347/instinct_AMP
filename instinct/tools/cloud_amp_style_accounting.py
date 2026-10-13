@@ -45,6 +45,9 @@ STYLE_TAGS = [
     "Loss/amp_total_loss",
     "Episode_Reward/feet_air_time",
     "Episode_Reward/track_lin_vel_xy_exp",
+    # ⭐ T2（全权照抄 mjlab）的命名
+    "Episode_Reward/track_anchor_linear_velocity",
+    "Episode_Reward/track_anchor_angular_velocity",
     "Episode_Reward/action_rate_l2",
 ]
 
@@ -162,7 +165,12 @@ def main() -> int:
     line(f"⭐ 上限（占比{args.air_ceiling}·权重）", lambda r: args.air_weight * args.air_ceiling)
     line("⇒ 已拿到上限的百分比", lambda r: 100.0 * r[6].get("Episode_Reward/feet_air_time", 0.0)
          / (args.air_weight * args.air_ceiling))
-    line("track_lin_vel_xy_exp/步", lambda r: r[6].get("Episode_Reward/track_lin_vel_xy_exp", float("nan")))
+    line("track 线性跟踪/步", lambda r: r[6].get(
+        "Episode_Reward/track_anchor_linear_velocity",
+        r[6].get("Episode_Reward/track_lin_vel_xy_exp", float("nan"))))
+    line("track 角速度跟踪/步", lambda r: r[6].get(
+        "Episode_Reward/track_anchor_angular_velocity",
+        r[6].get("Episode_Reward/track_ang_vel_z_exp", float("nan"))))
 
     print("\n--- 判别器损失（占比）---")
     line("discriminator_loss", lambda r: r[6].get("Loss/discriminator_loss", float("nan")))

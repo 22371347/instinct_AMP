@@ -237,6 +237,115 @@ from .amp_walk_t1l_env_cfg import (
     G1AmpWalkT1lEnvCfg,
     G1AmpWalkT1lEnvCfg_PLAY,
 )
+
+# ==== T1m（2026-10-09）：打开 RSI 的**相位随机化**（单参数，对齐 mjlab 的核心设计）====
+# 用户核实：mjlab 是「所有 clip 所有帧拼成大池 + 均匀随机抽帧」⇒ actor 从**任意 clip、任意相位**开始；
+# 而我们（自 V5 起）是「随机选 clip，但起点固定 = 第 0 帧」。
+# 本臂只改 `motion_start_from_middle_range`: (0.0, 0.0) → **(0.0, 1.0)**。
+# 动机：策略随时被扔回运动的任意相位 ⇒ actor 分布始终与参考分布重叠 ⇒ 判别器不会塑成常数
+#   （我们实测 actor↔参考联合 gap ≈ 37σ ⇒ 判别器一个迭代就分开 = AMP 事实上失效）。
+# ⚠️ 同时推翻 `amp_walk_env_cfg.py` 里「随机起点会破坏循环步态相位连续性」的旧注释
+#   （它是从 Vault（非循环步态）经验外推的，从未在行走上验证）。见 `ARCH_DIFF_vs_MJLAB.md` §3。
+# 起点 = T1a2 的 model_7000.pt（与 T1j/T1i/T1k/T1l 同起点）；算法仍用 T1i 的 λ=0.975。
+from .amp_walk_t1m_env_cfg import (
+    G1AmpWalkT1mEnvCfg,
+    G1AmpWalkT1mEnvCfg_PLAY,
+)
+
+# ==== T1n（2026-10-09）：判别器输入**白化** + **重置判别器**热启动 ====
+# 诊断（云端 agent.yaml + TB 实测）：判别器已**彻底饱和** ——
+#   `amp_d = −0.94`（策略侧）/ `amp_d_ref = +0.93`（参考侧）/ `amp_style_zero_frac = 0.35~0.38`，
+#   而 `quad = clamp(1 − 0.25(d−1)², 0, 1)` 在 `d ≤ −1` 处**恰为 0 且 dr/dd = 0`
+#   ⇒ 35%+ 样本落在死区，余下基本是常数偏置 ⇒ `discriminator_reward_coef` 抬 80× 也无塑形效果。
+# 改动（**全在算法侧**，环境侧与 T1l 逐字相同）：
+#   ① `discriminator_kwargs` += `normalizer_class_name="EmpiricalNormalization"`
+#   ② `amp_grad_pen_space` "raw" → **"normalized"**
+#   ③ `fresh_discriminator_on_load` False → **True**（饱和是 MSE(d,±1) 的极值不动点，救不回来）
+# ⚠️ 与 T1m 的关系：T1m 的 RSI 相位随机化**已撤回**（实测无改善）；等判别器修好可再单试。
+# ⚠️ `track_base_height` std **已经是 0.3**（T1l 的 `hstd0p3` 就改完了，env.yaml 实测）
+#   ⇒ 本臂不再重复该动作。
+from .amp_walk_t1n_env_cfg import (
+    G1AmpWalkT1nEnvCfg,
+    G1AmpWalkT1nEnvCfg_PLAY,
+)
+
+# ==== T1o（2026-10-09）：actor 观测 **378 → 663**（本体感受加 4 帧历史 + 删 base_lin_vel）====
+# 依据（逐行核对 mjlab 源码）：`AMP_mjlab/.../amp_env_cfg.py:148-169` 的 actor 观测组有
+#   `history_length=4, history_ordering="time"` ⇒ **384 = 96 × 4 帧**，且**无 height_scan、
+#   无 base_lin_vel**。我们是 378 **单帧**，其中 279（74%）是平地上近乎常数的 height_scan。
+# 核心假设：**步态相位只能从历史推断** —— 单帧观测分不出两种相位，而"交替步"正是
+#   相位依赖的动作。这可能是"单脚跳/不交替/不抬脚"的结构性原因。
+# 本臂 663 = **279（height_scan 单帧，保留以对齐其它专家策略）+ 4×96（mjlab 口径）**，
+#   ❌ 删 `base_lin_vel`（mjlab 里它只在 critic；真机也没有这个量）。
+# ⚠️ obs 维度变了 ⇒ **必须从头训**（不带 --resume）；本臂是新基线族，不与 T1j~T1n 比数值。
+# ⚠️ 镜像算子已改成"帧感知"（原实现遇 4 帧堆叠会抛形状错误）：`instinct/tools/test_mirror_frames.py`。
+from .amp_walk_t1o_env_cfg import (
+    G1AmpWalkT1oEnvCfg,
+    G1AmpWalkT1oEnvCfg_PLAY,
+    G1AmpWalkT1oTeacherEnv,
+)
+
+# ==== T2（2026-10-09 用户 + 学长决策）：**全权照抄 AMP_mjlab walk 配方** ====
+# mjlab 源码在 `/home/leo/rsl_project/AMP_mjlab`（workspace 外）。逐行核对后的照抄清单：
+#   * 观测：6 项 × `history_length=4` = 384（mjlab walk **删掉了** height_scan）
+#   * 奖励：**13 项**（track_anchor_lin/ang/height/body_ang_vel/action_rate/pos_limits
+#     /acc_l2/foot_slip/self_collisions/termination/default_pose/feet_lateral_width/feet_crossing）
+#   * 命令：Directional，(6,15) resample、prob_low .20/zero .6、side .20、lin .40(fwd .7)、back .10
+#   * 终止：time_out / bad_orientation 70° / bad_base_height 0.5（**无 base_contact**）
+#   * 事件：push_robot **1~3 s** 强推 + base_com；**无** reset_base / reset_robot_joints / add_base_mass
+#   * 复位：⭐ **RSI** —— 机器人状态 = 参考帧状态（我们**从未**真正接上过，本臂修正）
+#   * 算法：λ=0.75 / c=0.1（风格 0.025）、判别器 [1024,512,256] + 白化 + GP10(expert)
+#     + trunk/head wd 1e-3/1e-2 + 离线专家集、entropy .005、hidden (512,256,128)
+# 3 处例外：① `action_scale` 保持 1.0；② 探索噪声 0.25倍（init 0.25 / 下限 0.0125）；
+#   ③ `height_scan` 保留并**发 4 帧** ⇒ obs = 279×4 + 96×4 = **1500**。
+# 偏离见 `amp_walk_t2_env_cfg.py` 文件头的偏离表（共 11 条，逐条有理由）。
+# ⚠️ 必须**冷启动**（obs 1500）。
+from .amp_walk_t2_env_cfg import (
+    G1AmpWalkT2EnvCfg,
+    G1AmpWalkT2EnvCfg_PLAY,
+    G1AmpWalkT2TeacherEnv,
+)
+
+# ==== T3（2026-10-10 用户决策）：T2 + **只改一项奖励的靶与权重**（做减法）====
+# ① `track_base_height`: weight 1.5 → **1.0**、`target_height` None(=0.82 生成高度)
+#    → **0.8025**（= default 站姿的实测离地高度，见 `analyze_default_pose_height.py`）
+#    ⇒ 改完后该项值≈0.998~1.0（**基本变成常数**），不再对“立腰/伸膝”产生梯度，只留防塌。
+# ② 算法侧：`fresh_discriminator_on_load` True → **False**（续训时**保住刚活过来的判别器**）
+# 起点：**热启动** `t2_mjlabcopy_obs1500_rsi_cold` / `model_11500.pt`（obs 契约未变 ⇒ 可直接 resume）。
+# ⚠️ 契约（obs 1500 / 命令 / 动作语义）与 T2 完全相同 ⇒ 校验器直接继承。
+from .amp_walk_t3_env_cfg import (
+    G1AmpWalkT3EnvCfg,
+    G1AmpWalkT3EnvCfg_PLAY,
+    G1AmpWalkT3TeacherEnv,
+)
+
+# ==== T4（2026-10-10 用户决策）：**真消融** —— 整项移除 `track_base_height` ====
+# 目的：用实验把"是不是 height 项把躯干顶直"这条腿彻底钉死，并留一个"无高度项"对照基座
+#      （后续 `pelvis`-root 冷启动臂用）。非零奖励项 **12 → 11**。
+# 起点与 T3 相同（`t2_mjlabcopy_obs1500_rsi_cold` / `model_11500.pt`）⇒ T2/T3/T4 可直接对比。
+# ⚠️ 发车前预判（实测：该项在此轨迹上的姿态力只有 0.0035 reward/s = 总幅度的 0.08%，
+#    且 T3 已把它的方向翻转、12600 轮姿态纹丝不动）⇒ **预计本臂也不变**。
+# ⚠️ 移除后**不再有防塌正则** ⇒ 若出现蹲走，只能读成"撤了保险"，不得归因于"该项有害"。
+from .amp_walk_t4_env_cfg import (
+    G1AmpWalkT4EnvCfg,
+    G1AmpWalkT4EnvCfg_PLAY,
+    G1AmpWalkT4TeacherEnv,
+)
+
+# ==== T5（2026-10-10 用户决策）：高度项**换体** —— 量躯干 → 量骨盆 ====
+# `track_base_height`(root=torso_link, 靶 0.82 生成高度) → `track_pelvis_height`
+#   （pelvis, 靶 **0.7585** = FK 一致的站姿骨盆高度；weight/std 保持 mjlab 的 1.5/0.3）。
+# 为什么：骨盆高度**只由腿决定**（躯干高度可以用腰换）⇒ 这一项第一次变成"约束腿伸展量"，
+#   即 mjlab `track_root_height` 的原意。⚠️ 不取 mjlab 字面值 0.78：它比 FK 站姿高 2.15 cm，
+#   会逼腿伸直进奇异点（用户明确提醒）。非零奖励项仍 **12**。
+# ✅ 只改奖励函数 ⇒ 资产/关节序/动作语义/镜像映射/obs 维度全不变:
+#   **与越障（同资产）仍同源、蒸馏零影响**，且 **可热启动续训**（不需冷启动）。
+# 起点与 T3/T4 相同（`t2_mjlabcopy_obs1500_rsi_cold` / `model_11500.pt`）。
+from .amp_walk_t5_env_cfg import (
+    G1AmpWalkT5EnvCfg,
+    G1AmpWalkT5EnvCfg_PLAY,
+    G1AmpWalkT5TeacherEnv,
+)
 from .omni_loco_env_cfg import G1OmniLocoEnvCfg, G1OmniLocoEnvCfg_PLAY, G1OmniLocoTeacherEnv
 
 for task_id, env_cfg in (
@@ -586,7 +695,11 @@ for task_id, env_cfg in (
 # 而我们 V9h 只有 0.3（±17°）+ 0.0025 ⇒ **比“能学会走路的配方”少 1.7~3.3 倍探索幅度**。
 # V9h@2050 的实测也支持这个方向：σ 稳在 0.31（不再自降）、`feet_air_time` 单调爬到 0.0384，
 # 而 `gap = d_ref − d_actor = 1.18` 说明判别器健康、瓶颈在“策略没探索过去”。
-# ⇒ V9i：`init_noise_std 0.5` / `clip_max_std 0.8` / `entropy_coef 0.005`（+`clip_min_std 0.025`），
+# ⇒ V9i：`init_noise_std 0.6` / `clip_max_std 0.7` / `entropy_coef 0.005`（+`clip_min_std 0.03`），
+#    ⚠️ 勘误（2026-10-08）：本行原先写 0.5 / 0.8 / 0.025，与**实际生效值**不符
+#    （实际 = 0.6 / 0.7 / 0.005 / min 0.03）。依据三处一致：`agents/amp_walk_v9i_ppo_cfg.py`、
+#    v9i 的 run_name（`_ns0.6_maxstd0.7_ent0.005_`）、`docs/amp_walk/EFFECTIVE_REWARDS.md`
+#    的「算法侧」节。⇒ **查算法侧值一律以该表为准，不要读这里的历史注释。**
 #    其余（20 项奖励、`lerp 0.75` / `ampc 0.25`、fixed LR、镜像 ON）与 V9h 逐字相同。
 # ⚠️ 不要与 V9h 并行跑（CPU 瓶颈，会两边减半）。
 for task_id, env_cfg in (
@@ -607,9 +720,12 @@ for task_id, env_cfg in (
 # V9h@4770 实测：`lin_vel_z_l2` 只罚**竖直**速度（该项仅 −0.0034/s ⇒ 几乎无竖直弹跳），
 # 而 `feet_air_time` 只要“恰好一只脚着地”就持续给满（不区分踩了 0.3 s 还是 10 s）
 # ⇒ 策略退化成“**单脚侧身跳着走**”：一侧脚一直踩地、另一侧吊着、靠上身侧倾推进。
-# ⚠️ **镜像损失拦不住它**：它约束 `π(M(o)) ≈ M(π(o))`（策略**函数**对称性），而单侧步态
-# 访问到的状态其镜像态**从未被访问**（off-distribution）⇒ 约束可在“没去过的状态”上被满足
-# （实测镜像损失仅 0.0368，步态却完全单侧）。
+# ⚠️ **镜像损失拦不住它**（实测镜像损失仅 0.0368，步态却完全单侧）。
+# ⚠️ 机理已勘误（2026-10-08）：原先写"单侧步态访问到的状态其镜像态从未被访问（off-distribution）
+# ⇒ 约束可在没去过的状态上被满足" —— 那是策略侧的说法，不是实际根因。根因在**命令分布**：
+# **V9h 当时只给了前向速度**（侧向/转向是 v10 的③指令扩展才加的）⇒ 状态集中在"直行流形"、
+# **没有镜像场景的计算空间 ⇒ 镜像损失在该条件下无法正常生效**
+# （见 `docs/amp_walk/EXPERIMENTS.md` §A1）。
 # ⇒ V9j 新增 `feet_swing_time_penalty`（`rewards_amp.py`）：
 #     `cost = Σ_f clamp(air_time_f − 0.6 s, 0) × 1[‖cmd_xy‖>0.1]`，权重 −0.5。
 #     走路摆动相 0.2~0.5 s ⇒ **恒为 0**；单脚吊腿腾空 1 s ⇒ −0.5/步（−25/s），
@@ -633,7 +749,8 @@ for task_id, env_cfg in (
 # ① 探索量级：`init_noise_std 0.6` / `clip_max_std 0.7` / `entropy_coef 0.005` / `clip_min_std 0.03`
 #    （参照：仓库里不含 AMP 的行走配方 = 1.0 / 无上限 / 0.008；用户实测 σ=1 那版略有走路模态，
 #      但无上限时 σ 会失控到 1.04 rad ⇒ 本版给硬天花板 0.7）
-# ② 数据层镜像增广 ON（`symmetric_augmentation_*`）——直接治“镜像态从未被访问”：
+# ② 数据层镜像增广 ON（`symmetric_augmentation_*`）——把 expert 分布**对称化**
+#    （原写"直接治镜像态从未被访问"，该归因已勘误，见 `docs/amp_walk/EXPERIMENTS.md` §A1）：
 #    判别器的 expert 分布变左右对称 ⇒ 单侧步态不再“像人”；映射用
 #    `build_joint_mirror(OMNI_LOCO_JOINT_ORDER)` 现算（与镜像损失同一套已验证代码）
 # ③ 指令扩展：(0,0.7) × (−0.35,0.35) × (−0.6,0.6) ⇒ 左前/右前对角 + 转向都要会（在数据集包络内）
@@ -1502,6 +1619,37 @@ for task_id, env_cfg, agent_module, agent_cls in (
         "G1AmpWalkT1iPPORunnerCfg",
     ),
     (
+        # ⭐ T1m：T1l + `motion_start_from_middle_range` (0.0,0.0) → **(0.0,1.0)**（单参数）。
+        #       打开 RSI 相位随机化，对齐 mjlab「全池随机抽帧」的核心设计。
+        #       起点 = T1a2 的 model_7000.pt（与 T1j/T1i/T1k/T1l 同起点可比）。
+        "Instinct-Amp-Walk-T1m-G1-v0",
+        G1AmpWalkT1mEnvCfg,
+        "amp_walk_t1i_ppo_cfg",
+        "G1AmpWalkT1iPPORunnerCfg",
+    ),
+    (
+        "Instinct-Amp-Walk-T1m-G1-Play-v0",
+        G1AmpWalkT1mEnvCfg_PLAY,
+        "amp_walk_t1i_ppo_cfg",
+        "G1AmpWalkT1iPPORunnerCfg",
+    ),
+    (
+        # ⭐ T1n：**判别器修复臂**（环境侧 = T1l，改动全在算法侧）：
+        #   判别器输入白化 + `amp_grad_pen_space="normalized"`
+        #   + `fresh_discriminator_on_load=True`（丢弃预训练判别器，从零学起）。
+        #   起点 = T1a2 的 model_7000.pt（与 T1j/T1i/T1k/T1l/T1m 同起点）。
+        "Instinct-Amp-Walk-T1n-G1-v0",
+        G1AmpWalkT1nEnvCfg,
+        "amp_walk_t1n_ppo_cfg",
+        "G1AmpWalkT1nPPORunnerCfg",
+    ),
+    (
+        "Instinct-Amp-Walk-T1n-G1-Play-v0",
+        G1AmpWalkT1nEnvCfg_PLAY,
+        "amp_walk_t1n_ppo_cfg",
+        "G1AmpWalkT1nPPORunnerCfg",
+    ),
+    (
         # ⭐ T1c：`style_lerp` 1.0 → **0.9**（风格权重 0.10 = T1b 的 40%）。
         #        T1b（λ=0.75 ⇒ 权重 0.25）实测把 `vx_high` 从 0.59 压到 0.014。
         #        环境仍复用 T1a2 的 env cfg；热启动自 **T1a2** 的 model_7000.pt。
@@ -1536,5 +1684,108 @@ for task_id, env_cfg, agent_module, agent_cls in (
         kwargs={
             "env_cfg_entry_point": env_cfg,
             "instinct_rl_cfg_entry_point": f"{agents.__name__}.{agent_module}:{agent_cls}",
+        },
+    )
+
+
+# --- T1o：663 观测契约（本体感受 4 帧）+ **冷启动** -------------------------------
+# ⚠️ **单独一个注册块**：上面的 T1* 循环把 `entry_point` 硬编码成 `G1AmpWalkV31TeacherEnv`
+#    （378 契约），而 T1o 的观测维度不同 ⇒ 必须换成带 663 期望值的校验器子类。
+#    其余契约（动作 29 / joint 顺序 / `use_default_offset` / 命令范围与保持时长）
+#    全部继承 —— 本臂一个字都没改。
+for task_id, env_cfg in (
+    ("Instinct-Amp-Walk-T1o-G1-v0", G1AmpWalkT1oEnvCfg),
+    ("Instinct-Amp-Walk-T1o-G1-Play-v0", G1AmpWalkT1oEnvCfg_PLAY),
+):
+    gym.register(
+        id=task_id,
+        entry_point=G1AmpWalkT1oTeacherEnv,
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": env_cfg,
+            "instinct_rl_cfg_entry_point": (
+                f"{agents.__name__}.amp_walk_t1o_ppo_cfg:G1AmpWalkT1oPPORunnerCfg"
+            ),
+        },
+    )
+
+
+# --- T2：全权照抄 AMP_mjlab walk + 3 处例外（obs 1500 / 真 RSI）+ **冷启动** ---------
+# ⚠️ **单独一个注册块**：T2 的观测（1500）与命令范围（(-0.5,1.0)/(±1.0)/(±1.57)）
+#    都与 T1* 循环里的 `G1AmpWalkV31TeacherEnv`（378 契约）不同 ⇒ 必须用带 1500 期望值
+#    的校验器子类。其余契约（动作 29 / `scale == 1.0` / joint 顺序 / `dt` / `heading_command=False`）
+#    全部继承 —— 本臂没改那些。
+for task_id, env_cfg in (
+    ("Instinct-Amp-Walk-T2-G1-v0", G1AmpWalkT2EnvCfg),
+    ("Instinct-Amp-Walk-T2-G1-Play-v0", G1AmpWalkT2EnvCfg_PLAY),
+):
+    gym.register(
+        id=task_id,
+        entry_point=G1AmpWalkT2TeacherEnv,
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": env_cfg,
+            "instinct_rl_cfg_entry_point": (
+                f"{agents.__name__}.amp_walk_t2_ppo_cfg:G1AmpWalkT2PPORunnerCfg"
+            ),
+        },
+    )
+
+
+# --- T3：T2 + `track_base_height` 改靶/降权（做减法）+ 续训保留判别器 --------------
+# ⚠️ 契约与 T2 **完全相同**（obs 1500 / 命令范围 (-0.5,1.0)/(±1.0)/(±1.57) / 保持 (6,15)）
+#    ⇒ entry_point 直接用 `G1AmpWalkT3TeacherEnv`（它只继承 T2 的校验器）。
+for task_id, env_cfg in (
+    ("Instinct-Amp-Walk-T3-G1-v0", G1AmpWalkT3EnvCfg),
+    ("Instinct-Amp-Walk-T3-G1-Play-v0", G1AmpWalkT3EnvCfg_PLAY),
+):
+    gym.register(
+        id=task_id,
+        entry_point=G1AmpWalkT3TeacherEnv,
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": env_cfg,
+            "instinct_rl_cfg_entry_point": (
+                f"{agents.__name__}.amp_walk_t3_ppo_cfg:G1AmpWalkT3PPORunnerCfg"
+            ),
+        },
+    )
+
+
+# --- T4：T3 **整项移除 `track_base_height`**（消融臂，非零项 12→11）------------------
+# ⚠️ 契约仍与 T2/T3 完全相同（obs 1500 / 命令 / 动作语义）⇒ 校验器直接继承；
+#    `rewards={n}` 在契约校验里只打印不断言 ⇒ 不会拦车。
+for task_id, env_cfg in (
+    ("Instinct-Amp-Walk-T4-G1-v0", G1AmpWalkT4EnvCfg),
+    ("Instinct-Amp-Walk-T4-G1-Play-v0", G1AmpWalkT4EnvCfg_PLAY),
+):
+    gym.register(
+        id=task_id,
+        entry_point=G1AmpWalkT4TeacherEnv,
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": env_cfg,
+            "instinct_rl_cfg_entry_point": (
+                f"{agents.__name__}.amp_walk_t4_ppo_cfg:G1AmpWalkT4PPORunnerCfg"
+            ),
+        },
+    )
+
+
+# --- T5：高度项**换体**（量躯干 → 量骨盆, 靶 0.7585），非零项仍 12 -----------------
+# ⚠️ 契约（obs 1500 / 命令 / 资产 / 动作语义）与 T2 相同 ⇒ entry_point 直接继承。
+for task_id, env_cfg in (
+    ("Instinct-Amp-Walk-T5-G1-v0", G1AmpWalkT5EnvCfg),
+    ("Instinct-Amp-Walk-T5-G1-Play-v0", G1AmpWalkT5EnvCfg_PLAY),
+):
+    gym.register(
+        id=task_id,
+        entry_point=G1AmpWalkT5TeacherEnv,
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": env_cfg,
+            "instinct_rl_cfg_entry_point": (
+                f"{agents.__name__}.amp_walk_t5_ppo_cfg:G1AmpWalkT5PPORunnerCfg"
+            ),
         },
     )

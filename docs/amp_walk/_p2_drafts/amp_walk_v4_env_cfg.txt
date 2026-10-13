@@ -1,0 +1,9 @@
+"""AMP 行走 **v4**：环境与 v3 **逐字相同**，只换 `run_name`（v3 的 `__post_init__` 会把 `run_name` 钉死）。
+
+## ⚠️ 本层对**今天**仍有影响的部分
+
+* **无 —— `run_name` 已被后层覆盖**（今天 = `G1AmpWalkT1l...`）⇒ 本文件只是"14 项奖励 / 7-clip 数据集 /
+  观测 626/99/670 / 动作契约"那一代配置的**重命名副本**；teacher 侧直接复用 `G1AmpWalkV3TeacherEnv`（环境相同、契验期望值也一样）。
+* 本版唯一实质改动在 agent cfg（`agents/amp_walk_v4_ppo_cfg.py`：镜像损失 + AMP 侧两处修正）⇒
+  是否仍生效见 `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V4-G1-v0` 的「算法侧」节。
+⚠️ `RewTerm(...)` 字面值 **≠ 生效值**（后层整体覆盖 `params`）→ `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V4-G1-v0`（算法侧见同节）"""

@@ -1,24 +1,22 @@
-"""**T1e**：T1d 的配置 + **把 `dof_pos_limits` 换回「全关节软边距版」**。
+"""**T1e**：T1d + 把 `dof_pos_limits` 换回「全关节软边距版」（2026-10-07）。
 
-为什么（2026-10-07，T1d 实测暴露）
-----------------------------------
-T1a2 为了"与 T0 实现逐字对齐"，把 V33 的 `joint_pos_limits_margin` 换成了 T0 的
-`isaaclab.envs.mdp.joint_pos_limits`，而 T0 那项的作用域是
-    joint_names = ['.*_ankle_pitch_joint', '.*_ankle_roll_joint']
-⇒ **只罚踝**。于是腰/髋/膝的限位在**奖励**与**指标**里都成了盲区：
-  * `Episode_Reward/dof_pos_limits` 只反映踝关节；
-  * margin 版自带的诊断（`limit_margin_u_max` / `limit_margin_u_frac` /
-    `waist_pitch_abs_mean` / `waist_pitch_enter_frac`）随实现一起消失。
-T1d 因此出现关节限位问题（用户 2026-10-07 观察）⇒ 本臂把全关节软边距版**恢复**。
+## ⚠️ 本层对**今天**仍有影响的部分
 
-形状（逐关节归一化到"硬限位处 = 1.0"，`margin=0.15 rad`、`power=2`）
-    u_j  = [clamp(lower+margin − q, 0) + clamp(q − (upper−margin), 0)] / margin
-    cost = Σ_j u_j ** power
-⇒ 距限位仍有 margin 以上**不罚**；进入边距温和提醒；到硬限位 = 1.0；越界按幂增长。
+* **无 —— 已被 T1a2 覆盖**：今天 = T0 版 `isaaclab.envs.mdp.joint_pos_limits`（**线性、仅踝**，weight -1），非本层全关节软边距版。
 
-⚠️ 这是**有意的偏离**：T0 的踝-only 口径是它自己的取舍，本臂不再与之逐字等价。
-   ⇒ 相对 T1d 的改动是"限位奖励的作用域 + 函数形状"这一项（登记在案）。
-⚠️ 本文件不改动、不删除任何既有 cfg（保持非破坏性）。
+## 本层改动一览
+
+| # | 改动 | 现状（今天实际生效）|
+|---|---|---|
+| ① | `dof_pos_limits` 踝-only → **全关节 `joint_pos_limits_margin`**（margin 0.15 rad、power 2.0）+ 倾角/限位诊断 | **已被 T1a2 覆盖** → `joint_pos_limits`（线性、仅踝，-1）|
+
+## 推理与判读（已归档，勿在本文件重复）
+
+* 动机「T1d 暴露全关节限位盲区（T0 版只罚踝 ⇒ 腰/髋/膝在奖励与指标里都成盲区）」→ `EXPERIMENTS.md` §附待办第 2 条
+* 软边距形状 + 随之消失的诊断探针（`limit_margin_u_max` 等）→ 见该版 run 日志；⚠️ 相对 T1d 的改动 = "作用域 + 函数形状"（**有意偏离 T0 口径**）
+
+⚠️ 非破坏性；`RewTerm(...)` 字面值不代表生效值（后层整体覆盖 `params`）→ 实际值见
+   `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-T1e-G1-v0`（算法侧见同节）
 """
 
 from __future__ import annotations

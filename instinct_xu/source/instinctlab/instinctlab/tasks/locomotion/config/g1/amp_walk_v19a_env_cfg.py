@@ -1,34 +1,36 @@
-"""V19a 的环境侧：**逐字沿用 V18**，只把步态目标带的「下侧衰竭尺度」`soft` 从 0.3 → 0.4。
+"""V19a：**逐字沿用 V18，只把步态目标带的「下侧衰竭尺度」`soft` 0.3 → 0.4**（2026-10-02）。
 
-唯一改动
---------
-`feet_air_time_target_biped(soft=0.3 → 0.4)`。
+## ⚠️ 本层对**今天**仍有影响的部分
 
-为什么（V18 实测，`in_band_frac` 恒为 0 的直接原因）
---------------------------------------------------
-V18 打出的两个探针：
+* **无 —— 已被后层完全覆盖**：整条"目标带"实现（`feet_air_time_target_biped`，含本层调的 `soft`）
+  已在 **T1a2** 换回基类旧版 `feet_air_time_positive_biped`（`threshold=0.5`、`weight=+1`）
+  ⇒ 本层调的 `soft` 今天不存在。
+* 仍"活着"的是**结论**（见下表与推理小节）：核宽必须 ≥ 下边界，否则下侧进死区 ⇒ 该项恒 0 且无梯度。
 
-    Step/air_time_single_stance   0.0071 → 0.0113 s     （V17 是 0.007 s）
-    Step/air_time_in_band_frac    0.0000 → 0.0000       （**恒为 0**）
-    Episode_Reward/feet_air_time  0.0000 → 0.0011
+## 本层改动一览
 
-核函数是
+| # | 改动 | 现状（今天实际生效）|
+|---|---|---|
+| ① | ⭐ 唯一变量：`feet_air_time_target_biped(soft 0.3 → 0.4)`（等于 `good_lo`；上侧 `good_hi+soft` 1.3 → 1.4 s）| ❌ **已被 T1a2 覆盖** → `feet_air_time_positive_biped`（`+1` / `threshold=0.5`）|
 
-    score = 1 − clamp((good_lo − d)/soft, 0, 1) − clamp((d − good_hi)/soft, 0, 1)
-    reward = score · 1[单支撑] · 1[‖cmd_xy‖ > 0.1]
+## 推理与判读（已归档，勿在本文件重复）
 
-`soft = 0.3`、`good_lo = 0.4` ⇒ 下侧在 `d < good_lo − soft = 0.1 s` 处**饱和**
-（`clamp` 到 1）⇒ `score ≡ 0`，**奖励与梯度同时恒为 0**。
-V18 的单支撑时长实测只有 `0.009~0.011 s < 0.1 s` ⇒ 该奖励**从头到尾没工作过**，
-"小跳"没有任何一项在定价它。
+* ⭐ **为什么必须改**：核函数 `score = 1 − clamp((good_lo−d)/soft,0,1) − clamp((d−good_hi)/soft,0,1)`；
+  V18 取 `soft=0.3 < good_lo=0.4` ⇒ 下侧在 `d < good_lo−soft = 0.1 s` 处**饱和**（`clamp` 到 1）
+  ⇒ `score ≡ 0`，**奖励与梯度同时恒为 0**；而 V18 实测单支撑只有 `0.009~0.011 s < 0.1 s`
+  ⇒ 该奖励**从头到尾没工作过**，"小跳"没有任何一项在定价它（`Step/air_time_in_band_frac` 恒 0）→ 该版 run 日志
+* 取 `soft = good_lo = 0.4` 后下侧退化成 `score = d/0.4` ⇒ 在 `d ∈ [0,0.4]` 上**处处有梯度**
+  （`∂score/∂d = 2.5/s`；`d=0.01 s` 时每步 ≈ 0.025 —— 很小，但**不再是 0**，足以 bootstrap）→ 该版 run 日志
+* ⚠️ 旧 `feet_air_time_positive_biped` 的两个结构性漏洞（短到几毫秒也给分 / 越长越给）
+  → `docs/amp_walk/EXPERIMENTS.md` §B2
 
-取 `soft = good_lo = 0.4` 后，下侧退化成 `score = d / 0.4`
-⇒ 在 `d ∈ [0, 0.4]` 上**处处有梯度**（`∂score/∂d = 2.5 /s`，`d = 0.01 s` 时每步 ≈ 0.025
-—— 很小，但**不再是 0**，足以 bootstrap）。上侧 `good_hi + soft = 1.4 s` 才归零，
-比 V18 的 1.3 s 略宽一点，可接受。
+⚠️ 其余逐字不动：V18 的 21 项奖励结构 / 5 clip 数据集 / 四档全向指令 / `action_rate_l2 −0.10` /
+   `flat_orientation_l2 −2` / `feet_swing_time_penalty 0` / 三个跟踪项 3.0·0.8·1.0。
+   ⚠️ 本层的"目标带 + `soft 0.4`"口径此后已被 V19b/V19c/V19d 继续改写、最终被 T1a2 换掉
+   （今天 = 5 clip + 全向分档指令，grep 旁证、**未运行期核对**）。
 
-其余（5 clip 数据集、四档全向指令、`action_rate_l2 −0.10`、`flat_orientation_l2 −2`、
-`feet_swing_time_penalty 0`、三个跟踪项 3.0/0.8/1.0）**一律不动**。
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V19a-G1-v0`
 """
 
 from __future__ import annotations

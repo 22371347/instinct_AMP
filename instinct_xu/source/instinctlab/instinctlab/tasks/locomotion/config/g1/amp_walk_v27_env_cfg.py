@@ -1,62 +1,47 @@
-"""V27：**AMP 判别器"重启"** —— 丢掉已饱和的判别器 + 去掉白化，保留 V26 的 σ=0.20。
+"""V27：**AMP 判别器"重启"**（丢饱和判别器 + 去白化；env 侧只改 `run_name`）。
 
-## 为什么必须重置判别器（本轮的硬前提）
+## ⚠️ 本层对**今天**仍有影响的部分
 
-热启动时 `runner.load()` 走的是 `self.alg.load_state_dict(loaded_dict)`，而 V26 的
-`ckpt_manipulator=None` ⇒ **判别器权重 + 判别器优化器 + normalizer buffer 全部继承**。
-实测证据：V26 **第一个** log 块（iteration 8000）就已经是
-`amp_d = −1.0004` / `amp_d_ref = 0.9999` / `amp_style_std = 0.0014`
-—— 全新初始化的判别器输出应 ≈0、`style_std` 应 O(0.1~1)。
-⇒ **V26 的风格项从第 0 轮就是死的**，它的结果只能回答 σ 的问题，
-**不能**用来判定"白化是否杀死风格项"。
+* ⚠️ 本文件是 **env cfg**：V27 的实质改动**全在算法侧**（`agents/amp_walk_v27_ppo_cfg.py`
+  —— 判别器口径 + `ckpt_manipulator`）。本文件相对 V26 **env 侧零改动**
+  （奖励 / AMP 观测 / 指令集全同），只换了 `run_name`。
+* ⭐ **"去白化 + `amp_grad_pen_space='raw'`"这一口径今天仍在使用**：经 V33-**S8** → T1a → … → T1l。
+  旁证（逐字引用）`agents/amp_walk_t1a_ppo_cfg.py`：*"其余超参（判别器正则 / coef 4.0 /
+  adaptive LR / 专家集 / **无白化 raw GP**）逐字沿用 S8"*。
+* ❌ `ckpt_manipulator="drop_amp_discriminator"` **已不生效**（S8/T1a 起为 `None`＝判别器保留续训）。
 
-## 本轮变量
+## 本层改动一览（**env 侧 0 项**；下表全是算法侧）
 
-相对 V26，只动**判别器口径**（外加"必须重置判别器"这个机械动作）：
-
-| 项 | V26（= V22~V24 口径） | **V27** |
+| # | 改动（`agents/amp_walk_v27_ppo_cfg.py`）| 现状（今天实际生效）|
 |---|---|---|
-| 判别器输入 | 1560（195×8）+ **白化**（`EmpiricalNormalization(eps=0.01)`） | **1560，不白化**（回到 V19b/V19d/V20 口径） |
-| 白化统计量来源 | `amp_normalizer_expert_only=True`（**只由 reference 侧**累积） | —（无 normalizer） |
-| `amp_grad_pen_space` | `"normalized"` | **`"raw"`**（无白化时必须配对回 raw） |
-| `ckpt_manipulator` | `None`（判别器继承） | **`drop_amp_discriminator`**（判别器+其优化器从零重学） |
-| `clip_max_std` / 退火 | 0.20 / 300 | **不变** |
-| 奖励表 / `action_scale=1.0` / LR / `entropy_coef` / 策略权重 | — | **全不动**（策略从 V26 ckpt 热启动） |
+| ① | 判别器输入 **1560、不白化**（回 V19b/V19d/V20 口径；`amp_normalizer_expert_only` 随之作废）| ✅ 仍无白化（经 V33-S8 → T1a）|
+| ② | `amp_grad_pen_space` **`"normalized"` → `"raw"`**（无白化时必须配对）| ✅ 仍为 `raw`；⚠️ 但 §A4 已证伪"raw GP 可取"（曾被 GP 支配 1.2e6×）|
+| ③ | `ckpt_manipulator` = **`drop_amp_discriminator`**（判别器 + 其优化器从零重学）| ❌ **已被覆盖** → S8/T1a 起为 `None`（保留续训）|
+| ④ | `clip_max_std 0.20` / 退火 300、奖励表、`action_scale`、LR、`entropy_coef`、策略权重 —— **全部不动** | ❌ 已被 T1a2 全面改写（`clip_max_std=None`、`init_noise_std=1.0`、hidden `[256,128,128]`…）|
 
-## 依据（三代对照）
+## 推理与判读（已归档，勿在本文件重复）
 
-| 版本 | 判别器输入 | `style_std`（末 25%） | 判定 |
-|---|---|---|---|
-| V19b | 原始 1560 | **0.124** | ✅ 健康 |
-| V20 | 原始（2 帧） | **0.094** | ✅ 健康 |
-| V23 / V24 | **白化** expert-only | 0.003 / 0.008 | ❌ 死 |
-| V26（继承 V24 判别器 + 白化） | 白化 expert-only | **0.0008** | ❌ 死 |
+* **为什么必须重置判别器**：热启动时 `runner.load()` 走 `self.alg.load_state_dict(loaded_dict)`，
+  而 V26 的 `ckpt_manipulator=None` ⇒ 判别器权重 + 优化器 + normalizer buffer 全部继承；实测
+  V26 **第一个** log 块（iteration 8000）就已是 `amp_d=−1.0004 / amp_d_ref=0.9999 /
+  amp_style_std=0.0014` ⇒ **V26 的风格项从第 0 轮就是死的**，其结论只能回答 σ 问题。
+* **机制**：白化把"策略特征 vs 参考特征"的**系统性偏移**放大 `1/eps = 100×` ⇒ logits 巨大 ⇒
+  sigmoid 全饱和 ⇒ `−log(1−D)` 跨 env / 跨时间近似恒定 ⇒ `style_std ≈ 0` ⇒ 风格项梯度为 0。
+  → 见该版 run 日志；关联 → `docs/amp_walk/EXPERIMENTS.md` §A6（判别器饱和是常态）、
+  §A4（`raw` GP 陷阱 + 🟢 白化确实改善区分性）
+* **三代 `style_std` 对照**（V19b/V20 健康 0.124 / 0.094 ↔ V23/V24/V26 死 0.003 / 0.008 / 0.0008）
+  → `RESULTS_v22_whitening.md`（白化提升离线区分性：AUC 0.850→0.927、`style_std` ×2.7）+ 该版 run 日志
+* **预登记判据 1–5**（风格复活 / 判别器不立刻饱和 / 步态 / 不退化 / 风险）→ 见该版 run 日志
+* **两个变体**：**V27-a**（只重置判别器、保留白化）· **V27-c**（保留白化但两侧共同累积统计量）
+  → `agents/amp_walk_v27_ppo_cfg.py` 的标注处
+* ⚠️ **未核实（2026-10-06 后续核查；尚未进 `EXPERIMENTS.md`）**：V31 链的 `discriminator_kwargs`
+  里**没有** `normalizer_class_name`、ckpt 的 `discriminator` 键里**无** `normalizer.*`，且 **V22 是旁支**
+  ⇒ 本层"白化 / 去白化"是否真的生效**存疑**（若白化本就不存在，①② 都是 no-op）。**待归档**。
 
-机制：白化把"策略特征 vs 参考特征"的**系统性偏移**放大 `1/eps = 100×`
-⇒ logits 巨大 ⇒ sigmoid 全饱和（`d_ref=+1.0002, d=−0.998, disc_loss=1e-5`）
-⇒ `−log(1−D)` 变成**跨 env、跨时间都基本恒定** ⇒ `style_std ≈ 0` ⇒ 风格项梯度为 0。
-（讽刺的是 V22 引入白化的动机是离线 AUC 0.850→0.927——"更可分辨"，
-而 AMP 需要的恰恰相反：**判别器不能过早分辨完**。）
+⚠️ 其余逐字不动：本文件相对 V26 的 **env 侧无任何改动**。
 
-## 另两个变体（若想换口径，只改 `amp_walk_v27_ppo_cfg.py` 里标注的那两行）
-
-* **V27-a（只重置判别器，保留白化）**：把"去白化两行"注释掉。
-  预期：新判别器会"活"一小段，但 ~200-500 轮内因同样的系统性偏移再次饱和。
-  **信息量**：这是"白化必然杀死判别器"的确证实验。
-* **V27-c（保留白化但两侧共同累积统计量）**：`amp_normalizer_expert_only=False`
-  （rsl_rl/mjlab 的标准口径）。测"白化本身是否可行"，与 mjlab 严格对齐。
-
-## 预登记判据（对照 V26@8750 与 V19b/V20）
-
-1. **风格项复活**：`Step/amp_style_std` 0.0008 → **> 0.03**（目标 0.09~0.12，= V19b/V20 水平）；
-   `Loss/discriminator_loss` 1e-5 → **> 1e-3**；`amp_d` 从 −0.998 抬到 **> −0.9**。
-2. **判别器不立刻饱和**：`amp_d_ref` 不再恒等于 +1.000（期望 < 0.9）。
-3. **步态**：在 σ=0.20 的基线上继续改善（`hop < 0.648`、`in_band > 0.446`、
-   `single_stance > 0.119`）；`track_lin_vel_xy_exp > 1.412`（超过 V24）。
-4. **不退化**：`hf_acc_all` 仍 ~45（不被风格项重新拉回高频抖动）、`Mean reward` 仍 > +35
-   （回合口径）。
-5. **风险判据**：若风格项复活但 `hop`/`hf_acc` 恶化 ⇒ 说明判别器恢复分辨力后
-   在"奖励高频动作"（判别器偏好参考的高频细节），需要同时降 `amp` 权重/`quad_k`。
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V27-G1-v0`
 """
 
 from __future__ import annotations

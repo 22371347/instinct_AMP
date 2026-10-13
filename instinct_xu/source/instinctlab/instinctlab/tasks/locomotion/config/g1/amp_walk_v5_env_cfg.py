@@ -1,12 +1,10 @@
-"""AMP 行走 **v5** 的环境配置 —— 与 v4 **完全相同**，只换 `run_name`。
+"""AMP 行走 **v5**：环境与 v4 **逐字相同**，只换 `run_name`（v3 的 `__post_init__` 会把 `run_name` 钉死）。
 
-只加一个文件的原因和 v4 一样：`G1AmpWalkV3EnvCfg.__post_init__` 会把 `run_name`
-钉成 v3 的名字，复用 v4 会让日志目录看不出"这轮换了风格奖励形式"，事后极易混淆。
-**只改 `run_name`，其余一律不动**（奖励集 14 项、指令分布、精选 7-clip 数据集、
-观测 626/99/670、动作契约全部继承 v3/v4）。
+## ⚠️ 本层对**今天**仍有影响的部分
 
-⚠️ teacher 侧（蒸馏接口）继续复用 `G1AmpWalkV3TeacherEnv`：环境完全相同。
-"""
+* **无 —— `run_name` 已被后层覆盖**（今天 = `G1AmpWalkT1l...`）⇒ 本文件只是"14 项奖励 / 7-clip 数据集 / 观测 626/99/670 / 动作契约"那一代配置的**重命名副本**；teacher 侧始终复用 `G1AmpWalkV3TeacherEnv`。
+* 唯一实质改动在 agent cfg（`agents/amp_walk_v5_ppo_cfg.py`：风格奖励换 `logamp` 形式）→ 见 `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V5-G1-v0` 的「算法侧」节。
+⚠️ `RewTerm(...)` 字面值 **≠ 生效值**（后层整体覆盖 `params`）→ `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V5-G1-v0`（算法侧见同节）"""
 
 from __future__ import annotations
 

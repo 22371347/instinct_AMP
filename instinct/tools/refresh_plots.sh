@@ -26,6 +26,7 @@
 #     01_overview.png          总览：回报 / 回合长度 / AMP 损失 / 噪声 std
 #     02_reward_terms.png      Episode_Reward/* 逐项收敛
 #     03_amp_diagnostics.png   判别器诊断（损失 / 惩罚 / 权重衰减 / aux 奖励）
+#                               + ⭐ amp_d / amp_d_ref 与两者的差距叠加图
 #     04_foot_diagnostics.png  步宽与交叉
 #     05_terminations_perf.png 终止方式 / FPS / 速度跟踪误差
 #     06_amp_task_split.png    最终奖励里 task 与 AMP 风格各占多少

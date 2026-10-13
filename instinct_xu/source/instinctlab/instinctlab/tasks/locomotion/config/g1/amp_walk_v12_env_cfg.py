@@ -1,63 +1,44 @@
-"""V12：**把 AMP 判别器输入换成 LLP 论文的“两帧状态转移”** + 抬高静止姿态权重。
+"""V12：把 AMP 判别器输入换成 LLP 论文的「两帧状态转移」(s_t, s_{t+1}) + 抬高静止姿态权重。
 
-## ① 判别器输入 10 帧 → 2 帧（本次的**主变量**，来自 LLP 原论文）
+## ⚠️ 本层对**今天**仍有影响的部分
 
-论文里 AMP/LightLP 判别器吃的是**状态转移 (s_t, s_{t+1})** —— 两帧（当前 + 下一帧），
-既不是单帧、也不是长历史帧堆叠。我们此前沿用 beyondmimic/parkour 的
-`AMP_STATE_HISTORY = 10`（`amp_policy` / `amp_reference` 各 670 维）。
+* ⭐ **「2 帧 = 论文口径」这条结论今天仍站得住**：今天 T1l 的判别器输入也是 **2 帧**
+  （`AMP_V29_STATE_HISTORY = 2`）—— 但**状态构成与维度完全不同**：本层是旧的
+  5 项模板 `67×2 = 134`，今天自 V20 起换成 **13body×15×2 = 390** → V33 再补 anchor 重力
+  = **396 维**。⇒ 帧数"回归"，实现**不**是同一套。
+* ⭐ **判别器**在**ckpt 里**（`wasabi.py` override 了 `state_dict()`）⇒ 换判别器形状时必须用
+  `ckpt_manipulator` 丢掉，否则首次启动即崩 —— 今天仍是硬性约束。
+* ② 的数值已被后层覆盖（见下表）。
 
-⚠️ 为什么 10 帧可能"让 AMP 说不出话"：10 帧（0.2 s）的**姿态轮廓/抖动统计**本身就足以
-把 policy 与 reference 分开 ⇒ 判别器**没有任何压力**去学"单步转移像不像人"。
-这与我们反复观测到的现象自洽：`amp_d` 越训越负（−0.56 → −0.78）、`r_amp` 0.50 → 0.24，
-即风格奖励**理论上给得起**（到参考水平还有 +2.16/step 的空间）但**够不着**。
+## 本层改动一览（⚠️ 本轮同时动 **2 个量**，归因必须分开）
 
-改成 2 帧后：输入 = 67×2 = **134 维**；项的构成与缩放逐字不变
-（`joint_vel_rel ×0.05`、`base_ang_vel`、`base_lin_vel` **本来就在状态里** ⇒
-单步转移的信息是完整的；10 帧堆叠的边际信息最少）。
-我们给两帧的次序是 (s_{t−1}, s_t)（history 缓冲是"老→新"），对"判别平稳分布"的目标
-等价于论文的 (s_t, s_{t+1})；且 `amp_policy` / `amp_reference` 用**同一机制** ⇒ 天然同构
-（wasabi 的 `init_storage` 会断言两侧等长）。
-
-实现：在 env cfg 的 `__post_init__` 里调 `_patch_amp_two_frame(self)` ——
-**新建**两个 obs 群对象再挂上去（不去改基类的共享实例），5 个 term 的 `history_length`
-统一改 2。**策略 378 维观测、价值观测一个字都没动。**
-
-## ② `track_default_pose_on_stand`：−0.3 → −1.0（静止稳定性）
-
-用户要求：模型静止时更稳。它带 `gate_tau=0.25` 的平滑门控（`exp(−‖cmd‖/0.25)`）⇒
-走动时基本不生效，只在低速/立定段把关节往默认站姿拉。所以加回设计值 −1.0
-**不会**拖累行走能力。
-⚠️ 历史教训：V9c 记过它"−15.3/回合"，那是**门控读错数组**时的数（30% 站立 env 一直在
-被风格项拉、门控近似恒开）⇒ 与现在不可比。现在门控走真值指令
-（`Step/amp_stand_frac ≈ 0.30` 已实测）、且 `disable_style_on_stand` 已真正生效。
-
-## ③ 其余逐字不动
-
-21 项奖励结构（含 `feet_swing_time_penalty −0.5`、V11 的 `feet_air_time 8.0/thr0.6`、
-`action_rate_l2 −0.06`、`dof_acc_l2 −1e−6`）、三档指令、2-clip 数据集、镜像增广/损失、
-σ 上限 0.6、LR 固定、算法超参（λ=0.5、c=0.5 ⇒ 有效风格权重 0.25）。
-
-## ⚠️ 本轮同时动了**两个**量，判读口径必须分开
-
-| 关注点 | 看什么 | 期望 |
+| # | 改动 | 现状（今日 T1l 实际生效）|
 |---|---|---|
-| 风格（①的效应） | `amp_d` / `r_amp` / `Loss/amp_*` | `amp_d` 从 −0.78 抬向 −0.4 以内，`r_amp` 回升 |
-| 静止稳定（②的效应） | 站立档回合的 `track_default_pose_on_stand`、`base_ang_vel`、`base_contact` | 静止时漂移/晃动下降 |
-| 行走**不**退化 | `feet_air_time` >0.15/s、`vx_*_rmse`、中位回合长度 | 不低于 V11 |
+| ① | 判别器输入 10 → **2 帧**（`_patch_amp_two_frame`；`67×2 = 134` 维）| 帧数 ✅ 今天也是 **2**；但**构成/维度不同** → 13body×15×2 = 390 → +anchor 重力 = **396**（V20/V29/V33）|
+| ② | `track_default_pose_on_stand` −0.3 → **−1.0**（用户要求：模型静止时更稳）| **已被 V23 覆盖** → **−0.8**（并新增全关节 `pos_joint_weights`/tol 表、`vel_scale 0.8`）|
+| ③ | 判读口径：两变量分开看（风格看 `amp_d`/`r_amp`；静止稳定看 `track_default_pose_on_stand`/`base_ang_vel`）| 方法论仍有效（§E3 单变量）|
 
-若要严格单变量归因，下一轮把 ② 撤回即可（= V12b，只留 2 帧判别器）。
+## 推理与判读（已归档，勿在本文件重复）
 
-## ⚠️ 热启动：判别器**在** checkpoint 里，必须用 `ckpt_manipulator` 丢掉它
+* ① 的推理「10 帧的姿态轮廓/抖动统计本身就足以把 policy 与 reference 分开 ⇒ 判别器没有压力去
+  学'单步转移像不像人'」→ §A2（离线：h=1–2 对**时间结构类**退化完全瞎）
+* ② 的代价曾被**严重低估**（V12 掉掉的 ~18.5/回合里一半以上可直接归到站姿权重；
+  `Mean reward` 27.73→9.28、`feet_air_time` 0.160→0.099 更碎步）→ §B1
+* ⚠️ 历史教训：V9c 记的它「−15.3/回合」是**门控读错数组**时的数（门控近似恒开），与现在不可比
+  → 关联 §B1 / 该版 run 日志
 
-`instinct_rl/algorithms/wasabi.py` **override 了** `state_dict()` / `load_state_dict()`，
-把 `"discriminator"` 与 `"discriminator_optimizer"` 也写进/读出 checkpoint
-（早先只看 `ppo.py` 得出的"判别器不在 ckpt 里"是**错的**，第一次起 V12 就因此崩：
-`size mismatch for model.model.0.weight: [1024, 670] vs [1024, 134]`）。
+⚠️ 算法侧热启动的关键（勿删）：`instinct_rl/algorithms/wasabi.py` **override 了**
+   `state_dict()`/`load_state_dict()`，把 `"discriminator"` 与 `"discriminator_optimizer"`
+   也写进 ckpt（早先只看 `ppo.py` 得出的「判别器不在 ckpt 里」是**错的**，第一次起 V12 就因此崩：
+   `size mismatch for model.model.0.weight: [1024, 670] vs [1024, 134]`）
+   ⇒ 必须设 `ckpt_manipulator = "instinctlab.utils.ckpt_manipulators:drop_amp_discriminator"`。
+⚠️ 若要做严格单变量归因，下一轮把 ② 撤回即可（= V12b，只留 2 帧判别器）。
+⚠️ 其余逐字不动：21 项奖励结构（含 `feet_swing_time_penalty −0.5`、`feet_air_time 8.0/thr0.6`、
+   `action_rate_l2 −0.06`、`dof_acc_l2 −1e−6`）、三档指令、2-clip 数据集、镜像增广/损失、
+   σ 上限 0.6、固定 LR、算法超参（λ=0.5、c=0.5 ⇒ 有效风格权重 0.25）。
 
-✅ 已在 `agents/amp_walk_v12_ppo_cfg.py` 里设 `ckpt_manipulator =
-"instinctlab.utils.ckpt_manipulators:drop_amp_discriminator"`：
-删掉这两个键后 `Wasabi.load_state_dict` 只打一行 `[Warning] ... not found`，
-actor/critic（观测仍 378/99，形状未变）+ PPO 优化器照常热启动，判别器从零重学。
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V12-G1-v0`
 """
 
 from __future__ import annotations

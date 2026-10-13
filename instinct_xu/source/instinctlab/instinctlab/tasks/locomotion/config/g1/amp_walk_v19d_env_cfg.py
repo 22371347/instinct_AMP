@@ -1,48 +1,37 @@
-"""V19d 的环境侧：**V19c 全部保留**，只把步态带在**站立/低速档**的输出改成**负值**。
+"""V19d：把「站立/低速档」下 `feet_air_time` 的输出由 **0 价改为负价**（V19c 其余全部保留）。
 
-| 项 | V19c | **V19d** |
+## ⚠️ 本层对**今天**仍有影响的部分
+
+* **无 —— 已被后层完全覆盖**：整项 `feet_air_time`（含本层新增的 `stand_penalty` / `stand_min_d`）
+  已在 **T1a2** 换成基类旧版 `feet_air_time_positive_biped`（`threshold=0.5`、`weight=+1`）
+  ⇒ 本层的"站立负罚"**今天不存在**。
+* 仍"活着"的是**探针设计**：`Step/air_time_stand_step_frac` / `stand_pose_pos_err` /
+  `stand_pose_vel_err` / `stand_pose_active` —— 后续版本（V23/V24/V26）仍靠 `stand_pose_*` 定位站姿问题。
+
+## 本层改动一览
+
+| # | 改动 | 现状（今天实际生效）|
 |---|---|---|
-| `feet_air_time` 在 `cmd_speed ≤ 0.1` 时 | **0**（`gate_cmd=0`，既不奖也不罚） | **负值**：`−stand_penalty · min(d/good_lo, 1)`，`stand_penalty = 0.5` |
+| ① | ⭐ 唯一变量：站立档（`cmd_speed ≤ 0.1`）`feet_air_time` 由 `gate_cmd=0`（零价）改为**负价** `-stand_penalty·min(d/good_lo, 1)`，`stand_penalty=0.5`、`stand_min_d=0.03` | ❌ **已被 T1a2 覆盖** → 今天 = `feet_air_time_positive_biped`（`+1` / `threshold=0.5`），**无 `stand_penalty` 参数** |
+| ② | 新增探针（站立踏步占比 / 站立罚均值 / 站姿 pos·vel 拆分）| 代码侧；`stand_pose_*` 读数沿用至今 |
+| ③ | 起点 = **热启动 V19c 最新 ckpt**（保留判别器）| 已不适用（今天由 T1l 起点决定）|
 
-## 为什么（V19c@9700 的实测定位）
+## 推理与判读（已归档，勿在本文件重复）
 
-"站立时原地左右脚交替抬放"在 V19c 里**几乎无价**，逐项排查：
+* ⭐ 「该类项**只在低速段生效**，其价格会被'该省的动作'过度征收」→ `docs/amp_walk/EXPERIMENTS.md` §B1
+* 定位过程：V19c@9700"站立时原地左右脚交替抬放几乎无价"的逐项排查表（`feet_air_time`=0 / AMP 风格项=0 /
+  `track_lin`·`track_ang`≈满分 / 唯一成本 `track_default_pose_on_stand` —— 实测权重 −0.3→−0.5 后原始
+  cost 0.846→0.722 ⇒ **该项确实在工作，但不足以改掉踏步**）→ 该版 run 日志
+* 罚额量级表（weight=4.0 下 d=0.02→0.30 s 对应每步 −0.10→−1.50）+"偏激进但不至于压垮站立"的判读、
+  以及备用方案（2k 轮后仍踏步 ⇒ `stand_penalty` 提到 1.0）→ 该版 run 日志
 
-| 奖励项 | 站立 env（`cmd_speed ≤ 0.1`）下的取值 | 对"原地抬脚"的态度 |
-|---|---|---|
-| `feet_air_time` | **0**（`gate_cmd = 1[cmd>0.1] = 0`） | **零价** ← 就是这一项 |
-| AMP 风格项 | **0**（`disable_style_on_stand=True`、`stand_speed_threshold=0.1` 已实测确认） | 零价 |
-| `track_lin_vel_xy_exp` (3.0) | ≈ 3.0/步（指令=0，**不动**就是满分） | 只罚"漂移"，原地踏步不漂移 ⇒ 几乎不罚 |
-| `track_ang_vel_z_exp` (0.8) | 同上 | 同上 |
-| **`track_default_pose_on_stand` (−0.5)** | 原始 cost ≈ 0.72 ⇒ **−0.36/步** | ✅ 唯一的成本（实测：权重 −0.3→−0.5 后原始 cost 0.846→0.722 ⇒ **该项确实在工作**，但不足以改掉踏步） |
+⚠️ 其余逐字不动（**均已随①一并失效**）：`tau 0.08` / `motion_threshold 0.15` / `motion_ang_scale 0.5` /
+   `good_lo,hi 0.4/1.0` / `soft 0.3` / `weight 4.0`；`action_rate_l2 −0.06`（今天 **−0.05**）、
+   `track_default_pose_on_stand −0.5`（**已被 V23 覆盖 → −0.8**）；AMP 侧口径（quad k=0.125 / GP 1.0 /
+   wd 1e-5 / logit_wd 0 / eps 0.05 / λ0.75 / c1.0）**属算法侧 ⇒ 未核实**。
 
-⇒ 把"站立档"从 **0 价** 改成 **负价**，给策略一个**稠密、单一、方向明确**的信号。
-`min(d/good_lo, 1)` 让 `d → 0` 时罚也 → 0（"抬一下立刻放"几乎不罚），`d ≥ good_lo` 罚满。
-
-## 罚额量级（weight = 4.0）
-
-| 单支撑时长 d | 0.02 s | 0.05 s | 0.08 s | 0.15 s | 0.30 s | ≥0.40 s |
-|---|---|---|---|---|---|---|
-| 每步罚额 | −0.10 | −0.25 | −0.40 | −0.75 | −1.50 | **−2.00** |
-
-站立 env 的正奖励约 **3.5/步**（`track_lin 3.0` + `base_height` + `body_ang_vel`）⇒ 该罚约占
-其 12%~57%，**偏激进但不至于压垮站立**。若 2k 轮后仍在踏步 ⇒ 提到 1.0（满罚 −4.0/步）。
-
-## 新增探针（回答"到底有没有在踏步"）
-
-* `Step/air_time_stand_step_frac`：**站立 + 真的抬了脚（d > 0.03 s）的步数占比** ← 本轮的**主指标**，目标 → 0；
-* `Step/air_time_stand_pen_mean`：实际付出的站立罚均值（确认罚到东西了没）；
-* `Step/stand_pose_pos_err` / `stand_pose_vel_err` / `stand_pose_active`（V19d 新增）：
-  把 `track_default_pose_on_stand` 拆成"回默认姿态"与"关节速度阻尼"两部分 ⇒
-  **直接回答用户的问题"速度阻尼项在不在工作"**（pos/vel 两个原始量应随训练下降）。
-
-## 不动
-
-`tau = 0.08`、`motion_threshold = 0.15`、`motion_ang_scale = 0.5`、`good_lo/hi = 0.4/1.0`、
-`soft = 0.3`（仅上侧）、weight `4.0`；`action_rate_l2 = −0.06`、
-`track_default_pose_on_stand = −0.5`；AMP 侧与 V19b/V19c **逐字相同**（`quad k=0.125`、
-GP 1.0、wd 1e-5、logit_wd 0、eps 0.05、λ0.75、c1.0）。
-起点：**热启动 V19c 最新 checkpoint**（保留判别器）。
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V19d-G1-v0`
 """
 
 from __future__ import annotations

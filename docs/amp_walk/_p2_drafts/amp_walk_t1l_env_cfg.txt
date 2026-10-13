@@ -1,0 +1,35 @@
+"""**T1l**：把两项"历史偏离"改回 V33 / AMP_mjlab 原值（本臂正在训练；2026-10-08 用户决策）。
+
+## ⚠️ 本层对**今天**仍有影响的部分
+
+* ⭐ **本层全部内容就是两个改动**（热启动自 T1a2 的 `model_7000.pt`；非零奖励项 17）：
+  ① `track_lin_vel_xy_exp` weight **1.0 → 1.5**；② `track_base_height` **std 0.2 → 0.3**。
+* ⭐ **② 是"隐藏覆盖"被当场抓出的一次**：std=0.2 由 **V9H** 引入，经 V33Base→V33S→T1a→T1a2→T1j→T1k
+  一路继承、期间从未恢复 ⇒ 本臂首跑 ~9 秒即被 fail-fast 断言拦下
+  （`ValueError: [T1l] track_base_height.std = 0.2（应保持 mjlab 的 0.3）`）。
+
+## 本层改动一览
+
+| # | 项 | 当前 T1k | **T1l（今天生效）** | 偏离来源 | mjlab walk 值 |
+|---|---|---|---|---|---|
+| ① | `track_lin_vel_xy_exp` weight | 1.0 | **1.5** ✅ | T1a 白名单抄 T0 值 | 1.5 |
+| ② | `track_base_height` **std** | 0.2 | **0.3** ✅ | **V9H** 把核宽 0.3→0.2 收紧 | 0.3 |
+
+## ⚠️ 关于 ② 的方向（务必按此口径；旧"价格表"是**错的**，已删）
+
+`track_base_height` 的 target = 0.82 m = **"屈膝 38.3°"下的 torso 高度** ⇒ 该项**鼓励保持屈膝**；
+**std 放宽对"不曲膝"是反向的**（放宽 = 允许高度偏离，含直腿抬高）。
+⚠️ 原文"直腿拿满 1.5 / 屈膝亏 0.091 每步"**方向相反，作废** → `EXPERIMENTS.md` 勘误记录（二）。
+
+## 推理与判读（已归档，勿在本文件重复）
+
+* 用户决策原文与"两项可同臂改（作用域可分离、读数可分别归因）"的论证 → `EXPERIMENTS.md` §E3 / 见该版 run 日志
+* "不曲膝"的推力候选重排（`action_rate_l2` / `joint_deviation_knee=0` / 参考集膝角）→ §勘误记录（三）、（二）
+* 算法侧（λ=0.975 等）→ `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-T1l-G1-v0` 的「算法侧」节
+
+⚠️ 本层守卫：`track_lin_vel_xy_exp` 的 **std 0.5 不动**（改它=换尺子、破坏 T1b→T1k 可比性）；
+   `track_base_height` 的 weight 1.5 / `track_ang_vel_z_exp` 1.0 / 其余 15 项一律不动。
+
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-T1l-G1-v0`
+"""

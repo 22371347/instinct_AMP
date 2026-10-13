@@ -297,18 +297,33 @@ class AmpWalkLayout:
     with_lin_vel: bool = True        # ⭐ 非扫描尾段里是否含 base_lin_vel(3)
     #   AMP-Walk（626/378）含 base_lin_vel ⇒ 尾段 99；
     #   OmniLoco 基座（`LocoTeacherPolicyObsCfg`，623）**不含** ⇒ 尾段 96。
+    n_frames: int = 1                # ⭐ 非扫描尾段的**时序堆叠帧数**（= env cfg 的 `history_length`）
+    #   T1o（663）用 **4**；626/378/623 都是 1 ⇒ 零回归。
+    #   ⚠️ 堆叠是**逐项**做的、每项内部"最旧在前、最新在后" —— 对齐 isaaclab
+    #   `CircularBuffer.buffer`（docstring 明写 "oldest entry at the beginning"，
+    #   实现是 `torch.roll(shifts=max_length - _pointer - 1)`）+ **每项一个独立
+    #   history buffer**（`_group_obs_term_history_buffer[group][term]`）
+    #   ⇒ 展平后是 `[term1_f0..f_{N-1}, term2_f0..f_{N-1}, ...]`（**项优先，不是帧优先**）。
+    scan_frames: int = 1             # ⭐ **height_scan 的堆叠帧数**
+    #   626/378/663 都是 **1**（那份 env cfg 里 height_scan 没设 `history_length`）；
+    #   ⭐⭐ **T2（1500）是 4** —— 用户明确要求 "height_scan 也是 4 帧"。
 
     @property
     def tail_dim(self) -> int:
-        return 99 if self.with_lin_vel else 96
+        return (99 if self.with_lin_vel else 96) * self.n_frames
 
     @property
     def scan_dim(self) -> int:
+        """**每帧**的射线数（不是展平后的总维数）。"""
         return self.scan_ny * self.scan_nx
 
     @property
+    def scan_block_dim(self) -> int:
+        return self.scan_dim * self.scan_frames
+
+    @property
     def obs_dim(self) -> int:
-        return self.scan_dim + self.tail_dim
+        return self.scan_block_dim + self.tail_dim
 
 
 #: 版本 → 布局。**环境侧改了扫描几何就必须同步这里**，否则切片/叠加框都会错。
@@ -325,6 +340,23 @@ AMP_WALK_LAYOUTS: dict[str, AmpWalkLayout] = {
     "loco623": AmpWalkLayout("loco623", scan_ny=17, scan_nx=31,
                              scan_size=(3.0, 1.6), scan_forward=0.0,
                              with_lin_vel=False),
+    # ⭐⭐ T1o（`Instinct-Amp-Walk-T1o-G1-v0`）：279 + 96×4 = **663**。
+    #   扫描几何与 amp378 **完全相同**（3.0×0.8 / 31×9 / 前移 1.5 m）；
+    #   区别是尾段：**删掉 base_lin_vel**（对齐 AMP_mjlab：它只在 critic；
+    #   真机也没有这个量）且本体感受 6 项 **各堆叠 4 帧**（= mjlab 的 `history_length=4`）。
+    #   依据：`AMP_mjlab/.../amp_env_cfg.py:148-169` 的 actor 观测组
+    #   `history_length=4, history_ordering="time"` ⇒ mjlab actor = 96×4 = 384。
+    #   ❗ 注意：**163+384** 是"每项内部堆叠、项优先"，**不是**帧优先。
+    "amp663": AmpWalkLayout("amp663", scan_ny=9, scan_nx=31,
+                            scan_size=(3.0, 0.8), scan_forward=1.5,
+                            with_lin_vel=False, n_frames=4),
+    # ⭐⭐ T2（`Instinct-Amp-Walk-T2-G1-v0`）：**279×4 + 96×4 = 1500**。
+    #   与 amp663 的唯一区别：`height_scan` **也堆叠 4 帧**（用户："height_scan 也是 4 帧"）。
+    #   扫描几何与 amp378/amp663 **完全相同**（3.0×0.8 / 31×9 / 前移 1.5 m）。
+    #   ⇒ 分段 = `scan[0:1116] + 12+12+12+116+116+116`，**无 base_lin_vel**。
+    "amp1500": AmpWalkLayout("amp1500", scan_ny=9, scan_nx=31,
+                             scan_size=(3.0, 0.8), scan_forward=1.5,
+                             with_lin_vel=False, n_frames=4, scan_frames=4),
 }
 
 
@@ -375,6 +407,14 @@ class AmpWalkObsBuilder:
         #: 观测布局（默认 v1~v8 的 626/527，保持旧调用行为不变）
         self.layout = layout if layout is not None else AMP_WALK_LAYOUTS["amp626"]
         self.N_SCAN = self.layout.scan_dim
+        #: ⭐ 时序堆叠缓冲（`layout.n_frames > 1` 时启用；见 `build`）。
+        #: `{项名: deque(maxlen=n_frames)}`，**逐项**维护（因为展平是"项优先"）。
+        self._hist = None
+        #: ⭐ `height_scan` 的堆叠缓冲（`layout.scan_frames > 1` 时启用；T2 的 1500）。
+        self._scan_hist = None
+        #: 用于**自动检测 reset**：仿真时间倒流 ⇒ 清空时序缓冲（见 `build`）。
+        #: 这样就不用在两个 `reset_state()` 调用点手工插 `reset_history()`（易漏）。
+        self._last_time: float | None = None
 
         try:
             from joint_order import (ISAACLAB_ORDER, MUJOCO_ORDER, NPZ_ORDER,
@@ -436,11 +476,62 @@ class AmpWalkObsBuilder:
         jv = d.qvel[6:6 + self.n_joint][self.mj_to_obs]
         # 8) last_action（policy 序）
         #    ⭐ 尾段是否含 base_lin_vel 由布局决定（基座 623 没有这一项）
-        parts = [scan, cmd]
+        #: ⭐ 非扫描尾段：**按 `G1AmpWalkPolicyObsCfg` 的声明顺序**（与 env cfg 一一对应）
+        #:   `base_lin_vel` 只在含它的布局里出现（626/378 ⇒ 99；623/663 ⇒ 96）。
+        terms: dict[str, np.ndarray] = {"velocity_command": cmd}
         if self.layout.with_lin_vel:
-            parts.append(lin_b)
-        parts += [grav, ang_b, jp, jv, np.asarray(last_action, dtype=np.float64)]
+            terms["base_lin_vel"] = lin_b
+        terms["projected_gravity"] = grav
+        terms["base_ang_vel"] = ang_b
+        terms["joint_pos_rel"] = jp
+        terms["joint_vel"] = jv
+        terms["last_action"] = np.asarray(last_action, dtype=np.float64)
+
+        #: ⭐ 时序堆叠（`n_frames > 1`，即 T1o 的 663）：**逐项**堆叠，每项内部
+        #:   **最旧在前、最新在后**（依据见 `AmpWalkLayout.n_frames` 的注释）。
+        #:   T2（amp1500）里 **`height_scan` 也参与**（`scan_frames=4`），单独一个 deque。
+        _t = float(self.data.time)
+        if self._last_time is not None and _t < self._last_time:
+            self._hist = None            # 仿真时间倒流 ⇒ `reset_state()` 被调过
+            self._scan_hist = None
+        self._last_time = _t
+        _sfc = int(self.layout.scan_frames)
+        if self.layout.n_frames > 1 or _sfc > 1:
+            from collections import deque
+
+            if self._hist is None:
+                self._hist = {_nm: deque(maxlen=self.layout.n_frames) for _nm in terms}
+            if _sfc > 1:
+                if self._scan_hist is None:
+                    self._scan_hist = deque(maxlen=_sfc)
+                if len(self._scan_hist) == 0:              # 首帧 / 回合开始：用当前帧填满
+                    self._scan_hist.extend([scan] * _sfc)
+                else:
+                    self._scan_hist.append(scan)
+            for _nm, _v in terms.items():
+                _hb = self._hist[_nm]
+                if len(_hb) == 0:                      # 首帧 / 回合开始：用当前帧填满
+                    _hb.extend([_v] * self.layout.n_frames)
+                else:
+                    _hb.append(_v)
+
+        parts = [np.concatenate(self._scan_hist) if self._scan_hist is not None else scan]
+        for _nm, _v in terms.items():
+            parts.append(np.concatenate(self._hist[_nm]) if self._hist is not None else _v)
         return np.concatenate(parts)
+
+    def reset_history(self) -> None:
+        """手工清空时序缓冲（回合开始 / `reset_state()` 后）。
+
+        ⭐ 通常**不需要**手动调：`build()` 会看 `data.time` 倒流自动清。这里只留给
+        单测/脚本显式使用。
+
+        ⚠️ isaaclab 在 reset 时只把 `CircularBuffer._num_pushes` 归零、**不清内容**
+        ⇒ 真实行为是"上一回合的尾巴残留几帧"。这里改成"下一帧用当前帧重新填满"
+        ⇒ 4 帧后收敛到同一结果；只有前 3 帧有差异，**不影响稳态回放结论**。
+        """
+        self._hist = None
+        self._scan_hist = None
 
 
 # ---------------------------------------------------------------------------
@@ -933,8 +1024,28 @@ def play(args) -> int:
 
     n_joint = model.nu
     default_joint_pos = default_qpos[7 : 7 + n_joint].copy()
-    # ⚠️ action_scale 在下面（知道 obs_mode 之后）才能定 —— 两种任务的约定不同，
-    #    见那里的注释（这是个能把机器人直接搞摔的坑）。
+    # 逐关节动作尺度（在下面知道 obs_mode 之后才能定 —— 两种任务的约定不同），
+    # 见那里的注释（这是个能把机器人直接搞摔的坑）。
+
+    # --- ⭐ 取证：逐步 trace（
+    #     膝/腰到底摆在哪、躯干有多僵、每一项在此轨迹上的拉力 —— 都从这份 CSV 算）---
+    trace_names: list[str] | None = None
+    trace_rows: list[list[float]] | None = None
+    trace_header: list[str] = []
+    if args.trace_csv:
+        # 按**执行器序**取关节名（= `default_joint_pos`/`ctrl` 的序，也是 qpos[7:] 的序）
+        trace_names = []
+        for i in range(n_joint):
+            jid = int(model.actuator_trnid[i][0])
+            nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, jid) or f"jnt{jid}"
+            trace_names.append(nm)
+        trace_header = (["t", "cmd_vx", "cmd_vy", "cmd_wz", "cmd_speed",
+                         "root_x", "root_y", "root_z", "qw", "qx", "qy", "qz",
+                         "act_absmax"]
+                        + [f"j_{n}" for n in trace_names]
+                        + [f"d_{n}" for n in trace_names])
+        trace_rows = []
+        print(f"[trace] 将记录 {n_joint} 关节（名序前 3：{trace_names[:3]}）-> {args.trace_csv}")
 
     # 策略
     policy = load_policy(args.policy, args.policy_type) if args.policy else None
@@ -990,20 +1101,27 @@ def play(args) -> int:
     # ⭐ 观测分段表：**按当前布局推导**（v1~v8: 527 / v9: 279）——
     #    下面所有“分段排查/周期打印”都用它，不再写死 527/626。
     _n0 = int(getattr(obs_builder, "N_SCAN", 527))
-    _o = _n0 + 3                                   # 扫描 + 指令之后
+    #: ⭐ 时序堆叠（`history_length=N`）：**每一项**内部都是 `N × 单帧维`，
+    #:    所以除首部的 `height_scan`（默认单帧）之外，后面每段都要整体乘 N。
+    #:    顺序仍是"项优先"：同一项的 N 帧连续（不是帧优先）。
+    _nf = int(getattr(getattr(obs_builder, "layout", None), "n_frames", 1) or 1)
+    #: ⭐⭐ T2（1500）：`height_scan` **也堆叠**（`scan_frames=4`）⇒ 首段也要乘。
+    _sf = int(getattr(getattr(obs_builder, "layout", None), "scan_frames", 1) or 1)
+    _ns = _n0 * _sf
+    _o = _ns + 3 * _nf                             # 扫描块 + 指令（两者都可堆叠）
     SEG: list[tuple[str, int, int]] = [
-        ("height_scan", 0, _n0),
-        ("velocity_command", _n0, _o),
+        ("height_scan", 0, _ns),
+        ("velocity_command", _ns, _o),
     ]
     if bool(getattr(getattr(obs_builder, "layout", None), "with_lin_vel", True)):
-        SEG.append(("base_lin_vel", _o, _o + 3))
-        _o += 3
+        SEG.append(("base_lin_vel", _o, _o + 3 * _nf))
+        _o += 3 * _nf
     SEG += [
-        ("projected_gravity", _o, _o + 3),
-        ("base_ang_vel", _o + 3, _o + 6),
-        ("joint_pos_rel", _o + 6, _o + 35),
-        ("joint_vel", _o + 35, _o + 64),
-        ("last_action", _o + 64, _o + 93),
+        ("projected_gravity", _o, _o + 3 * _nf),
+        ("base_ang_vel", _o + 3 * _nf, _o + 6 * _nf),
+        ("joint_pos_rel", _o + 6 * _nf, _o + 35 * _nf),
+        ("joint_vel", _o + 35 * _nf, _o + 64 * _nf),
+        ("last_action", _o + 64 * _nf, _o + 93 * _nf),
     ]
     SEGD: dict[str, tuple[int, int]] = {nm: (a, b) for nm, a, b in SEG}
 
@@ -1236,6 +1354,18 @@ def play(args) -> int:
                     data.ctrl[:] = kp * (target - q) - kd * dq
                 mujoco.mj_step(model, data)
 
+            # --- 取证 trace：记录**物理子步之后**的状态（与 obs 下一帧一致）---
+            if trace_rows is not None:
+                trace_rows.append(
+                    [step * dt * decimation, float(cmd[0]), float(cmd[1]), float(cmd[2]),
+                     float(np.hypot(cmd[0], cmd[1]) + abs(cmd[2])),
+                     float(data.qpos[0]), float(data.qpos[1]), float(data.qpos[2]),
+                     float(data.qpos[3]), float(data.qpos[4]), float(data.qpos[5]),
+                     float(data.qpos[6]), float(np.abs(act).max())]
+                    + data.qpos[7 : 7 + n_joint].tolist()
+                    + data.qvel[6 : 6 + n_joint].tolist()
+                )
+
             # --- 累计「指令 vs 实际」：世界系 pelvis 线速度 + 位移 ---
             # `--track-skip`：跳过起步瞬态（注入初速后前几秒是过渡段，会污染均值）
             if (not tr_skipped) and step >= tr_skip_step:
@@ -1306,6 +1436,18 @@ def play(args) -> int:
         print(f"        净位移   Δx={dx:+.3f} m  Δy={dy:+.3f} m  （窗口 {max(0.0, sim_s - args.track_skip):.2f} s）")
         print(f"        稳态跟踪误差 |cmd-actual|_xy = {np.hypot(mcmd[0] - mvx, mcmd[1] - mvy):.3f} m/s")
         print("        ⇒ 指令 ≈ +0.8 而实际 ≈ 0 即「原地踏步」：策略问题，不是回放问题")
+
+    # --- 取证 trace 落盘（CSV）---
+    if args.trace_csv and trace_rows is not None:
+        import csv as _csv
+
+        tpath = Path(args.trace_csv)
+        tpath.parent.mkdir(parents=True, exist_ok=True)
+        with open(tpath, "w", newline="") as fh:
+            wr = _csv.writer(fh)
+            wr.writerow(trace_header)
+            wr.writerows(trace_rows)
+        print(f"[trace] 已写入 {len(trace_rows)} 行 × {len(trace_header)} 列 -> {tpath}")
 
     if args.record and frames:
         out = Path(args.record)
@@ -1413,6 +1555,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cmd-step", type=float, default=0.5, help="键盘每次按键的指令增量（默认 0.5）")
     ap.add_argument("--record", help="录制到 mp4（需 imageio）")
     ap.add_argument("--record-every", type=int, default=1, help="每 N 个策略步录一帧")
+    ap.add_argument(
+        "--trace-csv", default=None,
+        help="把逐步状态写成 CSV（取证用）：t / cmd / root 位姿 / 29 关节位置与速度 / |act|max。"
+             "列名形如 `j_waist_pitch_joint`（按关节名，下游不靠下标猜）")
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
     args = ap.parse_args(argv)

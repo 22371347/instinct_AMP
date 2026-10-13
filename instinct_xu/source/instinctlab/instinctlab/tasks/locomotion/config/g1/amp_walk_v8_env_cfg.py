@@ -1,14 +1,13 @@
-"""AMP 行走 **v8** 的环境配置 —— 与 v7 **完全相同**，只换 `run_name`。
+"""AMP 行走 **v8**：环境与 v7 **逐字相同**，只换 `run_name`（v3 的 `__post_init__` 会把 `run_name` 钉死）。
 
-只加一个文件的原因同 v4~v7：`G1AmpWalkV3EnvCfg.__post_init__` 会把 `run_name`
-钉成 v3 的名字，复用 v7 会让日志目录看不出"这轮换了风格奖励形式"。
+## ⚠️ 本层对**今天**仍有影响的部分
 
-**只改 `run_name`，其余一律不动**：奖励集 **15 项**（含 `joint_deviation_arms`）、
-指令分布、精选 7-clip 数据集、观测 626/99/670、动作契约（`scale=1.0`）全部继承 v3→v7。
+* **无 —— `run_name` 已被后层覆盖**（今天 = `G1AmpWalkT1l...`）⇒ 本文件只是"15 项奖励（含
+  `joint_deviation_arms`）/ 7-clip 数据集 / 观测 626/99/670 / 动作契约 `scale=1.0`"那一代配置的**重命名副本**。
+* 本版唯一实质改动在 agent cfg（`agents/amp_walk_v8_ppo_cfg.py`：风格奖励换 `log` 形式）⇒
+  是否仍生效见 `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V8-G1-v0` 的「算法侧」节。
 
-本版的实质改动（风格奖励 `r = -log(1 - quad(d))`）在 agent cfg
-（`G1AmpWalkV8PPORunnerCfg`）里，所以这个类刻意保持"零逻辑"。
-"""
+⚠️ `RewTerm(...)` 字面值 **≠ 生效值**（后层整体覆盖 `params`）→ `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V8-G1-v0`（算法侧见同节）"""
 
 from __future__ import annotations
 

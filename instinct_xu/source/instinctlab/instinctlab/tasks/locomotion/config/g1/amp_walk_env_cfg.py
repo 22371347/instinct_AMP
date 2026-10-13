@@ -1,13 +1,22 @@
-"""AMP 行走专家策略任务（G1 29-DoF，privileged teacher）。
+"""AMP 行走专家策略（G1 29-DoF，privileged teacher）—— **整条奖励链的根**（本文件定义 `G1AmpWalkRewardsCfg`）。
 
-相对 OmniLoco 的接口差异
-------------------------
-1. actor 观测在 623 维基础上 **增加 3 维 `base_lin_vel`** → **626 维**；
-2. 速度指令换成**方向分档**（否则「纯侧向」命令采不出来）；
-3. 奖励集换成 **AMP_mjlab v5 迁移版**（步骤⑤，`G1AmpWalkRewardsCfg`）；
-4. 场景额外挂 `robot_reference` + `motion_reference`（为步骤⑥ 的判别器提供参考状态）。
+## ⚠️ 本层对**今天**仍有影响的部分
 
-其余全部继承、不改动：
+* ⭐ `G1AmpWalkRewardsCfg`（AMP_mjlab v5 迁移的奖励集）**是今天所有臂的奖励集根** ⇒ 各项今天实际生效值见
+  `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-T1l-G1-v0`（**别读本文件的字面值**）。
+* ⭐ **本文件 = V5**（`run_name = "G1AmpWalkPlane_obs626_directional_rew5"`，**不是 V33**）；后层全靠 `super().__post_init__()` 逐层覆盖。
+
+## 本层改动一览
+
+| # | 改动 | 现状（今天实际生效）|
+|---|---|---|
+| ① | actor 观测 623 → **626**（+3 `base_lin_vel`，特权量） | **已被 V9 覆盖** → 378 维 |
+| ② | 速度指令 → **方向分档**（`DirectionalVelocityCommand`） | ✅ 仍用（范围被 V18 等改窄）|
+| ③ | 奖励集 → **AMP_mjlab v5 迁移版** | ✅ 仍为整条链的根 |
+| ④ | 额外挂 `robot_reference` + `motion_reference`（判别器参考态） | ✅ 仍用 |
+| ⑤ | "**尚未接入 AMP 算法**（步骤⑥）" | **已被后层覆盖** → AMP 早已接入 |
+
+## 其余全部继承、不改动（今天仍成立）
 
 | 项 | 值 | 来源 |
 |---|---|---|
@@ -17,26 +26,16 @@
 | 执行器 | `beyondmimic_g1_29dof_actuators` | `G1OmniLocoEnvCfg.__post_init__` |
 | 事件 / 终止 | 与 OmniLoco 相同 | `G1FlatEventsCfg` / `G1FlatTerminationsCfg` |
 | Critic 观测 | 含 `base_lin_vel`（本就对称） | `G1FlatCriticObsCfg` |
-| 速度指令 | **方向分档**（`DirectionalVelocityCommand`） | `tasks/locomotion/mdp/commands.py` |
-| 奖励函数本体 | **一行不改**（只覆盖权重 + 新增 5 项） | `tasks/locomotion/mdp/rewards_amp.py` |
+| 速度指令 | 方向分档（`DirectionalVelocityCommand`） | `tasks/locomotion/mdp/commands.py` |
+| 奖励函数本体 | 一行不改（只覆盖权重 + 新增 5 项） | `tasks/locomotion/mdp/rewards_amp.py` |
 
-为什么 actor 要加 `base_lin_vel`
---------------------------------
-本任务是**特权（privileged）教师**，允许使用真值量测；`base_lin_vel` 在真机上不可直接观测，
-但在仿真里可精确获得。加上它后：
-1. 与 `AMP_mjlab` 的 actor 输入对齐（其 actor 也含 base 线速度）；
-2. 为后续蒸馏到学生策略提供明确的“特权信息边界”；
-3. `G1OmniLocoEnvCfg` 的 fail-fast 契约校验**只允许 623 维**，因此必须新建任务
-   （`G1OmniLocoTeacherEnv._validate_teacher_contract` 会直接 `RuntimeError`）。
+## 推理与判读（已归档，勿在本文件重复）
 
-本文件对应 `PLAN_amp_walk.md` §6 的**步骤②③④⑤**：
-- ② 任务骨架（actor obs 626），
-- ③ 速度指令换成方向分档（见 §3.5），
-- ④ AMP 观测组 `amp_policy`/`amp_reference`（670 维，逐项同构），
-- ⑤ 奖励集迁移（见 §3.1 与 `mdp/rewards_amp.py` 的对照表）。
+* 为什么 actor 要加 `base_lin_vel`（对齐 mjlab / 界定蒸馏特权边界 / `G1OmniLocoEnvCfg` 只允许 623 维的 fail-fast 契约）→ 见该版 run 日志与 `PLAN_amp_walk.md` §6
+* 本文件对应 `PLAN_amp_walk.md` §6 的**步骤②③④⑤**（② 任务骨架 / ③ 方向分档指令 / ④ AMP 观测组 670 维 / ⑤ 奖励集迁移）
 
-**尚未接入 AMP 算法**（步骤⑥）。
-"""
+⚠️ **本文件里的 `RewTerm(...)` 字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-T1l-G1-v0`"""
 
 from __future__ import annotations
 
@@ -606,7 +605,8 @@ class G1AmpWalkTeacherEnv(G1OmniLocoTeacherEnv):
         _cmd = self.cfg.commands.base_velocity
         print(
             f"[AMP-WALK PASS] policy={sum(self.expected_policy_dims)} "
-            f"(height_scan={self.expected_scan_rays} + base_lin_vel), action=29, scale=1.0, "
+            f"(height_scan={self.expected_scan_rays} rays; 逐项与顺序见该臂的 [T1?]/[V?] 打印), "
+            f"action=29, scale=1.0, "
             f"cmd_ranges={self.expected_command_ranges} (directional), "
             f"cmd_low/zero={getattr(_cmd, 'prob_low', float('nan')):.2f}/"
             f"{getattr(_cmd, 'zero_frac_in_low', float('nan')):.2f}, "

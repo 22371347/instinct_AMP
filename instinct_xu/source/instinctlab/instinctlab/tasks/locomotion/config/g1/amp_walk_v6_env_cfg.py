@@ -1,34 +1,27 @@
-"""AMP 行走 **v6** 的环境配置 —— v5 全部继承，**只多一项奖励**。
+"""AMP 行走 **v6**：v5 全部继承，**只多一项奖励** —— 恢复基类 `joint_deviation_arms`（weight -0.1）。
 
-唯一改动：恢复基类 `G1FlatRewardsCfg` 的 **`joint_deviation_arms`**（weight −0.1）
-⇒ 奖励集 **14 → 15 项**。
+## ⚠️ 本层对**今天**仍有影响的部分
 
-为什么（用户实测）
-------------------
-无论静止还是移动，**肩、肘关节都异常：高举且接近限位**。实测（v3c @5390
-的 `joint_error_rmse/<joint>`）：
+* ⭐ **这一项今天仍生效**：T1l 的 `joint_deviation_arms = -0.1`（`joint_deviation_l1`）正是本层从基类复原的条目
+  ⇒ 至今是"手臂漂移"的持续刹车。
+* 奖励项数：本层 **14 → 15**；今天 T1l 为 **非零 17**（后续多轮改动所致，与本层无关）。
 
-| 关节 | 偏差 | 备注 |
+## 本层改动一览
+
+| # | 改动 | 现状（今天实际生效）|
 |---|---|---|
-| `right_shoulder_roll` | **2.0338 rad ≈ 116.5°** | 全场最差 |
-| `left_shoulder_roll` | 1.5495 rad ≈ 88.8° | |
-| 双侧 `elbow` | ≈ 1.49 rad ≈ 85° | |
+| ① | ⭐ 恢复 `joint_deviation_arms`（weight **-0.1**）⇒ 奖励集 14 → 15 项 | ✅ **-0.1**（`joint_deviation_l1`，逐字延续）|
 
-而 default 姿态是 `elbow +0.600` / `shoulder_pitch +0.200` / `shoulder_roll ±0.200`
-⇒ 手臂被抬到离 default 很远的位置。臂上 Σ(R−L) = **+1.739**（腿只有 +0.159）。
+## 推理与判读（已归档，勿在本文件重复）
 
-原因：v2 采用 AMP_mjlab 的 12 项配方时把 `joint_deviation_arms` 整项**删掉**了
-（连同 `flat_orientation_l2` / `joint_deviation_torso`，后两项已在 v3c 恢复）。
-⇒ **全任务奖励里没有任何一项约束手臂**，而 AMP 判别器只给整条 transition 一个
-全局标量（无法定位到关节），所以手臂可以自由漂到限位。
+* 动机「肩/肘异常高举贴限位」（v3c@5390：`right_shoulder_roll` 偏差 **2.03 rad ≈116°**、臂上 Σ(R-L)=+1.739）→ 见该版 run 日志
+* 根因「v2 采用 AMP_mjlab 12 项配方时整项删掉 ⇒ 全任务无任何手臂约束」→ 见该版 run 日志
+* ⚠️ 不复用 v3 的 `__post_init__`（`AMP_WALK_V3_CHANGES` 是"唯一事实来源"，v4/v5 日志已按 14 项发布）⇒ 新建 v6 保持单变量 → 见该版 run 日志
 
-⚠️ 为什么不复用 v3 的 `__post_init__`：
-   v3 的 `AMP_WALK_V3_CHANGES` 是「唯一事实来源」，且 v4/v5 的日志（`rewards=14`）
-   已按 14 项发布。所以这里**新建 v6**：v3/v4/v5 语义一字不动，V6 = V5 + 这一项，
-   保持"单变量"与历史 run 的可比性。
+⚠️ `rewards={n}` 在契约校验里**只打印、不断言**（`PLAN` §11.5）⇒ 14→15 不会 fail-fast。
 
-⚠️ `rewards={n}` 在契约校验里**只打印、不断言**（见 PLAN §11.5），
-   所以 14 → 15 不会被 fail-fast 拦下；选项探针见 `cloud_probe_v6_rewards.py`。
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V6-G1-v0`（算法侧见同节）
 """
 
 from __future__ import annotations

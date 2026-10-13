@@ -111,6 +111,8 @@ class WasabiPPOAmpMix(WasabiPPO):
         amp_grad_pen_space: str = "raw",
         clip_max_std: float | None = None,
         clip_max_std_schedule: int | None = None,
+        fresh_discriminator_on_load: bool = False,
+        policy_obs_frames: dict[str, int] | None = None,
         **kwargs,
     ):
         if reward_mix_mode not in ("additive", "lerp"):
@@ -232,11 +234,45 @@ class WasabiPPOAmpMix(WasabiPPO):
         )
         self._std_cap_step = 0
         self._std_cap_from: float | None = None
+        #: ⭐ T1n：`True` ⇒ 热启动时**丢弃 checkpoint 里的判别器（含其优化器）**。
+        #: 动机：判别器一旦饱和（`d_policy ≈ −1`）就会停在原来的不动点上，
+        #: 换个输入度量空间（白化）也救不回来 —— 它本来就在 MSE(d, ±1) 的**极值**附近。
+        #: 想干净地检验"白化是否有用"，判别器必须在新空间里从零学起。
+        self.fresh_discriminator_on_load = bool(fresh_discriminator_on_load)
+        #: ⭐ **时序堆叠项的帧数**（项名 → 帧数），供 `MirrorSpec.from_obs_format` 用。
+        #: ⚠️ **必须由配置显式声明**：isaaclab 的 `group_obs_term_dim` 报的是**已展平的
+        #:    标量**（`velocity_command`（4 帧×3 维）报成 `(12,)`）⇒ 帧结构在 `obs_format`
+        #:    里不存在，镜像算子**无法自行推导**（实测 T1o 首发就因此 fail-fast 退出）。
+        #:    未声明的项按单帧处理。
+        self.policy_obs_frames = dict(policy_obs_frames) if policy_obs_frames else None
         super().__init__(*args, **kwargs)
 
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
+
+    def load_state_dict(self, state_dict):
+        """热启动时按需**丢弃判别器**（`fresh_discriminator_on_load=True`）。
+
+        做法是**在调用上游之前**把两个键弹掉 —— 上游 `wasabi.py` 的
+        `load_state_dict` 是
+            `if "discriminator" in state_dict: ...load... else: print("[Warning] ...")`
+        所以弹掉之后它会走 `else` 分支，**保留 `__init__` 里刚构造的全新模块**。
+
+        ⚠️ 必须在 `super().load_state_dict()` **之前**处理：新增白化 buffer
+        （`normalizer._mean/_var/_std/count`）会让上游那句**严格加载**（默认
+        `strict=True`）直接抛 missing-keys ⇒ **热启动会崩**。弹掉判别器键
+        同时解决了这个问题。
+        """
+        if self.fresh_discriminator_on_load and isinstance(state_dict, dict):
+            state_dict = dict(state_dict)  # 不改调用方的 dict
+            for key in ("discriminator", "discriminator_optimizer"):
+                if state_dict.pop(key, None) is not None:
+                    print(
+                        f"[WasabiPPOAmpMix] fresh_discriminator_on_load=True ⇒ "
+                        f"丢弃 checkpoint 里的 `{key}`，使用全新初始化的模块"
+                    )
+        return super().load_state_dict(state_dict)
 
     def update(self, *args, **kwargs):
         """在 `PPO.update` 之后再补一次 **σ 上限**钳制（`clip_max_std=None` 时为 no-op）。
@@ -342,7 +378,9 @@ class WasabiPPOAmpMix(WasabiPPO):
                 # ⭐ 主路径：布局由观测契约推导 ⇒ v1~v8(626) / v9(378) 通用。
                 #   项名不认识、或扫描尺寸没在 `SCAN_LAYOUTS` 登记 ⇒ 启动即报错。
                 self._mirror_spec = MirrorSpec.from_obs_format(
-                    list(self._mirror_joint_names), self._policy_obs_format
+                    list(self._mirror_joint_names),
+                    self._policy_obs_format,
+                    frames_by_term=self.policy_obs_frames,
                 )
             else:
                 # 兼容路径：拿不到契约时退回旧 626 布局（等价于 v1~v8 的行为）

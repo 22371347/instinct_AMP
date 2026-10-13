@@ -65,7 +65,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, yaw_quat
 
 # ⭐ V23（2026-10-03）：进度门控（方向投影+EMA）与逐关节死区/内部权重 —— 纯 torch 小模块，
 #   可在本地无 Isaac 单测（`instinct/tools/test_amp_reward_utils.py`）。
@@ -249,6 +249,77 @@ def track_base_height_exp(
     return torch.exp(-torch.square(target - root_height) / std**2)
 
 
+#: T5（2026-10-10）默认的身体与目标（见 `track_pelvis_height_exp` 的 docstring）
+T5_DEFAULT_BODY = "pelvis"
+
+
+def track_pelvis_height_exp(
+    env: ManagerBasedRLEnv,
+    std: float,
+    target_height: float | None = None,
+    one_sided: bool = False,
+    body_name: str = T5_DEFAULT_BODY,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """**奖励** 指定刚体（默认 `pelvis`）的高度贴近目标（`exp(-e²/std²)`，正权重）。
+
+    与 `track_base_height_exp` 的**唯一**区别：被测量的体从 **root（= `torso_link`）**
+    换成 **`pelvis`** —— 即把 mjlab 的 `track_root_height` 放回它本来的语义
+    （mjlab 的 root 就是 `pelvis`；我们 root 是 `torso_link`，所以那一项量的是"躯干高度"）。
+
+    为什么必须换（2026-10-10 回放取证，`analyze_gait_trace.py`）
+    -------------------------------------------------------------
+    在 T3@12500 的同一条真实轨迹（vx=+0.8）上实测：
+      * 原项（**躯干**高度，靶 0.82）得分 **0.999**，姿态力只有 **0.0035 reward/s**
+        （= 12 项总幅度 4.26/s 的 **0.08%**）；改靶到 0.8025 后 12600 轮姿态也**毫无变化**；
+      * 更关键：**躯干高度可以用腰换**（MJCF FK：腰前倾 0.2 rad ⇒ 躯干矮 **1.5 cm**）
+        ⇒ 它**不约束腿的伸展**，反而给"扭腰换高度"开了口子（实测策略：躯干世界系仅
+        **+0.81°**（钉在竖直），而参考是 **+10.10°**；骨盆则后仰 −8.9° 去"补偿"）；
+      * **骨盆高度只由腿决定**（骨盆是两条腿的根，它的 z 由髋/膝/踝的伸展量决定）
+        ⇒ 换成骨盆后，这一项第一次变成"**约束腿的伸展量**"，正是 mjlab 要的"别塌"语义。
+
+    目标取值（`target_height`，m）
+    -----------------------------
+    | 候选 | 值 | 说明 |
+    |---|---|---|
+    | mjlab 原值（root=pelvis） | **0.78** | `KNEES_BENT_KEYFRAME.pos_z`（关节位姿与我们逐字相同）|
+    | 我们资产的"生成高度等价" | 0.776 | = 0.82 − 0.044（torso−pelvis 偏移，MJCF FK 实测）|
+    | ⭐ T5 采用：**FK 一致的站姿高度** | **0.7585** | default 站姿 + 脚掌着地时的骨盆离地高度 |
+
+    ⚠️ 为什么不用 0.78：它比"脚掌着地时的站姿"高 **2.15 cm** —— 和我们踩过的躯干靶
+    0.82（比站姿高 1.75 cm）**同款"偏高"**，会持续逼腿**伸展**，正是 T5 要避免的
+    "腿伸直 → 奇异点 → 动作受限"。取 0.7585 ⇒ 该项成为"**别蹲、也别过伸**"的**对称**约束，
+    伸展方向**零压力**。
+
+    Args:
+        std: 高度误差的高斯尺度（m）。mjlab 用 0.3。
+        target_height: 目标高度（m）。`None` ⇒ 退回 `default_root_state[:, 2]`
+            （⚠️ 那是**躯干**生成高度，对骨盆**不正确**，只作兜底，T5 必须显式给值）。
+        one_sided: `True` ⇒ 只罚"低于靶"（`relu(target − z)`），完全放开向上。
+            T5 默认 `False`（= mjlab 的对称口径）；若实测出现蹲走，这是第一根杠杆。
+        body_name: 默认 `pelvis`。**找不到就 raise**（不许静默退回 root —— 那会变成
+            静默地继续量躯干，是最危险的失效模式）。
+
+    探针：`Step/pelvis_height`（实测骨盆高度，用来验证靶是否自洽）。
+    """
+    asset = env.scene[asset_cfg.name]
+    ids, names = asset.find_bodies([body_name], preserve_order=True)
+    if len(ids) != 1:
+        raise ValueError(
+            f"[T5] 在 {asset_cfg.name!r} 上找不到唯一刚体 {body_name!r}（命中 {list(names)}）"
+        )
+    h = asset.data.body_pos_w[:, ids[0], 2]
+    if target_height is None:
+        target = asset.data.default_root_state[:, 2]
+    else:
+        target = torch.full_like(h, float(target_height))
+    err = target - h
+    if one_sided:
+        err = torch.clamp(err, min=0.0)
+    _log_metric(env, "pelvis_height", h.mean())
+    return torch.exp(-torch.square(err) / std**2)
+
+
 def track_root_ang_vel_xy_exp(
     env: ManagerBasedRLEnv,
     std: float,
@@ -266,6 +337,72 @@ def track_root_ang_vel_xy_exp(
     asset = env.scene[asset_cfg.name]
     ang_vel_xy = asset.data.root_ang_vel_b[:, :2]
     return torch.exp(-torch.sum(torch.square(ang_vel_xy), dim=-1) / std**2)
+
+
+# ---------------------------------------------------------------------------
+# ⭐⭐ T2（2026-10-09）：照抄 AMP_mjlab 的速度/角速度跟踪**形式**
+#     `AMP_mjlab/src/tasks/amp_loco/mdp/rewards.py:71-130`
+# ---------------------------------------------------------------------------
+
+
+def track_anchor_lin_vel_exp(
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """**奖励**：根速度与指令的**三维世界系**误差（`exp(-‖R_yaw·(vx,vy,0) − v_w‖²/std²)`）。
+
+    与仓库既有的 `track_lin_vel_xy_yaw_frame_exp` 的**唯一**区别：本项把**竖直速度 `v_z`
+    也算进误差**（指令的 z 分量恒为 0）。
+
+    为什么 T2 要专门补这一项（逐行核对 AMP_mjlab 源码）
+    ----------------------------------------------------
+    `AMP_mjlab/src/tasks/amp_loco/mdp/rewards.py:87-95`::
+
+        command_xyz_b = torch.cat((command[:, :2], zeros_like(command[:, :1])), dim=-1)
+        command_xyz_w = quat_apply(yaw_quat(body_link_quat_w[:, anchor]), command_xyz_b)
+        lin_vel_error = torch.sum(torch.square(
+            command_xyz_w[:, :3] - body_link_lin_vel_w[:, anchor, :3]), dim=1)
+
+    ⇒ 误差是**三维**的 ⇒ mjlab 的这一项本来就顺带承担了「别上下弹」的职责，
+    **这正是 mjlab 奖励集里没有 `lin_vel_z_l2` 的原因**。若沿用 xy-only 版本、
+    又删掉 `lin_vel_z_l2`，就等于**丢掉了全部竖直速度抑制**（“小跳模态”的直接燃料）。
+
+    `std` 照抄 mjlab walk 的 **1.0**（我们历史值 0.5 更严格 ⇒ 等效灵敏度 4 倍）。
+    """
+    asset = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    if command is None:
+        raise ValueError(f"[T2] 找不到指令项 {command_name!r}")
+
+    cmd_b = torch.cat((command[:, :2], torch.zeros_like(command[:, :1])), dim=-1)
+    cmd_w = quat_apply(yaw_quat(asset.data.root_quat_w), cmd_b)
+    err = torch.sum(torch.square(cmd_w - asset.data.root_lin_vel_w[:, :3]), dim=-1)
+    return torch.exp(-err / std**2)
+
+
+def track_anchor_ang_vel_exp(
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """**奖励**：`exp(-[(ωz_cmd − ωz_w)² + ‖ω_xy^b‖²] / std²)`。
+
+    照抄 `AMP_mjlab/src/tasks/amp_loco/mdp/rewards.py:98-128`：偏航误差用**世界系** `ωz`，
+    横滚/俯仰用**机体系** `ω_xy`，两者相加后同一个 `exp`。
+    ⚠️ 与既有的 `track_ang_vel_z_world_exp` 的区别：后者**不含** `‖ω_xy^b‖²` 那一项。
+    `std` 照抄 mjlab walk 的 **3.14**（我们历史值 0.5 ⇒ 等效严格 ~40 倍）。
+    """
+    asset = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    if command is None:
+        raise ValueError(f"[T2] 找不到指令项 {command_name!r}")
+
+    wz_err = torch.square(command[:, 2] - asset.data.root_ang_vel_w[:, 2])
+    wxy = torch.sum(torch.square(asset.data.root_ang_vel_b[:, :2]), dim=-1)
+    return torch.exp(-(wz_err + wxy) / std**2)
 
 
 def track_default_pose_on_stand(
@@ -658,9 +795,13 @@ def feet_swing_time_penalty(
     没有竖直弹跳）⇒ 于是"一侧脚一直踩地、另一侧吊着、靠上身侧倾推进"成了
     既躲过抗跳项、又拿满步态项的最优解，即实测观察到的"**单脚侧身跳着走**"。
 
-    ⚠️ **镜像损失拦不住这种现象**：它约束的是 `π(M(o)) ≈ M(π(o))`（策略**函数**的
-    对称性），而单侧步态实际访问到的状态，其镜像态**从未被访问过**（off-distribution）
-    ⇒ 约束可以在"没去过的状态"上被满足（V9h 实测镜像损失 0.0368 很小，步态却完全单侧）。
+    ⚠️ **镜像损失拦不住这种现象**（V9h 实测镜像损失 0.0368 很小，步态却完全单侧）。
+    ⚠️ 机理已勘误（2026-10-08）：原先写"单侧步态实际访问到的状态，其镜像态从未被访问过
+    （off-distribution）⇒ 约束可以在'没去过的状态'上被满足" —— 那是**策略侧**的说法，
+    **不是当时的实际根因**。根因在**命令分布**：V9h 当时**只给了前向速度**（纯 `(0, 0.7)`，
+    vy = wz = 0；侧向/转向是 V10 的③指令扩展才引入的）⇒ 状态分布集中在"直行流形"上、
+    **没有镜像场景的计算空间 ⇒ 镜像损失在"只有前向速度"的条件下无法正常生效**
+    （见 `docs/amp_walk/EXPERIMENTS.md` §A1）。
 
     ## 语义
 

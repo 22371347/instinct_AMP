@@ -1,59 +1,46 @@
-"""AMP 行走 **v9（MVP）** 的环境配置。
+"""AMP 行走 **v9（MVP）**：v8 续训发散后把变量收敛到四项的最小实现（2026-09-28）。
 
-背景：v8 续训到 1w3k 轮时**训练发散**（且 `waist_pitch` 长期贴限位）。经讨论，
-本轮只做**最小实现验证**，把变量收敛到四项：
+## ⚠️ 本层对**今天**仍有影响的部分
 
-| # | 改动 | 本文件负责 |
+* ⭐ **`height_scan` = 3.0×0.8 m（279 射线）、中心前移 1.5 m** 今天仍生效
+  ⇒ 策略观测 **626 → 378**（`obs378` 沿用至 T1l；观测项名字/顺序未动）。
+* ⭐ **"越障侧与我们是同一个 `G1_29DOF_TORSOBASE_POPSICLE_CFG`（`default_joint_pos` 逐字相同）"
+  今天仍有效** ⇒ 动作语义 `q_target = default + 1.0·a`、`clip=None` 两边本来就一致。
+* ❌ MVP 指令集（仅前向 0~0.7）已被完全覆盖（V10 "③ 指令扩展" → V18 方案 B → V33 `side_vel_min`）。
+* ❌ `noise_std` 缩小（在算法 cfg）已被 T1a2 覆盖（`init_noise_std=1.0`）。
+
+## 本层改动一览
+
+| # | 改动 | 现状（今天实际生效）|
 |---|---|---|
-| 1 | `height_scan` 对齐越障：尺寸 3.0×0.8（**279**）、**中心前移 1.5 m** | ✅ 本文件 |
-| 2 | `default_joint_pos` / `offset` 对齐越障 | ⚪ 核查后**本来就一致**，不动（见下） |
-| 3 | `noise_std` 缩小到 AMP_mjlab 等效值（+ std 上限） | `agents/amp_walk_v9_ppo_cfg.py` |
-| 4 | MVP 指令集（原地+前向 0~0.7）+ 仅前向数据集 | ✅ 本文件 |
+| ① | `height_scan` 3.0×0.8（**279**，`resolution=0.1`）+ **中心前移 1.5 m**（`AMP_WALK_V9_SCAN_FORWARD`，`ray_alignment="yaw"`）⇒ 观测 **626 → 378** = 279+3+3+3+3+29+29+29 | ✅ 仍生效（观测 378）|
+| ② | `default_joint_pos` / `offset` 对齐越障 | ⚪ **核查后本来就一致**，未改（见下）|
+| ③ | `noise_std` → AMP_mjlab 等效值（+ std 上限）〔算法 cfg〕| ❌ 已被 T1a2 覆盖 |
+| ④ | MVP 指令集（原地 + 前向 0~0.7）+ 仅前向数据集 | ❌ 已被 V10 / V18 / V33 覆盖 |
 
-### 1) height_scan
+**② 的核查（今天仍适用）**：两边同一个 POPSICLE cfg（`default_joint_pos` 逐字相同）；
+`JointPositionActionCfg.use_default_offset` **默认 True**（`actions_cfg.py:52`）⇒ 越障侧没写也等于 True；
+蒸馏教师 `perceptive_vault` 的 `scale` 也是 **1.0**（只有 `beyondmimic_vault` 用逐关节 `0.25·e/kp`）。
 
-```python
-MultiMeshRayCasterCfg(
-    prim_path     = "{ENV_REGEX_NS}/Robot/torso_link",
-    offset.pos    = (1.5, 0.0, 20.0),      # ⭐ 中心前移 1.5 m ⇒ 落点 x∈[0, 3] m
-    ray_alignment = "yaw",
-    pattern_cfg   = GridPatternCfg(resolution=0.1, size=(3.0, 0.8)),   # 31 × 9 = 279
-)
-```
+**④ 当时口径**：低速/原地 **0.30**（幅值 ≤0.1、`wz=0`；其中 60% 给精确 (0,0,0) ⇒ 占全体 18%）；
+纯侧向 / 纯前后 / 持续后退 **0 / 0 / 0**；均匀 0.70（`vx∈(0,0.7) / vy=0 / wz=0`，`vy`/`wz` 范围钉成 (0,0) 以免留死配置）。
+⚠️ `rel_standing_envs` / `rel_heading_envs` 仍 **0.0**、`heading_command` 仍 False（否则 `DirectionalVelocityCommand` fail-fast）；
+`resampling_time_range` 仍 **(6, 15) s**。
 
-⚠️ **出处对账（重要）**：我们手上的越障源码 `perceptive_vault_cfg.py:327-334` 写的是
-`offset.pos=(0.0, 0.0, 20.0)`（**居中**）+ `size=(3.0, 0.8)`；学长口头确认他的更新版
-**中心在机器人正前方** ⇒ 本文件按 **前移 1.5 m** 实现（用户 2026-09-28 确认）。
-⇒ 若日后拿到他的 `params/env.yaml`，只需核对/修改 `AMP_WALK_V9_SCAN_FORWARD` 一行。
+## 推理与判读（已归档，勿在本文件重复）
 
-⇒ actor 观测 **626 → 378** = 279 + 3 + 3 + 3 + 3 + 29 + 29 + 29（项名与顺序不变）。
-⚠️ 观测项**名字/顺序**一个都没动，只改了 `height_scan` 的**宽度** ⇒ 下游（镜像损失、
-本地回放工具）只需改「扫描维数」这一处常量。
+* ⚠️ **`height_scan` 出处对账**：手上越障源码 `perceptive_vault_cfg.py:327-334` 写的是 `pos=(0,0,20)`（**居中**）；
+  学长口头确认他的更新版**中心在机器人正前方** ⇒ 本文件按**前移 1.5 m** 实现（用户 2026-09-28 确认）。
+  若日后拿到他的 `params/env.yaml`，只需核对/修改 `AMP_WALK_V9_SCAN_FORWARD` 一行 → 见该版 run 日志
+* "仅前向数据集 / 指令 ⇒ AMP 压制侧移后退（**改命令分布无法解决**，只能补参考运动数据）"
+  → `docs/amp_walk/EXPERIMENTS.md` §D1
+* "镜像损失在**只有前向速度**时无法正常生效"（本层 MVP 指令即纯前向，正是 §A1 的前提）→ §A1
+* "95% 摔倒"只是断崖快照（v9g 振荡）→ §C1；"单脚侧身跳着走"退化模态 → §C3
 
-### 2) default pose / offset —— 核查结论：**无需改动**
+⚠️ 其余逐字不动：除 `height_scan` 宽度外，v8 的环境（动作 / 观测项 / 奖励表）逐字沿用。
 
-- 两边用的是**同一个** `G1_29DOF_TORSOBASE_POPSICLE_CFG`（`default_joint_pos` 逐字相同）；
-- IsaacLab 的 `JointPositionActionCfg.use_default_offset` **默认就是 `True`**
-  （`isaaclab/envs/mdp/actions/actions_cfg.py:52`，注释明确会覆盖 `offset` 为默认姿态）
-  ⇒ 越障那边**没写也等于 True** ⇒ 双方有效 offset 都 = `default_joint_pos`；
-- 蒸馏教师 `perceptive_vault` 的 `scale` 也是 **1.0**（只有 `beyondmimic_vault` 那个
-  变体用逐关节 `0.25·e/kp`）。
-⇒ 动作语义（`q_target = default + 1.0·a`、`clip=None`）**两边本来就一致**。
-
-### 4) MVP 指令集
-
-| 档 | 概率 | 内容 |
-|---|---|---|
-| 低速/原地 | **0.30** | 幅值 ≤0.1、`wz=0`；其中 **60%** 给精确 (0,0,0)（占全体 18%） |
-| 纯侧向 / 纯前后 / 持续后退 | **0 / 0 / 0** | 全部关闭（侧移、后退、转身都不在 MVP 范围） |
-| 均匀（= 余下 0.70） | 0.70 | 父类均匀采样，范围已收敛为 `vx∈(0,0.7) / vy=0 / wz=0` |
-
-⚠️ `vy` 与 `wz` 的范围设为 **(0.0, 0.0)**（而不是 ±0.0），确保父类均匀分支也只给 0；
-`straight_*` / `back_*` 的范围也跟着收进 MVP 区间（虽然对应概率为 0，用不到，
-但避免留下与指令范围冲突的「死配置」）。
-⚠️ `rel_standing_envs` / `rel_heading_envs` 仍为 **0.0**，`heading_command` 仍 **False**
-（`DirectionalVelocityCommand` 有 fail-fast：非 0 会直接 raise）。
-⚠️ `resampling_time_range` 仍 **(6, 15) s**（与 v3 一致）。
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V9-G1-v0`
 """
 
 from __future__ import annotations

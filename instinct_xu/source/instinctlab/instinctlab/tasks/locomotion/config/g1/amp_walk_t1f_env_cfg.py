@@ -1,36 +1,32 @@
-"""**T1f**：把 mjlab 的奖励机理**恢复**回来 + 限位/姿态权重按 mjlab 校准。
+"""**T1f**：一次性把 mjlab 的 6 项奖励机理**恢复/校准**回来（2026-10-07）。
 
-为什么（2026-10-07 定位）
-------------------------
-T1a2/T1b/T1c/T1d/T1e 这条线为了"与 T0 奖励白名单逐字对齐"，把下面这些项
-**全部置 0 禁用**了（`amp_walk_env_cfg.py` 里它们本来就带 mjlab v5 的权重）：
+## ⚠️ 本层对**今天**仍有影响的部分
 
-    项                              mjlab v5   T1a2~T1e
-    feet_lateral_width（步宽下限）   -10.0      0（禁用）
-    feet_crossing（双脚真交叉）      -20.0      0（禁用）
-    track_lin_vel_xy_exp              1.5       1.0
-    track_ang_vel_z_exp               1.2       1.0
+* ⭐ **唯一今天仍生效的改动 = `track_lin_vel_xy_exp` 1.0 → 1.5**（经 T1k 保持、T1l 沿用）。
+* ⭐ **这是"必须单变量"的最典型案例**：6 项齐改 ⇒ 训练失败（站立盆地，见下）。
+* 其余 5 项**今天全部不再生效**（被 T1a2 白名单/实现回退覆盖，见下表）。
 
-⇒ **mjlab 防止"窄步 / 脚掌侧边缘站姿"的核心机理被关掉了**，这解释了：
-  * 踝 `ankle_roll` 从 ≤500 轮起就停在限位附近（`tracking_joint_error_rmse`
-    ≈0.242→0.257，全身最大，且全程几乎不变）；
-  * `limit_margin_u_max = 2.08`（越过硬限位）；
-  * 目视"用脚掌侧边缘行走"。
-另外 mjlab 的 `joint_pos_limits` 权重是 **-10.0**，我们只有 **-1.0**（差 10×）。
+## 本层改动一览（⚠️ 本轮是「6 组变量」，非单变量）
 
-本臂相对 T1a2 的改动（**mjlab 对齐**，逐项可核）
-----------------------------------------------
-    1. feet_lateral_width : 0 → **-10.0**（sep_floor=0.157，gate_lateral，max_cost 0.10）
-    2. feet_crossing      : 0 → **-20.0**（保留方向门控：本仓库侧移 clip 是交叉式侧步）
-    3. dof_pos_limits     : 踝-only -1.0 → **全关节 -10.0**（回到标准 joint_pos_limits）
-    4. flat_orientation_l2: -1.0 → **-2.0**（用户指定，强化上身直立）
-    5. track_lin_vel_xy_exp : 1.0 → **1.5**（mjlab）
-    6. track_ang_vel_z_exp  : 1.0 → **1.2**（mjlab）
-算法侧同批对齐见 `agents/amp_walk_t1f_ppo_cfg.py`。
+| # | 改动 | 现状（今天实际生效）|
+|---|---|---|
+| ① | `feet_lateral_width` 0 → **-10**（`gate_lateral`、`max_cost` 0.10）| **已被 T1a2 覆盖** → **-1** |
+| ② | `feet_crossing` 0 → **-20**（保留方向门控）| **已被覆盖** → **-2** |
+| ③ | `dof_pos_limits` 踝-only -1 → **全关节 -10**（回标准 `joint_pos_limits`）| **已被 T1a2 覆盖** → **-1**（踝-only，`isaaclab...joint_pos_limits`）|
+| ④ | `flat_orientation_l2` -1 → **-2** | **已被覆盖** → **-1** |
+| ⑤ | `track_lin_vel_xy_exp` 1.0 → **1.5** | ✅ **1.5**（经 T1k 保持、T1l 沿用）|
+| ⑥ | `track_ang_vel_z_exp` 1.0 → **1.2** | **已被覆盖** → **1.0** |
 
-⚠️ 这是**刻意偏离 T0 口径**（T0 的奖励表是另一套设计）。目的：把"跟踪 + 类人风格"
-   拉回 mjlab 已验证有效的配置。
-⚠️ 本文件不改动、不删除任何既有 cfg（非破坏性）。
+## 推理与判读（已归档，勿在本文件重复）
+
+* ⭐ **失败结果**：6 项齐改 ⇒ `vx_high 0.02@6010`（站立盆地；T1a2 在 1010 轮就有 0.56）⇒ 无法归因 → `EXPERIMENTS.md` §B4
+* 动机「踝 `ankle_roll` 贴限位 / `limit_margin_u_max=2.08` / 脚掌侧缘行走」及 mjlab `joint_pos_limits` -10 vs 我们 -1 → §附待办第 2 条
+* 算法侧同批对齐见 `agents/amp_walk_t1f_ppo_cfg.py`（不在本文件）
+
+⚠️ 本层是**刻意偏离 T0 口径**的合并改动（目的：把"跟踪 + 类人风格"拉回 mjlab 已验证配置）。
+
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-T1f-G1-v0`（算法侧见同节）
 """
 
 from __future__ import annotations

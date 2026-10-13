@@ -713,7 +713,7 @@ bash instinct/tools/refresh_plots.sh stop     # 停止
 |---|---|
 | `01_overview.png` | 平均回报 / 回合长度 / AMP 总损失 / 动作噪声 std |
 | `02_reward_terms.png` | 21 项 `Episode_Reward/*` 逐项收敛（缺项自动过滤） |
-| `03_amp_diagnostics.png` | 判别器 4 个损失项 + `Step/discriminator_reward` + `amp_style_reward` |
+| `03_amp_diagnostics.png` | 判别器 4 个损失项 + `Step/discriminator_reward` + `amp_style_reward` + ⭐`amp_d` / `amp_d_ref`（判别器对**策略/参考**的原始打分）与两者的**差距叠加图** |
 | `04_foot_diagnostics.png` | ⭐ 步宽/交叉专项（**本次迁移最关键的设计风险点**） |
 | `05_terminations_perf.png` | 终止方式 / FPS / 速度跟踪误差 |
 | `06_amp_task_split.png` | 最终奖励里 task 与 AMP 风格各占多少 |

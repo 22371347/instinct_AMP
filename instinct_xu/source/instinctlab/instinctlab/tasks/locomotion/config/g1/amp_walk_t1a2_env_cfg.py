@@ -1,38 +1,46 @@
-"""**T1a2**：T1a + **把奖励"实现/作用域"逐字对齐 T0**（T1a 只对齐了权重）。
+"""**T1a2**：T1a + **把奖励"实现/作用域"逐字对齐 T0**（T1a 只对齐了权重；2026-10-07 控制变量审计）。
 
-============================================================================
-为什么要 T1a2（2026-10-07 控制变量审计的结论）
-============================================================================
-`cloud_diff_t1a_t0.py` 把两套 cfg 现场建出来对比后发现：T1a 的 17 项权重虽然与 T0
-逐项相等，但**同名奖励的实现/作用域大面积不同** ⇒ 无法用 T1a 回答"T0 的能力是否还在"。
-且实测 T1a 在 1500 轮收敛到"站着不动"（九档 `vel_mean` 全 ≈0，`vx_high` 0.006，
-T0 同期 0.643）—— 与 S8 的失败模式一致。
+## ⚠️ 本层对**今天**仍有影响的部分
 
-本文件把**生效项**中实现不同的三处换回 T0：
+* ⭐⭐ **本层是这三项的「当前生效层」**（今天 T1k/T1l 逐字沿用）—— 它们**覆盖了 V18/V21/V23/V24 等层的设定**：
+  * `dof_pos_limits` = `isaaclab.envs.mdp.joint_pos_limits`（**线性**、作用域**仅踝** pitch/roll）
+    ⇒ 覆盖 V21/V23/V24 的 `joint_pos_limits_margin`（margin 0.15、二次、全 29 关节）
+  * `dof_acc_l2` = `joint_acc_l2`（作用域 **hip + knee**）⇒ 覆盖 V24 的"全 29 关节"版
+  * `feet_air_time` = `feet_air_time_positive_biped`（`threshold=0.5`）
+    ⇒ 覆盖 V18/V21/V23/V24 的"目标带"实现（`feet_air_time_target_biped`）
+* ⭐ **刻意保留**（用户点名的核心，**不算**"未对齐"）：① `track_default_pose_on_stand`(−0.8)（交付要求②：静止恢复初始姿态）；
+  ② `mirror_loss`（策略层，coef 0.1 —— 交付要求②：对称能力）；③ AMP 判别器全套 + `style_lerp=1.0`（风格项贡献恰 0，
+  判别器仍训练 ⇒ T1b 可热启动）；④ V33S 骨架（378 观测（含 `base_lin_vel` 教师特权）/ 396 AMP 状态 / 全向分档指令）。
+* 其余 16 项不在此列，见该表。
 
-| 项 | T1a（错） | **T1a2（= T0）** |
-|---|---|---|
-| `feet_air_time` (w=+1) | `rewards_amp.feet_air_time_target_biped`（目标带 0.4~1.0 s） | `rewards.feet_air_time_positive_biped`，`threshold=0.5` |
-| `dof_pos_limits` (w=−1) | `rewards_amp.joint_pos_limits_margin`（margin 0.15、二次、**全 29 关节**） | `isaaclab.envs.mdp.joint_pos_limits`（线性、**仅踝 pitch/roll**） |
-| `dof_acc_l2` (w=−2e-7) | `joint_acc_l2`，`asset_cfg=.*`（**全 29 关节**） | `joint_acc_l2`，`asset_cfg=hip/knee` |
+## 本层改动一览（把"生效项"中实现不同的三处换回 T0）
 
-============================================================================
-**刻意保留**（用户点名的核心部分，不算"未对齐"）
-============================================================================
-1. `track_default_pose_on_stand`(−0.8) —— 交付要求②（静止恢复初始姿态）。
-2. `mirror_loss`（策略层镜像损失，coef 0.1）—— 交付要求②（对称能力）。
-3. AMP 判别器全套 + `style_lerp=1.0`（风格项贡献恰为 0；判别器仍训练 ⇒ T1b 可热启动）。
-4. V33S 骨架：378 观测（含 `base_lin_vel` 教师特权）/ 396 AMP 状态 / 全向分档指令。
+| # | 项 | T1a（错）→ **T1a2（= T0）** | 现状（今天实际生效）|
+|---|---|---|---|
+| ① | `feet_air_time`(w=+1) | `rewards_amp.feet_air_time_target_biped`（目标带 0.4~1.0 s）→ **`rewards.feet_air_time_positive_biped`**（`threshold=0.5`）| ✅ **本层是当前生效层** |
+| ② | `dof_pos_limits`(w=−1) | `rewards_amp.joint_pos_limits_margin`（margin 0.15、二次、全 29 关节）→ **`isaaclab.envs.mdp.joint_pos_limits`**（线性、仅踝 pitch/roll）| ✅ **本层是当前生效层**（覆盖 V21/V23/V24）|
+| ③ | `dof_acc_l2`(w=−2e-7) | `joint_acc_l2`，`asset_cfg=.*`（全 29 关节）→ **`joint_acc_l2`，`asset_cfg=hip/knee`** | ✅ **本层是当前生效层**（覆盖 V24 的全关节版）|
 
-============================================================================
-**已知且接受的残余差异**（写在这里，避免以后误读为"完全等价"）
-============================================================================
-* `track_lin_vel_xy_exp` 用 `rewards_amp.track_lin_vel_xy_axis_diag`：它是
-  `track_lin_vel_xy_yaw_frame_exp` 的**逐样本等价**无损诊断版，**运行期恒等自检**
-  （`max|Δ| > 1e-5` 直接抛错）⇒ 训练奖励完全不变，白拿 `lin_track_*` 曲线。
-* T0 的 `stand_still`(−0.8) 换成 `track_default_pose_on_stand`(−0.8)：
-  T0 那项本质是"静止时关节偏离 default 的 L1"，语义相近（见审计记录）。
+⚠️ `params` 里的 `SceneEntityCfg` **必须带上 `body_names`/`joint_names`** —— 作用域不同等于换了奖励（审计踩过的坑）。
+
+## 推理与判读（已归档，勿在本文件重复）
+
+* **为什么要 T1a2**：`cloud_diff_t1a_t0.py` 现场建两套 cfg 对比 ⇒ T1a 的 17 项权重虽与 T0 逐项相等，
+  但**同名奖励的实现/作用域大面积不同** ⇒ 无法用它回答"T0 的能力是否还在"；
+  且实测 T1a 在 1500 轮收敛到"站着不动"（九档 `vel_mean` 全 ≈0、`vx_high` 0.006，T0 同期 0.643），
+  与 S8 的失败模式一致 → `instinct/docs/v33_tracking_gait_analysis.md` + 该版 run 日志
+
+**已知且接受的残余差异**（避免以后误读为"完全等价"）：
+* `track_lin_vel_xy_exp` 用 `rewards_amp.track_lin_vel_xy_axis_diag`：是 `track_lin_vel_xy_yaw_frame_exp` 的
+  **逐样本等价**无损诊断版，**运行期恒等自检**（`max|Δ| > 1e-5` 直接抛错）⇒ 训练奖励完全不变，白拿 `lin_track_*` 曲线。
+* T0 的 `stand_still`(−0.8) 换成 `track_default_pose_on_stand`(−0.8)：T0 那项本质是"静止时关节偏离 default 的 L1"，
+  语义相近（见审计记录）。
 * 观测 378 vs 623、指令分布（`ang_vel_z ±0.8`、6~15 s 重采样）保持 V33S —— 用户确认。
+
+⚠️ 其余逐字不动：T1a 的白名单机制（22 项里删 1 存 21、非零 16 项）。
+
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-T1a2-G1-v0`
 """
 
 from __future__ import annotations

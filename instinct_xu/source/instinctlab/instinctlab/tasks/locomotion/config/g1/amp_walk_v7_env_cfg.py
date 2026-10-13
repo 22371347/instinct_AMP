@@ -1,14 +1,12 @@
-"""AMP 行走 **v7** 的环境配置 —— 与 v6 **完全相同**，只换 `run_name`。
+"""AMP 行走 **v7**：与 v6 **完全相同**，只换 `run_name`（v3 的 `__post_init__` 把 `run_name` 钉死）。
 
-只加一个文件的原因同 v4/v5/v6：`G1AmpWalkV3EnvCfg.__post_init__` 会把 `run_name`
-钉成 v3 的名字，复用 v6 会让日志目录看不出"这轮 σ 与 AMP 系数都改了"。
+## ⚠️ 本层对**今天**仍有影响的部分
 
-**只改 `run_name`，其余一律不动**：奖励集 **15 项**（v3 的 14 项 + v6 恢复的
-`joint_deviation_arms`）、指令分布、精选 7-clip 数据集、观测 626/99/670、
-动作契约（`scale=1.0`）全部继承 v3→v6。
+* **无 —— `run_name` 已被后层覆盖**（今天 = `G1AmpWalkT1l...`）⇒ 本文件是"15 项奖励 / 7-clip 数据集 /
+  观测 626/99/670 / 动作契约 `scale=1.0`"那一代配置的**重命名副本**，其余逐字继承 v3→v6。
+* 判读（已归档）：本任务按**从零训练**（不带 `--resume`）启动的理由 → `agents/amp_walk_v7_ppo_cfg.py` docstring
 
-⚠️ 本任务按「**从零训练**」启动（不带 `--resume`），理由见
-`agents/amp_walk_v7_ppo_cfg.py` 的模块 docstring。
+⚠️ `RewTerm(...)` 字面值 **≠ 生效值**（后层整体覆盖 `params`）→ `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V7-G1-v0`（算法侧见同节）
 """
 
 from __future__ import annotations

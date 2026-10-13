@@ -1,0 +1,48 @@
+"""V2：把奖励集换成 AMP_mjlab 的 12 项配方（删 9 项 + 对齐 3 个权重）。
+
+## ⚠️ 本层对**今天**仍有影响的部分（其余已被后层覆盖，见下表）
+
+* ⭐ **唯一至今存活的实质改动 = 删除 `stand_still`**：今天 T1l 的「已删除(None)」只有
+  `stand_still` 一项（V9h 曾明确「刻意不恢复」）；本层删的另外 8 项**已被后层陆续恢复**。
+* 本层提出的「12 项 = AMP_mjlab `amp_loco` 配方」框架**已被后层扩展回 21 项**
+  （今天非零 17 项）⇒ 今天**不再等于**该配方。
+* 仍在被引用的**方向性结论**：`action_rate_l2` 是奖励集里**最大的单项成本**
+  （−0.646/s，而全部任务正向项合计才 ~+1.6/s）；`joint_deviation_*` 是「关节漂到限位」的
+  **唯一持续刹车**。
+* 契约不变性（动作 29D / 观测 626-99-670 / 50 Hz / 无 clip）**今天仍成立** → `INTERFACE_CONTRACT.md`。
+
+## 本层改动一览
+
+| # | 改动 | 现状（今日 T1l 实际生效）|
+|---|---|---|
+| ① | 置 `None` **删 9 项**（`AMP_WALK_V2_REMOVED_TERMS`）：`feet_air_time` / `joint_deviation_{knee,hip,arms,torso}` / `flat_orientation_l2` / `stand_still` / `lin_vel_z_l2` / `dof_torques_l2` | **仅 `stand_still` 仍为 None** ✅ → 其余 8 项已恢复：`feet_air_time +1`(thr0.5)、`flat_orientation_l2 −1`、`lin_vel_z_l2 −0.1`、`dof_torques_l2 −4e-6`、`joint_deviation_{hip,arms} −0.1`、`joint_deviation_{knee,torso} +0` |
+| ② | 对齐 3 个权重（`AMP_WALK_V2_WEIGHT_FIXES`）：`action_rate_l2 −0.05→−0.01`、`dof_pos_limits −1→−10`、`dof_acc_l2 −2e-7→−2.5e-7` | **三项均已被覆盖** → `action_rate_l2` **−0.05**；`dof_pos_limits` **−1（仅踝）**；`dof_acc_l2` **−2e-7（仅髋/膝）** |
+| ③ | 保留 9 项已对齐项（合计 12 项）| 部分仍在：`track_base_height +1.5` ✅、`track_lin_vel_xy_exp +1.5` ✅、`termination_penalty −200` ✅；已被改名/改值：`track_ang_vel_z +1.2→+1.0`、`track_default_pose_on_stand −1.0→−0.8`、`body_ang_vel_xy +0.7→0`、`feet_lateral_width −10→−1`、`feet_crossing −20→−2`、`feet_slide −0.25→−0.1` |
+
+**刻意保留的 4 条偏离（今天多数仍成立）**
+
+1. `track_lin/ang_vel` 的 `std` 仍 **0.5**（mjlab 是 1.0/3.14）—— ✅ 今天仍 0.5。
+2. `dof_pos_limits` 仍**只作用踝关节**（mjlab 全关节）—— ✅ 今天仍只踝。
+3. `dof_acc_l2` 仍**只作用髋/膝**（mjlab 全关节）—— ✅ 今天仍只髋/膝。
+4. `feet_lateral_width`/`feet_crossing` 实测**几乎不激活**（`max_cost=0.10` 封顶）
+   ⇒ ⚠️ 宽站姿问题**不会**因本文件自动解决 —— 参数至今仍在。
+
+## 推理与判读（已归档，勿在本文件重复）
+
+* `feet_air_time`「函数内 `sum(in_contact)==1` ⇒ 构造上奖励单脚支撑」→ `EXPERIMENTS.md` §B2
+* `joint_deviation_*` 的删除理由「把关节往直腿 default 拽」**已被证伪**（default 实为**屈膝**）
+  → `EXPERIMENTS.md` §P3；真正的代价是「这 4 项是关节漂移的唯一持续刹车」（结论仍有效）
+* 删 `lin_vel_z_l2`（压制跳跃起跳/落地）、`dof_torques_l2`（数值上纯装饰 −0.018/s）、
+  `flat_orientation_l2`（与 `body_ang_vel_xy` 语义重叠）、`stand_still`（与
+  `track_default_pose_on_stand` 语义重叠）的逐项性价比 → 见该版 run 日志
+* `action_rate_l2` 5× 过强「鼓励跳跃」的频率论证 → 见该版 run 日志（机制版已归档 §B5）
+
+⚠️ 其余逐字不动：**接口契约与 v1 逐字相同**（动作/观测/时序/执行器，见 `INTERFACE_CONTRACT.md`）
+   ⇒ v2 的 ckpt 与 v1 **互换**（可从 `model_5000.pt` 直接续训）、teacher 侧接口
+   （含 `model_*.pt` + `params/agent.yaml` 的 run 目录）不受影响。
+   ⚠️ 唯一**不兼容点**：奖励语义变了 ⇒ v1 的 value function 不再准确，续训初期
+   回报会先掉再涨（**预期**现象）。
+
+⚠️ 本文件里的 `RewTerm(...)` **字面值不代表最终生效值**（后层会整体覆盖 `params`）。
+   查实际生效值 → `docs/amp_walk/EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V2-G1-v0`
+"""

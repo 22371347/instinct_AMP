@@ -1,20 +1,16 @@
-"""V15 的环境：**逐字沿用 V14**（2 帧判别器 134 维 / 三档指令 / 2-clip 数据集 /
-`track_default_pose_on_stand −0.3` / 限位软边距全关节 margin 0.15 power 2 weight −1.5）。
+"""V15：环境**逐字沿用 V14**；唯一改动在算法侧（`discriminator_reward_coef` 0.25 → 1.0，风格分量 ×4）。
 
-唯一改动在**算法侧**（`discriminator_reward_coef` 0.25 → 1.0，即风格分量 ×4），
-见 `agents/amp_walk_v15_ppo_cfg.py`。
+## ⚠️ 本层对**今天**仍有影响的部分
 
-⚠️ 关于你看到的那张"躯干接近 45°"的截图：`Episode_Reward/flat_orientation_l2` 是
-**所有 env、所有时刻的平均**，均值小不代表"任何时刻都竖直"。因此本轮起
-`mdp/rewards_amp.py::joint_pos_limits_margin` 会额外记录**倾角分布**探针：
+* **无 —— 已被后层整体覆盖**；今日生效值 `discriminator_reward_coef = 4.0`（非本层的 1.0）
+  ⇒ 本层改动一览仅①这一项（`agents/amp_walk_v15_ppo_cfg.py`）。
 
-    Step/tilt_deg_mean      平均倾角（度）
-    Step/tilt_p95_deg       **95 分位**倾角（度）⭐ 偶发大倾角看这个
-    Step/tilt_gt{20,30,45}_frac   倾角超阈的 env 比例
-    Step/grav_bx_mean       躯干系重力 x（有符号 ⇒ 判别前/后倾）
-    [LIMIT-TOP]             每 500 步打印"边距占用最高的 5 个关节"（谁在超限）
+## 推理与判读（已归档，勿在本文件重复）
 
-⇒ 有了它们，"均值 4° 但偶发 45°"就能被直接证实/证伪。
+* ⭐ 「风格权重 ×4 能改善风格」**已实测证伪**（`amp_d` -0.433→-0.407 且伴随崩溃振荡）→ `EXPERIMENTS.md` §A3
+* 「均值倾角小 ≠ 任何时刻都竖直」+ 本层起的倾角分布探针（`Step/tilt_p95_deg`、`[LIMIT-TOP]` 等）→ 见该版 run 日志
+
+⚠️ `RewTerm(...)` 字面值 **≠ 生效值**（后层整体覆盖 `params`）→ 见 `EFFECTIVE_REWARDS.md` → `Instinct-Amp-Walk-V15-G1-v0`（算法侧见同节）
 """
 
 from __future__ import annotations
