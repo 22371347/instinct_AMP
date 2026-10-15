@@ -67,6 +67,32 @@ def _load_names():
     return list(AMP_V20_BODY_NAMES), AMP_V20_ANCHOR_NAME
 
 
+def _anchor_from_env_cfg(env_cfg) -> str | None:
+    """从 env cfg 的 `amp_policy` / `amp_reference` 观测组里读出**实际使用的 anchor 刚体名**。
+
+    ⚠️ 为什么必须这么做（2026-10-13 踩到的静默错误）：
+    换根臂（pelvis 根）把 anchor 从 `torso_link` 改成了 `pelvis` —— 但那**只改了**
+    `ObsTermCfg.params["anchor_cfg"]`，模块常量 `AMP_V20_ANCHOR_NAME` 仍是 `torso_link`。
+    本脚本原先直接 import 那个常量 ⇒ 导出的专家集按 **torso** 计算，而判别器
+    策略侧按 **pelvis** ⇒ 两侧**不同帧**，维度一样、不报错，但判别器比对的是错位的量。
+    以 env cfg（= obs 组真正用的东西）为准就不会再有这个偏差。
+    """
+    import dataclasses
+
+    obs = getattr(env_cfg, "observations", None)
+    for grp_name in ("amp_policy", "amp_reference"):
+        grp = getattr(obs, grp_name, None)
+        if grp is None or not dataclasses.is_dataclass(grp):
+            continue
+        for f in dataclasses.fields(grp):
+            params = getattr(getattr(grp, f.name), "params", None)
+            if isinstance(params, dict) and "anchor_cfg" in params:
+                names = getattr(params["anchor_cfg"], "body_names", None)
+                if names:
+                    return str(names[0])
+    return None
+
+
 def stats_block(tag: str, x):
     """打印并返回逐维 μ/σ（x: (B, D)）。"""
     import numpy as np
@@ -86,6 +112,13 @@ def main(log: list[str]) -> int:
     ap.add_argument("--task", default="Instinct-Amp-Walk-V29-G1-v0")
     ap.add_argument("--num_envs", type=int, default=256)
     ap.add_argument("--live_steps", type=int, default=30, help="采多少步的活体 amp_policy/amp_reference")
+    ap.add_argument(
+        "--anchor",
+        default=None,
+        help="覆盖 anchor 刚体名。默认从 env cfg 的 amp_policy/amp_reference 观测组读"
+        "（即 obs 组真正的口径）；读不到才退回模块常量 AMP_V20_ANCHOR_NAME。"
+        "⚠️ 换根臂必须让这里等于判别器策略侧的 anchor，否则专家批与策略批不同帧。",
+    )
     ap.add_argument(
         "--with_anchor_gravity",
         action="store_true",
@@ -173,8 +206,16 @@ def main(log: list[str]) -> int:
                 print(f"    · {a} = {v!r}", flush=True)
 
     # ---------------- 1) body / anchor 索引（与 obs 组同一套解析）----------------
-    BODY_NAMES, ANCHOR = _load_names()
-    print(f"\n[1] 从 cfg 导入口径：{len(BODY_NAMES)} body，anchor={ANCHOR}", flush=True)
+    BODY_NAMES, ANCHOR_CONST = _load_names()
+    # ⭐ anchor 以 **env cfg 实际口径** 为准（CLI > env cfg > 模块常量）
+    _anchor_env = _anchor_from_env_cfg(env_cfg)
+    ANCHOR = args.anchor or _anchor_env or ANCHOR_CONST
+    _src = ("--anchor" if args.anchor else
+            ("env cfg 的 amp_* 观测组" if _anchor_env else "模块常量(兜底)"))
+    print(f"\n[1] 从 cfg 导入口径：{len(BODY_NAMES)} body，anchor={ANCHOR}（来源：{_src}）", flush=True)
+    if _anchor_env and _anchor_env != ANCHOR_CONST:
+        print(f"    ⚠️ 模块常量 AMP_V20_ANCHOR_NAME={ANCHOR_CONST} 已被 env cfg 覆盖为 {_anchor_env}"
+              "（换根臂的正常情形）", flush=True)
     print(f"    BODY_NAMES={BODY_NAMES}", flush=True)
     body_ids, body_names = mgr.find_bodies(BODY_NAMES, preserve_order=True)
     anchor_ids, anchor_names = mgr.find_bodies([ANCHOR], preserve_order=True)

@@ -56,9 +56,17 @@ def pick_clip(pattern: str) -> str:
 
 
 def list_selection(sel_path: str) -> list[str]:
-    """选型 yaml 里的全部 clip（按 yaml 顺序）。"""
+    """选型 yaml 里的全部 clip（按 yaml 顺序，**相对 yaml 自身目录**解析）。
+
+    ⚠️ 早先的实现在调用处写 `BASE + f`（BASE = 固定的 `motions/amp_walk`），
+    于是拿 `motions/amp_walk_pelvis/xxx.yaml` 当选择文件时，读到的仍然是
+    **旧目录的 npz** —— 换根后会静默混用“新模型 + 旧数据”，结果全错。
+    """
+    import os
+
     sel = yaml.safe_load(open(sel_path))["selected_files"]
-    return [s["file"] for s in sel]
+    d = os.path.dirname(os.path.abspath(sel_path))
+    return [f if os.path.isabs(f := s["file"]) else os.path.join(d, f) for s in sel]
 
 
 def _qmul(a, b):
@@ -86,7 +94,9 @@ def _qrot(q, v):
         2 * (x * y + z * w), w2 - x2 + y2 - z2, 2 * (y * z - x * w),
         2 * (x * z - y * w), 2 * (y * z + x * w), w2 - x2 - y2 + z2,
     ], axis=-1).reshape(v.shape[:-1] + (3, 3))
-    return np.einsum("nij,nj->ni", R, v)
+    # ⚠️ 必须用省略号写法：`d_pos` 在单帧路径里是**不带 batch 维**的 (3,)，
+    #    写死 "nij,nj->ni" 会报 "too many subscripts"。
+    return np.einsum("...ij,...j->...i", R, v)
 
 
 def torso_pose_from_pelvis(pelvis_pos, pelvis_quat, d_pos, d_quat):
@@ -156,7 +166,7 @@ def main() -> int:
         clips = [args.npz]
     elif args.selection:
         selp = args.selection if os.path.sep in args.selection else (BASE + args.selection)
-        clips = [BASE + f for f in list_selection(selp)]
+        clips = list_selection(selp)   # ← 已在 list_selection 内按 yaml 目录解析成完整路径
         print(f"[sel] {os.path.basename(selp)}：{len(clips)} 个 clip")
     else:
         clips = [BASE + pick_clip(args.clip)]
@@ -169,11 +179,29 @@ def main() -> int:
     foot_sids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, s)
                  for s in ("left_foot", "right_foot")]
     foot_sids = [s for s in foot_sids if s >= 0]
-    #: 站姿（keyframe）下脚 site 的离地偏移 ⇒ 把"支撑脚离地间隙"归零的基准
+    #: ⚠️ 官方 rev1.0 的 MJCF **没有** `left_foot`/`right_foot` site ⇒ 退回用
+    #: `*_ankle_roll_link` 的体心高度（同一套“脚底框”语义，只差一个常数偏移；
+    #: 下面统一用“站姿基准”归零，所以两种来源的间隙口径一致）。
+    foot_bids: list[int] = []
+    if not foot_sids:
+        foot_bids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, b)
+                     for b in ("left_ankle_roll_link", "right_ankle_roll_link")]
+        foot_bids = [b for b in foot_bids if b >= 0]
+        if not foot_bids:
+            raise SystemExit("模型里既没有 left_foot/right_foot site，也没有 ankle_roll link")
+
+    def lowest_foot_z() -> float:
+        """当前状态下“最低脚部参考点”的高度（site 优先，否则用踝体心）。"""
+        if foot_sids:
+            return float(min(data.site_xpos[s, 2] for s in foot_sids))
+        return float(min(data.xpos[b, 2] for b in foot_bids))
+
+    #: 站姿（keyframe）下脚参考点的离地偏移 ⇒ 把"支撑脚离地间隙"归零的基准
     data.qpos[:] = model.key_qpos[0].copy()
     mujoco.mj_forward(model, data)
-    foot_off = float(min(data.site_xpos[s, 2] for s in foot_sids))
-    print(f"[ref] 站姿脚 site 离地 = {100 * foot_off:+.2f} cm（间隙以此为基准归零）")
+    foot_off = lowest_foot_z()
+    _src = "site" if foot_sids else "ankle_roll 体心"
+    print(f"[ref] 站姿脚（{_src}）离地 = {100 * foot_off:+.2f} cm（间隙以此为基准归零）")
 
     # ---------------------------------------------------------------- 定量表模式
     if args.table:
@@ -204,11 +232,14 @@ def main() -> int:
                 data.qpos[3:7] = q
                 data.qpos[adr] = jp[i]
                 mujoco.mj_forward(model, data)
-                tt.append(torso_lean_deg(np.asarray(q)[None, :])[0][0])
+                # ⚠️ 胻干倾角必须读 **FK 后的 torso 刚体**姿态：
+                #    换根（base=pelvis，模型 root=pelvis）后 `q` 与 pelvis 等价，
+                #    再拿它当“躯干”会退化成“骨盆倾角”。
+                tt.append(torso_lean_deg(np.asarray(data.xquat[torso_bid])[None, :])[0][0])
                 tp.append(torso_lean_deg(np.asarray(data.xquat[pelvis_bid])[None, :])[0][0])
                 zt.append(float(data.xpos[torso_bid, 2]))
                 zp.append(float(data.xpos[pelvis_bid, 2]))
-                cl.append(min(data.site_xpos[s, 2] for s in foot_sids) - foot_off)
+                cl.append(lowest_foot_z() - foot_off)
             g = lambda nm, q=None: np.percentile(jp[:, names.index(nm)], q if q else 50)  # noqa: E731
             js = lambda nm: "/".join(f"{v:+.0f}" for v in  # noqa: E731
                                      np.degrees(np.percentile(jp[:, names.index(nm)], [5, 50, 95])))
@@ -275,7 +306,7 @@ def main() -> int:
                 data.qpos[3:7] = base_quat[i]
                 data.qpos[adr] = jp[i]
                 mujoco.mj_forward(model, data)
-                clear.append(min(data.site_xpos[s, 2] for s in foot_sids) - foot_off)
+                clear.append(lowest_foot_z() - foot_off)
                 if args.fixed_camera:
                     cam.lookat[:] = [0.0, 0.0, 0.5]
                 else:

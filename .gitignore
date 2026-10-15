@@ -46,3 +46,6 @@ instinct/eval/
 g1_scan_loco_9600_train_sim2sim/
 instinct/probe/
 instinct/backups/
+
+# ---- 临时目录 ----
+tmp/

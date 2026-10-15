@@ -25,6 +25,22 @@ from instinctlab.motion_reference.motion_files.amass_motion_cfg import AmassMoti
 from instinctlab.motion_reference.utils import motion_interpolate_bilinear
 
 G1_CFG = G1_29DOF_TORSOBASE_POPSICLE_CFG
+
+#: ⭐⭐ FK 的**浮动基座 = URDF 的根 link**（`MotionReferenceManager._initialize_robot_kinematics`
+#: 用 `pk.build_chain_from_urdf` 建链） —— 而本仓所有 retarget 数据集的 `base_pos_w`
+#: 记的是 **pelvis**，不是 torso_link：
+#:   · 实测（`g1_speed_vault_retargeted.npz` 抽 6 帧）：把 base 当 **torso** 用，
+#:     全模型最低点 = **-0.027~-0.037 m（穿地）**；当 **pelvis** 用则恰好 **+0.000 m**；
+#:   · 我们已有的 34 个 AMP 数据集同样以 pelvis 为 base（base_z 均值 0.772）；
+#:   · popsicle 资产的默认站姿 torso_z - pelvis_z = **0.0440 m**。
+#: `g1_29dof_torsobase_popsicle.urdf` 的根是 **torso_link** ⇒ 直接用它做 FK 会把
+#: pelvis 的轨迹张冠李戴到 torso 上，**参考整体偏 4.4 cm**（翻越这种精确足部接触
+#: 任务里足以把奖励/终止条件带偏）。
+#: ⇒ 改用仓内**同源但以 pelvis 为根**的官方 URDF 做 FK：两版 URDF 的关节原点逐项
+#:   一致（如 `left_hip_pitch_joint` origin 均为 `0 0.064452 -0.1027`），只是根不同，
+#:   关节/链接命名完全齐备，替换后 `link_of_interests` 与 `isaac_joint_names` 都能对上。
+_G1_RESOURCES_DIR = os.path.dirname(os.path.dirname(G1_CFG.spawn.asset_path))
+VAULT_FK_URDF = os.path.join(_G1_RESOURCES_DIR, "official_rev10", "g1_29dof_rev_1_0.urdf")
 MOTION_NAME = "MimicKitSpeedVault"
 MOTION_DIR = os.path.join(os.path.dirname(__file__), "motions", "vault")
 
@@ -41,24 +57,51 @@ with np.load(os.path.join(MOTION_DIR, VAULT_MOTION_FILE)) as _vault_npz:
 
 @configclass
 class VaultMotionCfg(AmassMotionCfgBase):
-    """Converted MimicKit G1 vault and flat locomotion motions."""
+    """Converted MimicKit G1 vault and flat locomotion motions.
+
+    数据集契约（`g1_speed_vault_retargeted.npz`，实测）：
+      · `framerate = 50 Hz`、737 帧 = 14.74 s；base 从 x=-6.52 跑到 x=+5.56
+        （含 0.25 m 抬升，即翻越段）；
+      · 障碍箱 `obstacle_pos=(1.7, 0.5, 0.055)`、`obstacle_size=(0.4, 10.0, 0.6)`
+        ⇒ 与下面 `VAULT_BOX_POS` **完全一致**，即参考轨迹与箱子已在同一世界系下
+        对齐（**不需要再做任何平移**；管理器只额外叠加 `env_origins`）；
+      · npz 只有 `joint_names / joint_pos / base_pos_w / base_quat_w`：
+        加载器走 `_read_retargetted_motion_file`，把 29 关节**按名**重排到
+        articulation 序，`joint_vel / base_lin_vel / base_ang_vel` 由
+        `velocity_estimation_method` 数值估计；npz 里的 `velocity_command`
+        本管线**不读取**（BeyondMimic 系奖励用参考自身速度，不用外部指令）。
+    """
 
     path = MOTION_DIR
     retargetting_func = None
     filtered_motion_selection_filepath = MOTION_SELECTION_FILE
-    motion_start_from_middle_range = [0.0, 0.8]
+    #: 收紧到本数据集后缀（默认列表还含 poses/stageii/soma.csv，会把同目录其它
+    #: 文件一并扫进来）；与 AMP 臂的写法一致。
+    supported_file_endings = ["retargeted.npz"]
+    #: 数据集 50 fps == 环境控制频率（sim.dt=0.005 × decimation=4 = 50 Hz）
+    #: ⇒ 插值退化为 no-op；写出来便于核对（默认值恰好也是 50）。
+    motion_target_framerate = 50.0
+    #: bin 生效时该项会被 binning 覆盖（见 `AmassMotionCfg` 的 docstring），
+    #: 这里与 `perceptive_vault_cfg.py` 的训练口径保持一致。
+    motion_start_from_middle_range = [0.0, 0.0]
     motion_start_height_offset = 0.0
     ensure_link_below_zero_ground = False
     buffer_device = "output_device"
     motion_interpolate_func = motion_interpolate_bilinear
     velocity_estimation_method = "frontbackward"
+    #: 1 s 一个 bin ⇒ 允许从动作中段起（BeyondMimic 风格，训练恢复能力）；
+    #: 置 None 则严格从运动起点起（PLAY 变体就是这么做的）。
     motion_bin_length_s = 1.0
-    _hacked_selected_file = VAULT_MOTION_FILE
+    #: 与 `perceptive_vault_cfg.py` 训练口径一致（单 clip 下与 "independent" 等价）。
+    env_starting_stub_sampling_strategy = "concat_motion_bins"
 
 
 motion_reference_cfg = MotionReferenceManagerCfg(
     prim_path="{ENV_REGEX_NS}/Robot/torso_link",
-    robot_model_path=G1_CFG.spawn.asset_path,
+    # ⭐ 必须用 **pelvis 为根**的 URDF（见上面 `VAULT_FK_URDF` 的说明）：
+    #   数据集 base_pos_w 是 pelvis 的位姿，而 FK 的浮动基座 = URDF 根 link。
+    #   用 popsicle（torso 根）会整体偏 4.4 cm。
+    robot_model_path=VAULT_FK_URDF,
     reference_prim_path="/World/envs/env_.*/RobotReference/torso_link",
     link_of_interests=[
         "pelvis",
@@ -91,7 +134,10 @@ motion_reference_cfg = MotionReferenceManagerCfg(
     motion_buffers={
         MOTION_NAME: VaultMotionCfg(),
     },
-    mp_split_method="Even",
+    # ⚠️ 单 clip 任务：**不能**用 "Even"（那是给 AMP 臂多 clip 跨进程切分用的）。
+    #    本任务只有 1 个运动文件，用 "None"（= 不跨进程切分，每个进程被动加载整段），
+    #    与已跑通的 `perceptive_vault_cfg.py` 的 `VAULT_MOTION_REFERENCE_CFG` 一致。
+    mp_split_method="None",
 )
 
 

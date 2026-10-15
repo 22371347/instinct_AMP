@@ -61,11 +61,108 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 DEFAULT_XML = Path(__file__).resolve().parent.parent / "assets/g1_29dof_popsicle_play.xml"
+#: ⭐ 官方 `g1_29dof_rev_1_0`（**pelvis 为根**）的 play MJCF —— P1 臂用。
+#:    由 `tools/build_g1_mjcf.py --init-root-height 0.7585` 从
+#:    `assets/official_rev10/g1_29dof_rev_1_0.xml` 生成（自由关节在 pelvis、
+#:    29 个 hinge、`<motor>` 执行器、home keyframe z=0.7585、注入地面）。
+REV10_XML = Path(__file__).resolve().parent.parent / "assets/g1_29dof_rev10_play.xml"
+
+
+@dataclass(frozen=True)
+class AssetProfile:
+    """一套「资产 + 约定」的组合：换资产会同时改变 4 件事，必须整体切。"""
+
+    name: str
+    xml: Path
+    scan_body: str          # 高程图/扫描框的挂载 body（= 该资产的根 body）
+    obs_joint_order: str    # 观测里 joint_pos_rel/joint_vel 的顺序名（见 joint_order.py）
+    policy_joint_order: str  # 策略动作向量的顺序名
+    desc: str
+
+
+#: `--asset` 的预设。**默认 auto**（按 `--policy`/`--xml` 路径推断，避免“忘了加
+#: `--asset rev10`”把 P1(pelvis 根) 策略当旧资产回放 —— 那会因为**观测/动作关节
+#: 序整体错位**导致抽搐、摔倒后高频剧烈挣扎，而不是报错）。
+#: `--asset auto` 的路径线索（大小写不敏感）。**先 rev10 后 legacy**：
+#: P1 的产物路径总带 `p1_*` / `rev10` / `pelvis`，旧资产带 `vt2/v10/v11/t0..t5/omni`。
+_REV10_HINTS = ("rev10", "p1_", "/p1", "p1-", "pelvis_official", "official_rev10",
+                "g1_29dof_rev", "pelvis_g1")
+_LEGACY_HINTS = ("vt2", "v10", "v11", "v12", "vt1", "t0_", "t1_", "t3_", "t4_",
+                 "t5_", "omni", "legacy", "popsicle", "torsobase")
+
+
+def detect_asset_profile(args) -> "tuple[str, str]":
+    """按路径线索推断资产预设；返回 (名称, 理由)。
+
+    ⭐ 为什么必须自动判：`--asset` 决定 **四件互相耦合的事**（xml / 扫描 body /
+    观测关节序 / 动作关节序）。P1 与旧资产用的是**完全不同的关节序**（P1 = 官方
+    左右交错序，旧 = isaaclab 肩优先序），用错不是“略差”而是**全错**：观测关节块
+    被打乱、动作也被映射到错的关节 ⇒ 模型抽搐、摔倒后高频剧烈挣扎。
+    """
+    blob = " ".join(str(x) for x in (
+        getattr(args, "policy", "") or "",
+        getattr(args, "normalizer", "") or "",
+        getattr(args, "xml", "") or "",
+        getattr(args, "trace_csv", "") or "",
+        getattr(args, "record", "") or "",
+    ) if x)
+    low = blob.lower()
+    for _h in _REV10_HINTS:
+        if _h in low:
+            return "rev10", f"路径含 '{_h}'"
+    for _h in _LEGACY_HINTS:
+        if _h in low:
+            return "legacy", f"路径含 '{_h}'"
+    return "legacy", "无明确线索"
+
+
+ASSET_PROFILES: dict[str, AssetProfile] = {
+    "legacy": AssetProfile(
+        name="legacy",
+        xml=DEFAULT_XML,
+        scan_body="torso_link",
+        obs_joint_order="isaaclab",
+        policy_joint_order="isaaclab",
+        desc="旧 torsobase(popsicle) 资产：躯干为根，V1~T5 全系列",
+    ),
+    "rev10": AssetProfile(
+        name="rev10",
+        xml=REV10_XML,
+        scan_body="pelvis",
+        obs_joint_order="p1",
+        policy_joint_order="p1",
+        desc="官方 g1_29dof_rev_1_0：pelvis 为根，P1(p1_pelvis_*) 起",
+    ),
+}
+
 #: 备用：原始 InstinctLab 资产（注意这是 23-DoF + 双手变体，nu=37，**不适合** 29-DoF 跑酷策略）
 FALLBACK_XML = (
     Path(__file__).resolve().parent.parent
     / "repos/InstinctLab/source/instinctlab/instinctlab/assets/resources/unitree_g1/scene.xml"
 )
+
+#: ⭐ 训练侧资产（官方 rev1.0 URDF）—— `--verify-model` 用它来核对"本地跑的到底是不是这个模型"
+TRAIN_URDF = (
+    Path(__file__).resolve().parent.parent.parent
+    / "instinct_xu/source/instinctlab/instinctlab/assets/resources/unitree_g1/official_rev10/g1_29dof_rev_1_0.urdf"
+)
+
+#: 训练侧 `init_state.joint_pos`（按关节名；未列出的 = 0）—— 来自 `G1_29DOF_REV10_PELVIS_CFG`
+DEFAULT_JOINT_POS_BY_NAME: dict[str, float] = {
+    ".*_hip_pitch_joint": -0.312,
+    ".*_knee_joint": 0.669,
+    ".*_ankle_pitch_joint": -0.363,
+    ".*_elbow_joint": 0.6,
+    "left_shoulder_roll_joint": 0.2,
+    "left_shoulder_pitch_joint": 0.2,
+    "right_shoulder_roll_joint": -0.2,
+    "right_shoulder_pitch_joint": 0.2,
+}
+#: 两套资产在"同一姿势"下能分辨的指纹（根 body 名是最强判据：两套总质量恰好都是 33.3411 kg）
+ASSET_FINGERPRINTS = {
+    "rev10": dict(root_body="pelvis", nu=29, nq=36, init_root_z=0.7585),
+    "legacy": dict(root_body="torso_link", nu=29, nq=36, init_root_z=0.82),
+}
 
 def _per_joint_action_scale() -> np.ndarray:
     """逐关节动作尺度（beyondmimic_action_scale = 0.25*effort/kp）。
@@ -417,8 +514,8 @@ class AmpWalkObsBuilder:
         self._last_time: float | None = None
 
         try:
-            from joint_order import (ISAACLAB_ORDER, MUJOCO_ORDER, NPZ_ORDER,
-                                     mjcf_to_order_index)  # type: ignore
+            from joint_order import (MUJOCO_ORDER, ORDER_CANDIDATES,
+                                     mujoco_state_order_from_model)  # type: ignore
         except ImportError as exc:  # pragma: no cover
             raise SystemExit(
                 "需要同目录的 joint_order.py（提供各套关节序映射）："
@@ -431,18 +528,24 @@ class AmpWalkObsBuilder:
         # 默认（joint_names=None → joint_ids=slice(None)）⇒ **articulation 序**，
         # 与「动作」用的 OMNI_LOCO 序 **不是**同一套！
         # 候选：articulation（= Unitree URDF 声明序）/ omiloco / mjcf
-        cand = {
-            "isaaclab": ISAACLAB_ORDER,
-            "omniloco": ISAACLAB_ORDER,
-            "npz": NPZ_ORDER,
-            "articulation": NPZ_ORDER,   # 云端实测确认后固定到这个
-            "mjcf": MUJOCO_ORDER,
-        }
+        # ⭐ 顺序表**统一从 `joint_order.ORDER_CANDIDATES` 取**（唯一真相源）：
+        #    旧资产(torso 根) = isaaclab/omniloco；新资产(pelvis 根) = p1。
+        cand = ORDER_CANDIDATES
         if obs_joint_order not in cand:
-            raise SystemExit(f"未知 --obs-joint-order={obs_joint_order}，可选 {list(cand)}")
+            raise SystemExit(f"未知 --obs-joint-order={obs_joint_order}，可选 {sorted(cand)}")
         self.obs_order_name = obs_joint_order
-        self.mj_to_obs = np.array(mjcf_to_order_index(cand[obs_joint_order]), dtype=int)
+        # ⭐⭐ **状态序**（`qpos[7:]`/`qvel[6:]` 的排法）≠ ctrl 序！
+        #     旧 popsicle 两者相同；官方 rev1.0 的 qpos 序 = URDF 声明序（腿优先），
+        #     ctrl 序 = 执行器序（腰优先）。以前直接拿 MUJOCO_ORDER 当状态序用，
+        #     在官方资产上会让观测关节块整体错位 → 回放抽搐。必须**从模型里读**。
+        self.mj_state_order = list(mujoco_state_order_from_model(model))
+        _miss = [n for n in MUJOCO_ORDER if n not in self.mj_state_order]
+        if _miss:
+            raise SystemExit(f"MJCF 状态序里缺关节：{_miss}")
+        _dst = cand[obs_joint_order]
+        self.mj_to_obs = np.array([self.mj_state_order.index(n) for n in _dst], dtype=int)
         # 默认站姿按**观测序**重排，供 joint_pos_rel 使用
+        # （调用方给的是 keyframe 的 `qpos[7:]`，即**状态序**）
         self.default_policy = np.asarray(default_joint_pos_mjcf,
                                          dtype=np.float64)[self.mj_to_obs]
         bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, torso_body_name)
@@ -451,11 +554,17 @@ class AmpWalkObsBuilder:
                 f"MJCF 里找不到 body '{torso_body_name}' —— height_scan 需要它的 z 坐标"
             )
         self.torso_body_id = bid
+        self.scan_body_name = str(torso_body_name)
+        _same = self.mj_state_order == list(MUJOCO_ORDER)
         print(f"[obs] AMP-Walk {self.layout.obs_dim} 维（布局 {self.layout.name}）："
               f"height_scan={self.N_SCAN} "
-              f"(平地常数 torso_z-{self.SCAN_OFFSET})，torso_body_id={bid}")
+              f"(平地常数 {self.scan_body_name}_z-{self.SCAN_OFFSET})，"
+              f"scan_body_id={bid}")
+        print(f"[obs] 状态序(qpos/qvel) {'==' if _same else '!='} ctrl 序"
+              + ("" if _same else
+                 f"；状态序前 3 = {self.mj_state_order[:3]}，ctrl 序前 3 = {list(MUJOCO_ORDER)[:3]}"))
         print(f"[obs] 观测关节块用 **{obs_joint_order}** 序"
-              f"（与动作的 OMNI_LOCO 序不同；重排={'生效' if not np.array_equal(self.mj_to_obs, np.arange(n_joint)) else 'no-op'}）")
+              f"（从状态序重排，重排={'生效' if not np.array_equal(self.mj_to_obs, np.arange(n_joint)) else 'no-op'}）")
 
     def build(self, cmd: np.ndarray, last_action: np.ndarray) -> np.ndarray:
         d = self.data
@@ -626,8 +735,20 @@ def onnx_info(path: str) -> None:
 SCAN_SIZE_XY = (3.0, 1.6)       # (前后, 左右) m —— GridPatternCfg 的 size（默认=v1~v8）
 SCAN_RESOLUTION = 0.1           # m —— GridPatternCfg 的 resolution
 SCAN_FORWARD = 0.0              # ⭐ 扫描中心相对躯干的前移量 m（v9 = 1.5）
-SCAN_TORSO_BODY = "torso_link"  # 挂载点
+SCAN_TORSO_BODY = "torso_link"  # 挂载点（默认=旧资产；由 `set_scan_body()` 按 --asset 切换）
 SCAN_ALIGNMENT = "yaw"          # 与 IsaacLab 的 ray_alignment 对齐
+
+
+def set_scan_body(body_name: str) -> None:
+    """切扫描框/高程图可视化的挂载 body（= 该资产在 IsaacLab 里的根 body）。
+
+    ⚠️ 与 `apply_scan_layout()` 一样是**模块级全局**：绘图函数读它。
+    旧资产 → `torso_link`；新官方资产(pelvis 根) → `pelvis`。
+    挂载 body 只影响**可视化**（框画在哪）与平地 `height_scan` 常量
+    （`body_z - 0.5`），不影响基座速度/重力等量（那些都走自由关节）。
+    """
+    global SCAN_TORSO_BODY
+    SCAN_TORSO_BODY = str(body_name)
 
 
 def apply_scan_layout(layout) -> None:
@@ -753,6 +874,151 @@ SCAN_GRID_RAYS = SCAN_NY * SCAN_NX
 
 
 # ---------------------------------------------------------------------------
+# 录像（**流式**写盘）
+# ---------------------------------------------------------------------------
+
+class VideoSink:
+    """**流式**录像：边跑边写盘，绝不在内存里囤帧。
+
+    为什么必须流式：旧实现把所有帧塞进 list、跑完才 `iio.imwrite` ——
+    640×480 RGB @50 fps 约 **46 MB/s**，`--duration 0`（键盘遥控）/长跑几分钟
+    就吃光内存，表现就是「跑一段时间后段错误 / 闪退」。现在每帧立刻交给编码器
+    （或立刻落 PNG），内存占用与帧数**无关**。
+    """
+
+    def __init__(self, path, fps: float):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fps = max(1.0, float(fps))
+        self.count = 0
+        self._writer = None
+        self._frames_dir = None
+        try:
+            import imageio
+
+            # 经典流式 API：实测 `iio.imopen(..., plugin="FFMPEG")` 在本机启
+            # 不来（OSError: initializing plugin FFMPEG），而 `get_writer` 可以，
+            # 且它就是逐帧追加语义（内存占用与帧数无关）。
+            # `macro_block_size=1`：尺寸不是 16 的倍数时别让 ffmpeg 偷偷改分辨率。
+            self._writer = imageio.get_writer(
+                self.path, fps=self.fps, codec="libx264", quality=7,
+                macro_block_size=1, ffmpeg_log_level="error",
+            )
+            print(f"[record] 流式写盘 -> {self.path}  fps={self.fps:g}")
+        except Exception as exc:  # noqa: BLE001
+            # 没 ffmpeg/imageio 时退化成逐帧 PNG（同样**不**占内存）
+            self._frames_dir = self.path.with_name(self.path.stem + "_frames")
+            self._frames_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[record] mp4 编码不可用（{type(exc).__name__}: {exc}）⇒ 逐帧存 PNG -> "
+                  f"{self._frames_dir}")
+
+    def write(self, frame) -> None:
+        if self._writer is not None:
+            self._writer.append_data(frame)
+        else:
+            from PIL import Image
+
+            Image.fromarray(np.asarray(frame)).save(
+                self._frames_dir / f"{self.count:06d}.png")
+        self.count += 1
+
+    def close(self) -> None:
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[record] ⚠️ 关闭编码器失败: {type(exc).__name__}: {exc}")
+            self._writer = None
+            print(f"[record] 已保存 {self.count} 帧 -> {self.path}")
+        elif self.count:
+            print(f"[record] 已存 {self.count} 张 PNG -> {self._frames_dir}")
+            print(f"[record] 需 mp4：pip install imageio imageio-ffmpeg，然后\n"
+                  f"          ffmpeg -framerate {self.fps:g} -i "
+                  f"{self._frames_dir}/%06d.png {self.path}")
+
+
+# ---------------------------------------------------------------------------
+# X11 / GLX 错误防护
+# ---------------------------------------------------------------------------
+
+#: 保活：`XSetErrorHandler` 持有的 Python 回调**不能被 GC**，否则会崩得更惨。
+_XERROR_CB = None
+
+
+def install_x_error_guard(verbose: bool = True) -> bool:
+    """让 Xlib 的 X 协议错误**只记录、不 exit()**。
+
+    为什么需要：Xlib 的默认错误处理器遇到协议错误（典型就是
+    `X Error of failed request: GLXBadContext ... X_GLXDestroyContext`）会
+    **直接 exit() 整个进程** ⇒ 表现就是「跑着跑着窗口一黑、进程没了（闪退）」。
+    常见触发场景：同进程里 viewer 的渲染线程 GL 上下文与离屏 `Renderer` 的
+    上下文共存/销毁顺序不对，或驱动本身在多上下文下的 bug。
+
+    装上自定义处理器后只打印诊断（含 error/request code），进程继续跑；
+    但 GL 资源此时可能已不可用，所以同时给出「改用 --gl egl / 重启」的建议。
+    """
+    global _XERROR_CB
+    try:
+        import ctypes
+        import ctypes.util
+
+        class _XErrorEvent(ctypes.Structure):
+            _fields_ = [
+                ("type", ctypes.c_int),
+                ("serial", ctypes.c_ulong),
+                ("error_code", ctypes.c_ubyte),
+                ("request_code", ctypes.c_ubyte),
+                ("minor_code", ctypes.c_ubyte),
+                ("resourceid", ctypes.c_ulong),
+                ("display", ctypes.c_void_p),
+            ]
+
+        handler_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                     ctypes.POINTER(_XErrorEvent))
+        lib = None
+        for cand in ("X11", "libX11.so.6", "libX11.so"):
+            try:
+                lib = ctypes.CDLL(cand)
+                break
+            except OSError:
+                continue
+        if lib is None:
+            if verbose:
+                print("[x11] 找不到 libX11 ⇒ 跳过 X 错误防护（非 X11 环境可忽略）")
+            return False
+
+        stats = {"n": 0}
+
+        def _on_x_error(display, event):
+            stats["n"] += 1
+            codes = "?"
+            try:
+                e = event.contents
+                codes = (f"error_code={e.error_code} request_code={e.request_code} "
+                         f"minor={e.minor_code} serial={e.serial}")
+            except Exception:  # noqa: BLE001
+                pass
+            print(f"[x11] ⚠️ X 协议错误 #{stats['n']}（{codes}）——**已拦截**，"
+                  "不让 Xlib exit 进程。\n"
+                  "      这通常是 GLX/GL 上下文问题：建议改用 `--gl egl`（纯离屏）"
+                  "或分开跑 viewer / 录像；必要时重启回放进程。", flush=True)
+            return 0
+
+        cb = handler_t(_on_x_error)
+        lib.XSetErrorHandler.argtypes = [handler_t]
+        lib.XSetErrorHandler.restype = handler_t
+        lib.XSetErrorHandler(cb)
+        _XERROR_CB = cb
+        if verbose:
+            print("[x11] 已安装 X 错误防护：GLXBadContext 之类只告警、不再让进程直接退出")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        if verbose:
+            print(f"[x11] 安装 X 错误防护失败（不影响仿真）: {type(exc).__name__}: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # 键盘遥控（WASD/QE）—— 平地技能验证
 # ---------------------------------------------------------------------------
 
@@ -855,12 +1121,165 @@ def load_model(xml_path, checkered_floor: bool = True):
     return model
 
 
+def model_fingerprint(model, xml_path: "str | Path") -> dict:
+    """模型指纹：用来回答"我这次跑的到底是哪套资产"。
+
+    ⚠️ 两套资产（旧 torso 根 / 官方 pelvis 根）**总质量恰好都是 33.3411 kg**，
+    所以只报质量分不出来；**根 body 名**才是最强判据。
+    """
+    import hashlib
+
+    import mujoco
+
+    xml_path = Path(xml_path)
+    try:
+        sha = hashlib.sha256(xml_path.read_bytes()).hexdigest()
+    except OSError:
+        sha = "?"
+    root = "?"
+    for j in range(model.njnt):
+        if int(model.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_FREE):
+            root = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(model.jnt_bodyid[j])) or "?"
+            break
+    return dict(path=str(xml_path), sha256=sha, nq=int(model.nq), nv=int(model.nv), nu=int(model.nu),
+                nbody=int(model.nbody), mass=float(model.body_mass.sum()), root_body=root,
+                timestep=float(model.opt.timestep))
+
+
+def print_model_fingerprint(fp: dict, expect_asset: str) -> None:
+    exp = ASSET_FINGERPRINTS.get(expect_asset, {})
+    ok = (exp.get("root_body") == fp["root_body"]) and (exp.get("nu") == fp["nu"])
+    print(f"[model] 文件   : {fp['path']}")
+    print(f"[model] sha256 : {fp['sha256'][:16]}…   nq={fp['nq']} nv={fp['nv']} nu={fp['nu']} "
+          f"nbody={fp['nbody']} mass={fp['mass']:.4f} kg  dt={fp['timestep']}")
+    print(f"[model] 根 body: **{fp['root_body']}**   （{expect_asset} 预设期望 "
+          f"{exp.get('root_body')}）" + ("   ✅ 是这一套资产" if ok else "   ❌ 资产不对！"))
+
+
+def load_urdf_via_mujoco(urdf_path: Path):
+    """加载官方 URDF（MuJoCo 的 URDF 导入需要把 mesh 路径改成绝对路径）。"""
+    import re
+    import tempfile
+
+    import mujoco
+
+    txt = urdf_path.read_text()
+    meshdir = urdf_path.parent / "meshes"
+    txt = re.sub(r'filename="([^"]*)"', lambda m: f'filename="{meshdir / Path(m.group(1)).name}"', txt)
+    tmp = Path(tempfile.mkdtemp(prefix="urdfchk_")) / urdf_path.name
+    tmp.write_text(txt)
+    return mujoco.MjModel.from_xml_path(str(tmp))
+
+
+def verify_model_vs_urdf(model, data, urdf_path: Path, xml_hint: str = "?") -> int:
+    """核对**本地跑的 MJCF** 与**训练用的官方 URDF** 是不是同一个机器人。
+
+    做法：按关节名把两边的关节设成同一个姿势，比较所有同名 body 的世界位置
+    （URDF 被 MuJoCo 当成固定基座导入 ⇒ 位置相对 pelvis，需要扣掉基座偏移）。
+    """
+    if not urdf_path.is_file():
+        raise SystemExit(f"找不到训练 URDF：{urdf_path}")
+    import mujoco
+
+    print(f"\n[verify] 训练 URDF : {urdf_path}")
+    print(f"[verify] 本地 MJCF : {xml_hint}")
+    try:
+        mu = load_urdf_via_mujoco(urdf_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[verify] ⚠️ URDF 加载失败（跳过 FK 对比）：{type(exc).__name__}: {exc}")
+        return 1
+    du, dx = mujoco.MjData(mu), mujoco.MjData(data.model)
+    print(f"[verify] URDF 模型 : nq={mu.nq} nv={mu.nv} nu={mu.nu} nbody={mu.nbody} "
+          f"mass={mu.body_mass.sum():.4f} kg")
+    print(f"[verify] 本地模型 : nq={model.nq} nv={model.nv} nu={model.nu} nbody={model.nbody} "
+          f"mass={model.body_mass.sum():.4f} kg")
+    dm = []
+    for b in range(model.nbody):
+        nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b)
+        iu = mujoco.mj_name2id(mu, mujoco.mjtObj.mjOBJ_BODY, nm) if nm else -1
+        if iu >= 0:
+            dm.append((abs(float(model.body_mass[b]) - float(mu.body_mass[iu])), nm))
+    dm.sort(reverse=True)
+    _rel = dm[0][0] / max(1e-9, float(model.body_mass[
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, dm[0][1])]))
+    print(f"[verify] 同名 link 质量最大差 = {dm[0][0] * 1000:.3f} g（{dm[0][1]}，"
+          f"相对 {_rel * 100:.4f}%），共比 {len(dm)} 个 link"
+          + ("   ✅" if _rel < 5e-4 else "   ⚠️ 有差异")
+          + "（XML 把 head/logo/rubber_hand 等固定子 link 并入了父 link，故 torso/腕部"
+            "本来就会差 1 g 量级）")
+
+    def set_pose(m, d, cfg: dict[str, float], root_z: "float | None"):
+        d.qpos[:] = 0.0
+        for j in range(m.njnt):
+            adr = int(m.jnt_qposadr[j])
+            if int(m.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_FREE):
+                if root_z is not None:
+                    d.qpos[adr:adr + 3] = (0.0, 0.0, root_z)
+                    d.qpos[adr + 3:adr + 7] = (1.0, 0.0, 0.0, 0.0)
+            else:
+                nm = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, j)
+                if nm in cfg:
+                    d.qpos[adr] = cfg[nm]
+
+    def dflt(nm: str) -> float:
+        for k, v in DEFAULT_JOINT_POS_BY_NAME.items():
+            if k.startswith(".*_") and nm.endswith(k[3:]):
+                return v
+            if k == nm:
+                return v
+        return 0.0
+
+    urdf_names = [mujoco.mj_id2name(mu, mujoco.mjtObj.mjOBJ_BODY, b) for b in range(mu.nbody)]
+    probes = {
+        "默认站姿": {},
+        "探针姿势": {"left_hip_pitch_joint": 0.4, "left_knee_joint": 0.8, "waist_yaw_joint": 0.3,
+                     "left_shoulder_pitch_joint": 0.5, "right_hip_roll_joint": -0.2},
+    }
+    # keyframe 里的关节角（本地模型默认站姿），按名字给 URDF 用
+    key = model.key_qpos[0] if model.nkey > 0 else None
+    key_by_name: dict[str, float] = {}
+    if key is not None:
+        for j in range(model.njnt):
+            nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+            if nm and int(model.jnt_type[j]) != int(mujoco.mjtJoint.mjJNT_FREE):
+                key_by_name[nm] = float(key[int(model.jnt_qposadr[j])])
+    for tag, extra in probes.items():
+        cfg = dict(key_by_name) if tag == "默认站姿" else {k: dflt(k) for k in key_by_name}
+        cfg.update(extra)
+        set_pose(mu, du, cfg, None)
+        set_pose(model, dx, cfg, float(key[2]) if key is not None else 0.7585)
+        mujoco.mj_forward(mu, du)
+        mujoco.mj_forward(model, dx)
+        # 本地模型的 pelvis 世界位置（扣掉它，两边才可比）
+        pid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+        base = dx.xpos[pid].copy() if pid >= 0 else np.zeros(3)
+        worst, worst_nm = 0.0, ""
+        n = 0
+        for nm in urdf_names:
+            if not nm or nm == "world":
+                continue
+            iu = mujoco.mj_name2id(mu, mujoco.mjtObj.mjOBJ_BODY, nm)
+            ix = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, nm)
+            if iu < 0 or ix < 0:
+                continue
+            d = float(np.linalg.norm(du.xpos[iu] - (dx.xpos[ix] - base)))
+            n += 1
+            if d > worst:
+                worst, worst_nm = d, nm
+        print(f"[verify] {tag}：比 {n} 个同名 body，最大位置差 = {worst * 1000:.3f} mm（{worst_nm}）"
+              + ("   ✅" if worst < 1e-3 else "   ❌ 不是同一个机器人！"))
+    print("[verify] ⇒ 若上面 3 项都 ✅：本地回放用的就是**训练那套 g1_29dof_rev_1_0**"
+          "（同一运动学 + 同一质量/惯量），差异只可能来自接触/求解器/关节序/观测。")
+    return 0
+
+
 def reset_state(model, data) -> None:
     """把机器人复位到 MJCF 的初始 keyframe（`R` 键与启动时**共用这一份逻辑**）。
 
     ⚠️ **必须跟一次 `mj_forward`**：`mj_resetDataKeyframe` 只写了 `qpos`/`qvel`，
     `data.xpos`（body 世界坐标）等派生量仍是**未初始化**的。`height_scan` 要用
-    torso 的 z，不 forward 就会拿到垃圾值（实测首帧 scan=0.5 而非 0.32）→
+    扫描挂载 body（`torso_link` 或 `pelvis`）的 z，不 forward 就会拿到垃圾值
+    （实测首帧 scan=0.5 而非 0.32）→
     第一帧观测错 → 动作飙到 4 rad → 因为 `last_action` 是无裁剪反馈，
     直接指数发散到 NaN。
     """
@@ -1008,6 +1427,14 @@ def play(args) -> int:
         dump_model(args.xml)
         return 0
 
+    # ── ⭐ 资产自检：确认"跑的到底是哪套模型" ────────────────────────────────
+    _fp = model_fingerprint(model, args.xml)
+    print_model_fingerprint(_fp, args.asset)
+    if args.fingerprint:
+        return 0
+    if args.verify_model:
+        return verify_model_vs_urdf(model, data, Path(args.verify_urdf), xml_hint=args.xml)
+
     # 默认站姿：用 MJCF 的 keyframe（若有），否则用 qpos0
     if model.nkey > 0:
         default_qpos = model.key_qpos[0].copy()
@@ -1027,18 +1454,36 @@ def play(args) -> int:
     # 逐关节动作尺度（在下面知道 obs_mode 之后才能定 —— 两种任务的约定不同），
     # 见那里的注释（这是个能把机器人直接搞摔的坑）。
 
+    # ⭐ 状态序(qpos/qvel) → ctrl 序 的索引：**两者可能不同序**
+    #    （旧 popsicle 相同；官方 rev1.0 的 qpos 序 = URDF 声明序 / ctrl 序 = 执行器序）
+    #    ⇒ 手动 PD 分支把 q/dq 与 target(=ctrl 序) 相减前必须先对齐，否则抽搐。
+    try:
+        from joint_order import mj_state_to_ctrl_index  # type: ignore
+        state_to_ctrl = np.array(mj_state_to_ctrl_index(model), dtype=int)
+    except ImportError:  # pragma: no cover
+        state_to_ctrl = np.arange(n_joint)
+    if not np.array_equal(state_to_ctrl, np.arange(n_joint)):
+        print(f"[ctrl] 状态序(qpos) ≠ ctrl 序 ⇒ 反馈量按名重排（{state_to_ctrl[:6]}...）")
+    #: ⭐⭐ 默认站姿的 **ctrl 序**版本：
+    #: `default_joint_pos` 是 qpos/状态序，而是 `act[pol_to_mj]` 是 ctrl 序；
+    #: `target = 默认姿 + 动作` 必须**同序**！
+    #: 官方 rev1.0 两者不同序（腿→腰→臂 vs 腰→腿→臂）⇒ 不重排会把膝/髀的
+    #: 默认角错配到别的关节（实测最大错 **0.98 rad**：left_knee 被当成 -0.312、
+    #: left_hip_pitch 被当成 +0.669）⇒ 机器人被命令成**错的姿态**，1 s 内就倒、
+    #: 之后高频剧烈挣扎。旧 popsicle 两者同序，所以一直没暴露。
+    default_joint_pos_ctrl = np.asarray(default_joint_pos, dtype=np.float64)[
+        np.asarray(state_to_ctrl, dtype=int)].copy()
+
     # --- ⭐ 取证：逐步 trace（
     #     膝/腰到底摆在哪、躯干有多僵、每一项在此轨迹上的拉力 —— 都从这份 CSV 算）---
     trace_names: list[str] | None = None
     trace_rows: list[list[float]] | None = None
     trace_header: list[str] = []
     if args.trace_csv:
-        # 按**执行器序**取关节名（= `default_joint_pos`/`ctrl` 的序，也是 qpos[7:] 的序）
-        trace_names = []
-        for i in range(n_joint):
-            jid = int(model.actuator_trnid[i][0])
-            nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, jid) or f"jnt{jid}"
-            trace_names.append(nm)
+        # 列里记的是 `qpos[7:]`/`qvel[6:]` ⇒ 名字必须是**状态序**
+        # （⚠️ 不是 ctrl 序：官方 rev1.0 两者不同，写错会让 CSV 的列名与数据错位）
+        from joint_order import mujoco_state_order_from_model  # type: ignore
+        trace_names = list(mujoco_state_order_from_model(model))
         trace_header = (["t", "cmd_vx", "cmd_vy", "cmd_wz", "cmd_speed",
                          "root_x", "root_y", "root_z", "qw", "qx", "qy", "qz",
                          "act_absmax"]
@@ -1074,6 +1519,9 @@ def play(args) -> int:
         elif dim is None:
             if args.selftest_obs:
                 obs_mode = "amp626"   # 自检默认校验 v1~v8 的 626 维
+            elif args.print_ctrl_table or args.pose_check:
+                # 关节序自检用不到观测，随便挑一个与资产匹配的布局（只为打印扫描几何）
+                obs_mode = "amp1500" if args.asset == "rev10" else "amp626"
             else:
                 raise SystemExit(
                     "--obs-mode auto 无法从策略文件推断观测维度（torch 分支 / 动态维度）。\n"
@@ -1088,7 +1536,9 @@ def play(args) -> int:
         # ⭐ AMP-Walk：先把可视化几何切到同一布局（否则叠加的橙框会误导），再建 builder
         amp_layout = AMP_WALK_LAYOUTS[obs_mode]
         apply_scan_layout(amp_layout)
+        set_scan_body(args.scan_body)
         obs_builder = AmpWalkObsBuilder(model, data, default_joint_pos, n_joint=n_joint,
+                                        torso_body_name=args.scan_body,
                                         obs_joint_order=args.obs_joint_order, layout=amp_layout)
     else:
         obs_builder = ObsBuilder(model, data, default_joint_pos, history=args.history)
@@ -1127,14 +1577,14 @@ def play(args) -> int:
 
     # 动作重排：策略输出是 IsaacLab(policy) 序，MJCF 的 ctrl 是 MJCF 序。
     # 两套顺序不同（IsaacLab 肩优先左右交错；MJCF 按 body 遍历）→ 不重排会完全错位。
-    if args.joint_order == "isaaclab":
+    if args.joint_order != "as-is":
         try:
             from joint_order import policy_to_mujoco_index  # type: ignore
-            pol_to_mj = np.array(policy_to_mujoco_index(), dtype=int)
-            print(f"[act] 动作按关节名从 policy 序 → MJCF 序重排"
+            pol_to_mj = np.array(policy_to_mujoco_index(args.joint_order), dtype=int)
+            print(f"[act] 动作按关节名从 policy 序({args.joint_order}) → MJCF 序重排"
                   f"（{'no-op' if np.array_equal(pol_to_mj, np.arange(n_joint)) else '生效'}）")
         except ImportError as exc:  # pragma: no cover
-            raise SystemExit(f"--joint-order isaaclab 需要 joint_order.py：{exc}")
+            raise SystemExit(f"--joint-order {args.joint_order} 需要 joint_order.py：{exc}")
     else:
         pol_to_mj = np.arange(n_joint)
         print("[act] 不做关节重排（--joint-order as-is）")
@@ -1180,10 +1630,14 @@ def play(args) -> int:
         print(f"\n[selftest] 符号关键检查：")
         print(f"  projected_gravity = {np.array2string(g, precision=4)}"
               f"   → 直立时应接近 (0, 0, -1)；若是 (0,0,+1) 则符号错了")
-        print(f"  height_scan[0]    = {obs[0]:.4f}   → 平地应 ≈ torso_z - {0.5}"
+        print(f"  height_scan[0]    = {obs[0]:.4f}   → 平地应 ≈ "
+              f"{getattr(obs_builder, 'scan_body_name', 'root')}_z - 0.5"
               f"（与扫描尺寸/前移量无关）")
+        if obs_builder is not None:
+            print(f"  height_scan[0]    扫描挂载 = {getattr(obs_builder, 'scan_body_name', '?')}"
+                  f"  body_id = {getattr(obs_builder, 'torso_body_id', '?')}")
         print(f"  joint_pos_rel[:3] = {np.array2string(obs[SEGD['joint_pos_rel'][0]:][:3], precision=4)}"
-              f"   → 按 IsaacLab(肩优先交错) 序，即 left/right shoulder pitch, waist pitch")
+              f"   → 前 3 个关节即观测序（{getattr(obs_builder, 'obs_order_name', '?')}）的前 3 个")
         print(f"  base_ang_vel      = {np.array2string(obs[SEGD['base_ang_vel'][0]: SEGD['base_ang_vel'][1]], precision=4)}")
         return 0
 
@@ -1206,9 +1660,11 @@ def play(args) -> int:
     n_steps = 10**9 if infinite else int(args.duration / (dt * decimation))
 
     renderer = None
-    frames: list[np.ndarray] = []
+    sink: VideoSink | None = None
     if args.record:
         renderer = mujoco.Renderer(model, height=args.height, width=args.width)
+        # ⭐ 流式写盘（绝不把帧囤在内存里，见 VideoSink 的 docstring）
+        sink = VideoSink(args.record, fps=args.policy_hz / max(1, args.record_every))
 
     # --- 高程图扫描区域可视化（默认开）---
     scan_torso_id = -1
@@ -1218,7 +1674,7 @@ def play(args) -> int:
             print(f"[scan] ⚠️ MJCF 里找不到 body '{SCAN_TORSO_BODY}'，关闭扫描区域可视化")
         else:
             print(scan_geometry_text())
-            print(f"       torso_body_id = {scan_torso_id}")
+            print(f"       扫描挂载 body '{SCAN_TORSO_BODY}' → body_id = {scan_torso_id}")
 
     viewer_ctx = None
     teleop: KeyboardCommandController | None = None
@@ -1247,6 +1703,20 @@ def play(args) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"[scene] 设置初始相机失败（不影响仿真）: {type(exc).__name__}: {exc}")
 
+    # ⭐⭐ 与 viewer 渲染线程互斥（这是「跑一会儿就段错误/闪退」的主因）
+    #   MuJoCo 3.13 的 `launch_passive` 把「窗口 + GL 上下文 + 渲染循环」放进一个
+    #   **daemon 线程**（`viewer.py`: `threading.Thread(target=_launch_internal)`），
+    #   渲染时持有 `Handle.lock()` 暴露的这把锁；而 `sync()` / `set_texts()`
+    #   会**自己加锁**（所以不能再在外面套一层，可能死锁）。
+    #   主线程若裸跑 `mj_step`（写 data.xpos/geom_xpos/contact…，且内部 arena 可能
+    #   扩容导致指针失效），渲染线程会并发读同一份 `MjData`
+    #   ⇒ 随机段错误 / `GLXBadContext`（Xlib 默认错误处理器会**直接 exit 进程**
+    #   ⇒ 表现得像「跑一段时间就闪退」）。⇒ 所有**写 data** 的地方都进这把锁。
+    import contextlib as _ctxlib
+
+    step_lock = (viewer_ctx.lock() if viewer_ctx is not None
+                 else _ctxlib.nullcontext())
+
     # --- 实时节拍（⭐ 不加的话仿真会以 CPU 全速跑，看起来像 50x 快进）---
     wall_dt = dt * decimation / max(1e-6, float(args.speed))
     realtime = not args.no_realtime
@@ -1265,6 +1735,106 @@ def play(args) -> int:
     total_txt = "inf" if infinite else str(n_steps)
     print(f"[run] {total_txt} policy steps @ {args.policy_hz} Hz (decimation={decimation}, dt={dt})")
     print("[track] 判据：给 +0.8 前进指令时，实际 vx 均值应接近 +0.8；若≈0 即「原地踏步」")
+
+    # ── ⭐ 关节序自检（两种模式，都不需要策略）─────────────────────────────────
+    #   为什么需要：**策略/观测序 ≠ ctrl 序 ≠ qpos 序**（官方资产三套序都不同）。
+    #   ① `--print-ctrl-table`：保持训练默认站姿 2 s，逐执行器打印目标 vs 实测；
+    #   ② `--pose-check`：每次只动一个关节，肉眼确认"动的部位"与打印的名字一致。
+    if args.print_ctrl_table or args.pose_check:
+        ctrl_names = [
+            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, int(model.actuator_trnid[i][0]))
+            for i in range(n_joint)
+        ]
+        # 默认站姿按 **ctrl 序**（default_joint_pos 是 qpos 状态序 ⇒ 必须按名重排）
+        dflt_ctrl = np.asarray(default_joint_pos, dtype=np.float64)[np.asarray(state_to_ctrl, dtype=int)]
+        # 该关节在**策略序**（= 观测/动作的关节排列）里的下标 —— 用来核对三套序
+        try:
+            from joint_order import ORDER_CANDIDATES as _OC  # type: ignore
+            _pol_order: list[str] = list(_OC[args.obs_joint_order])
+        except Exception:  # noqa: BLE001
+            _pol_order = []
+
+        def _policy_index_of(nm: str | None) -> "int | None":
+            return _pol_order.index(nm) if (nm is not None and nm in _pol_order) else None
+
+        print(f"\n[pose] 默认站姿（按 **ctrl 序**；来源=MJCF keyframe，已逐名与训练 "
+              f"`init_state.joint_pos` 核对过）")
+        for i, (nm, v) in enumerate(zip(ctrl_names, dflt_ctrl)):
+            pi = _policy_index_of(nm)
+            print(f"   ctrl[{i:2d}] {nm:26s} 目标={v:+.4f}   策略序下标={(pi if pi is not None else -1)}")
+
+    if args.print_ctrl_table:
+        # 保持默认站姿一段时间，再逐执行器对比"目标 vs 实测"
+        # ⚠️ 两条经验：
+        #   ① 保持别超过 ~0.5 s：**零动作纯 PD 保持本来就站不住**（legacy/rev10 都是），
+        #      倒下去之后关节会被地面顶偏，误以为是关节序错；
+        #   ② 默认把重力置零：这样每个关节的稳态误差 ≈ 0，**任何大偏差只能是映射错**
+        #      （带重力时肩/肘会因自重下垂 0.1~0.2 rad，那是正常的伺服误差）。
+        if not args.pose_check_gravity:
+            model.opt.gravity[:] = 0.0
+            print("\n[pose] 已把重力置零（要带重力看下垂误差加 --pose-check-gravity）")
+        n_hold = max(1, int(round(args.ctrl_table_hold / dt)))
+        for _ in range(n_hold):
+            data.ctrl[:] = dflt_ctrl
+            mujoco.mj_step(model, data)
+        q_ctrl = np.asarray(data.qpos[7:7 + n_joint], dtype=np.float64)[np.asarray(state_to_ctrl, dtype=int)]
+        print(f"\n[pose] 保持默认站姿 {args.ctrl_table_hold:.2f} s 后的实测（ctrl 序）：")
+        print(f"   {'ctrl槽':>5} {'关节名':26s} {'目标':>9s} {'实测':>9s} {'误差':>9s} {'策略序下标':>10s}")
+        worst = 0.0
+        for i, nm in enumerate(ctrl_names):
+            err = q_ctrl[i] - dflt_ctrl[i]
+            worst = max(worst, abs(err))
+            pi = _policy_index_of(nm)
+            print(f"   {i:5d} {nm:26s} {dflt_ctrl[i]:+9.4f} {q_ctrl[i]:+9.4f} {err:+9.4f} "
+                  f"{(pi if pi is not None else -1):10d}")
+        good = worst < 0.02
+        print(f"\n   ⇒ 最大跟踪误差 = {worst * 1000:.2f} mrad"
+              + ("   ✅ 所有关节都到了默认站姿 ⇒ **ctrl↔策略序映射正确**" if good else
+                 "   ⚠️ 有偏差：若某关节差得很大、且偏差量级像**别的关节的默认角** ⇒ 关节序错位"))
+        print(f"   ⇒ 根高度 = {data.qpos[2]:.4f} m（初始 0.7585）")
+        return 0
+
+    if args.pose_check:
+        if not args.pose_check_gravity:
+            model.opt.gravity[:] = 0.0
+            print("\n[pose-check] 已把重力置零 ⇒ 机器人悬在原地，每个关节单独动、不会倒，"
+                  "肉眼最好判断（要带重力加 --pose-check-gravity）")
+        print(f"[pose-check] 单点扫描：delta=±{args.pose_check_delta:+.2f} rad，"
+              f"每个姿势保持 {args.pose_check_hold:.2f} s")
+        print("[pose-check] 看窗口里**哪个部位在动**，与下面打印的关节名对照：")
+        seq: list[tuple[str, int | None, float]] = [("默认站姿（零动作）", None, 0.0)]
+        for i, nm in enumerate(ctrl_names):
+            seq.append((f"ctrl[{i}] {nm}", i, +args.pose_check_delta))
+            seq.append((f"ctrl[{i}] {nm}", i, -args.pose_check_delta))
+        t_wall = time.perf_counter()
+        for label, idx, delta in seq:
+            tgt = dflt_ctrl.copy()
+            if idx is not None:
+                tgt[idx] += delta
+            n_sub = max(1, int(round(args.pose_check_hold / dt)))
+            print(f"\n▶ {label}" + ("" if idx is None else f"   {delta:+.2f} rad")
+                  + f"   （策略序下标={_policy_index_of(label.split()[-1])}）")
+            for k in range(n_sub):
+                with step_lock:
+                    data.ctrl[:] = tgt
+                    mujoco.mj_step(model, data)
+                if viewer_ctx is not None:
+                    viewer_ctx.sync()
+                    if not viewer_ctx.is_running():
+                        print("[pose-check] 窗口已关闭，提前结束")
+                        return 0
+                if realtime:
+                    t_wall += wall_dt
+                    sl = t_wall - time.perf_counter()
+                    if sl > 0:
+                        time.sleep(sl)
+            if idx is not None:
+                q_ctrl = np.asarray(data.qpos[7:7 + n_joint], dtype=np.float64)[
+                    np.asarray(state_to_ctrl, dtype=int)]
+                print(f"   实测 {ctrl_names[idx]} = {q_ctrl[idx]:+.4f}（目标 {tgt[idx]:+.4f}）")
+        print("\n[pose-check] 结束。若某个姿势里动的部位与名字不符 ⇒ 关节序/映射需要修。")
+        return 0
+
     try:
         for step in range(n_steps):
             # --- 键盘遥控：每步覆盖 cmd / 处理复位 / 关窗即退出 ---
@@ -1276,8 +1846,9 @@ def play(args) -> int:
                 if do_reset:
                     # ⚠️ 复位必须同时清 `last_action`：不清的话策略会把「上一段生命
                     #    末期的大动作」当作第一帧输入，直接指数发散（见 §13 坑 2）。
-                    reset_state(model, data)
-                    apply_init_vel(model, data, args.init_vx)
+                    with step_lock:
+                        reset_state(model, data)
+                        apply_init_vel(model, data, args.init_vx)
                     last_action = np.zeros(n_joint, dtype=np.float64)
                     # 跟踪统计也要重新起算，否则位移会跨生命期累加
                     tr_n = 0
@@ -1298,6 +1869,27 @@ def play(args) -> int:
                 if step == 0:
                     print(f"[obs] 第 1 帧拼出维度 = {obs.shape[-1]}"
                           + ("  ✅ 与策略输入一致" if int(obs.shape[-1]) == int(getattr(policy, 'input_dim', -1) or -1) else "  ⚠️ 与策略输入维度不一致！"))
+                    # ⭐ 资产/约定一致性自检：拿**归一化器的 scan 统计量**当参照。
+                    #    height_scan 的语义是 `sensor_z - hit_z - 0.5`，平地上就是
+                    #    `挂载 body 的高度 - 0.5` ⇒ 训练均值 ≈ init 高度 - 0.5。
+                    #    挂错 body（pelvis ↔ torso_link，差 ~0.1 m）或换错资产时
+                    #    这里会明显偏 ⇒ 在开跑前就暴露「--asset 选错」。
+                    if normalizer is not None and "height_scan" in SEGD:
+                        _a, _b = SEGD["height_scan"]
+                        _now = float(np.mean(obs.reshape(-1)[_a:_b]))
+                        _tr = float(np.mean(np.asarray(normalizer.mean).reshape(-1)[_a:_b]))
+                        _d = abs(_now - _tr)
+                        _msg = (f"[asset-check] height_scan: 当前(default 姿)={_now:.4f} "
+                                f"训练归一化器均值={_tr:.4f}  Δ={_d:.4f}")
+                        if _d < 0.05:
+                            print(_msg + "  ✅ 扫描 body / 高度口径一致")
+                        else:
+                            print(_msg + f"  ❌ 不一致！\n"
+                                  f"           ⇒ 当前 --asset={args.asset}（扫描 body="
+                                  f"{args.scan_body}）与策略训练时的资产不符。\n"
+                                  f"           P1(p1_pelvis_*) 必须用 `--asset rev10`；"
+                                  f"旧资产(V1~T5) 用默认 legacy。\n"
+                                  f"           继续跑会「抽搐 / 摔倒后高频剧烈挣扎」。")
                 # 非有限值会把 ctrl 变成 NaN、让仿真彻底崩 —— 这里定位到**具体哪一段**
                 o1 = obs.reshape(-1)
                 if not np.isfinite(o1).all():
@@ -1341,18 +1933,21 @@ def play(args) -> int:
                 act = np.zeros(n_joint)
             last_action = act.copy()          # IsaacLab 的 last_action 是 policy 序
 
-            # 应用到 MJCF：目标角 = MJCF 序默认站姿 + 逐关节 scale × MJCF 序动作
-            target = default_joint_pos + action_scale * act[pol_to_mj]
+            # 应用到 MJCF：目标角 = **ctrl 序**默认站姿 + 逐关节 scale × **ctrl 序**动作
+            # ⚠️ 两个加数必须同序：default_joint_pos_ctrl 已按名重排（见上面注释）
+            target = default_joint_pos_ctrl + action_scale * act[pol_to_mj]
 
-            # --- 物理子步 ---
-            for _ in range(decimation):
-                if use_position_actuator:
-                    data.ctrl[:] = target
-                else:
-                    q = data.qpos[7 : 7 + n_joint]
-                    dq = data.qvel[6 : 6 + n_joint]
-                    data.ctrl[:] = kp * (target - q) - kd * dq
-                mujoco.mj_step(model, data)
+            # --- 物理子步（⭐ 必须持有 viewer 的锁，见 step_lock 的说明）---
+            with step_lock:
+                for _ in range(decimation):
+                    if use_position_actuator:
+                        data.ctrl[:] = target
+                    else:
+                        # 反馈量：qpos/qvel 是**状态序**，target 是 **ctrl 序** ⇒ 按名对齐
+                        q = data.qpos[7 : 7 + n_joint][state_to_ctrl]
+                        dq = data.qvel[6 : 6 + n_joint][state_to_ctrl]
+                        data.ctrl[:] = kp * (target - q) - kd * dq
+                    mujoco.mj_step(model, data)
 
             # --- 取证 trace：记录**物理子步之后**的状态（与 obs 下一帧一致）---
             if trace_rows is not None:
@@ -1386,9 +1981,9 @@ def play(args) -> int:
                         viewer_ctx.user_scn.ngeom = 0
                         draw_scan_footprint(viewer_ctx.user_scn, data, scan_torso_id)
                 viewer_ctx.sync()
-            if renderer is not None and step % args.record_every == 0:
+            if renderer is not None and sink is not None and step % args.record_every == 0:
                 renderer.update_scene(data)
-                frames.append(renderer.render().copy())
+                sink.write(renderer.render())
 
             # --- 实时节拍：把每个策略步的墙上耗时对齐到 wall_dt ---
             if realtime:
@@ -1414,16 +2009,34 @@ def play(args) -> int:
     except KeyboardInterrupt:
         print("\n[interrupted]")
     finally:
-        if viewer_ctx is not None:
-            viewer_ctx.close()
+        # ⭐ 退出顺序很重要：先释放**离屏** Renderer，再关 viewer 的渲染线程，
+        #    最后稍等一下让它真的退干净。顺序反了（两个 GL 上下文共享同一个 X
+        #    display 时）会出现 `GLXBadContext ... X_GLXDestroyContext`，而 Xlib 的
+        #    默认错误处理器会直接 exit() 整个进程 ⇒ 看起来就是「跑着跑着闪退」。
         if renderer is not None:
-            renderer.close()
+            try:
+                renderer.close()
+            except Exception:  # noqa: BLE001
+                pass
+            renderer = None
+        if viewer_ctx is not None:
+            try:
+                viewer_ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.2)   # 给渲染线程收尾的时间，别在它还在用上下文时退出
 
     # 实时性汇总：客观确认"不再是快进"（目标 1.00x）
     wall_s = time.perf_counter() - t_start
     sim_s = (step + 1) * dt * decimation
     print(f"[pace] 仿真 {sim_s:.2f} s / 墙上 {wall_s:.2f} s = {sim_s / max(1e-9, wall_s):.2f}x 实时"
           + ("（目标 1.00x）" if realtime else "（--no-realtime，全速跑）"))
+    # ⭐ 策略频率实测：每个循环体 = **一次策略推理** ⇒ 频率必须 = policy_hz（不是 1/dt！）
+    if sim_s > 1e-9:
+        print(f"[rate] 策略推理 {step + 1} 次 / 仿真 {sim_s:.2f} s = "
+              f"{(step + 1) / sim_s:.2f} Hz（期望 {args.policy_hz:.0f} Hz；"
+              f"物理步 = {1.0 / dt:.0f} Hz × 每步 {decimation} 子步）"
+              + ("   ✅" if abs((step + 1) / sim_s - args.policy_hz) < 0.5 else "   ❌"))
 
     # --- 指令跟踪汇总（回放判据：指标好 ≠ 真的走了）---
     if tr_n > 0:
@@ -1449,17 +2062,8 @@ def play(args) -> int:
             wr.writerows(trace_rows)
         print(f"[trace] 已写入 {len(trace_rows)} 行 × {len(trace_header)} 列 -> {tpath}")
 
-    if args.record and frames:
-        out = Path(args.record)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            import imageio.v3 as iio
-
-            iio.imwrite(out, frames, fps=args.policy_hz / max(1, args.record_every))
-            print(f"[record] 已保存 {len(frames)} 帧 -> {out}")
-        except ImportError:
-            np.save(out.with_suffix(".npy"), np.array(frames))
-            print(f"[record] 缺少 imageio，已存为 {out.with_suffix('.npy')}（pip install imageio imageio-ffmpeg 可出 mp4）")
+    if sink is not None:
+        sink.close()
 
     return 0
 
@@ -1470,7 +2074,20 @@ def play(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--xml", default=str(DEFAULT_XML), help="G1 MJCF/scene XML 路径")
+    ap.add_argument(
+        "--asset", choices=["auto", "legacy", "rev10"], default="auto",
+        help="资产/约定预设：auto=按 --policy/--xml 路径自动判（默认）；"
+             "legacy=旧 torsobase(popsicle，躯干为根，V1~T5)；"
+             "rev10=官方 g1_29dof_rev_1_0(pelvis 为根，p1_pelvis_*)。"
+             "⚠️ 切换它会同时改「xml / 扫描挂载 body / 观测关节序 / 动作关节序」"
+             "四件事（换根会改 articulation 序，不整体切必然错位 ⇒ 抽搐）。"
+             "下面各项若显式给了就覆盖预设。",
+    )
+    ap.add_argument("--xml", default=None, help="G1 MJCF/scene XML 路径（默认按 --asset）")
+    ap.add_argument(
+        "--scan-body", default=None,
+        help="高程图/扫描框的挂载 body（默认按 --asset：legacy=torso_link / rev10=pelvis）",
+    )
     ap.add_argument("--dump-model", action="store_true", help="打印模型结构后退出")
     ap.add_argument("--onnx-info", action="store_true", help="打印 ONNX 策略 IO 后退出")
     ap.add_argument(
@@ -1481,8 +2098,9 @@ def main(argv: list[str] | None = None) -> int:
              "legacy=InstinctLab parkour（8 帧堆叠）",
     )
     ap.add_argument(
-        "--joint-order", choices=["isaaclab", "as-is"], default="isaaclab",
-        help="策略向量 ↔ MJCF ctrl 的关节序转换：isaaclab=按关节名重排（正确）；as-is=不重排",
+        "--joint-order", choices=["isaaclab", "as-is", "p1", "pelvis"], default=None,
+        help="策略向量 ↔ MJCF ctrl 的关节序转换：isaaclab=旧资产(torso 根)按关节名重排；"
+             "p1/pelvis=新资产(pelvis 根)按关节名重排；as-is=不重排。默认按 --asset",
     )
     ap.add_argument(
         "--action-scale-mode", choices=["auto", "unity", "beyondmimic"], default="auto",
@@ -1496,12 +2114,12 @@ def main(argv: list[str] | None = None) -> int:
              "调试发散问题时建议给个 5.0",
     )
     ap.add_argument(
-        "--obs-joint-order", choices=["npz", "articulation", "omniloco", "isaaclab", "mjcf"],
-        default="isaaclab",
+        "--obs-joint-order", choices=["npz", "articulation", "omniloco", "isaaclab", "mjcf", "p1", "pelvis"],
+        default=None,
         help="观测里 joint_pos_rel/joint_vel 用的关节序。**云端实测：InstinctLab 的"
              "articulation 序 == ACTION_TERM_JOINTS == OMNI_LOCO（肩优先交错）**，"
-             "所以默认 isaaclab/omniloco 才是对的；npz 是 AMP 参考动作的序（腿优先），"
-             "仅在排查 AMP 观测对齐时才有用",
+             "所以旧资产默认 isaaclab/omniloco 才是对的；npz 是 AMP 参考动作的序（腿优先），"
+             "仅在排查 AMP 观测对齐时才有用。新资产(pelvis 根)用 p1。默认按 --asset",
     )
     ap.add_argument(
         "--normalizer", default=None,
@@ -1518,6 +2136,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--policy", help="策略文件 (.onnx / .pt)")
     ap.add_argument("--policy-type", choices=["auto", "onnx", "torch"], default="auto")
+    ap.add_argument(
+        "--fingerprint", action="store_true",
+        help="【资产自检】打印模型指纹（文件 sha256 / 根 body 名 / nq,nv,nu / 总质量）后退出，"
+             "用来确认“跑的到底是哪套资产”（两套总质量相同，**根 body 名**才能区分）",
+    )
+    ap.add_argument(
+        "--verify-model", action="store_true",
+        help="【资产自检】把本地 MJCF 与**训练用的官方 URDF** 逐 link 比质量、逐 body 比 FK"
+             "（多组姿势）后退出 —— 证明回放确实用的是 g1_29dof_rev_1_0",
+    )
+    ap.add_argument("--verify-urdf", default=str(TRAIN_URDF),
+                    help=f"--verify-model 要对比的训练 URDF（默认 {TRAIN_URDF}）")
+    ap.add_argument("--print-ctrl-table", action="store_true",
+        help="【关节序自检·无窗】用默认站姿保持 2 s，然后逐执行器打印 "
+             "「ctrl 槽 / 关节名 / 目标角 / 实测角 / 该关节在策略序里的下标」后退出",
+    )
+    ap.add_argument(
+        "--pose-check", action="store_true",
+        help="【关节序自检·开窗】逐关节做单点测试：每次只让一个关节偏离默认站姿 ±delta，"
+             "其余保持默认；终端打印当前是哪个关节，肉眼看窗口里**哪个部位在动**即可确认关节序",
+    )
+    ap.add_argument("--pose-check-delta", type=float, default=0.4,
+                    help="--pose-check 的单点偏移幅度（rad，默认 0.4）")
+    ap.add_argument("--pose-check-hold", type=float, default=1.0,
+                    help="--pose-check 每个姿势保持的秒数（默认 1.0）")
+    ap.add_argument("--pose-check-gravity", action="store_true",
+                    help="--pose-check 时**保留重力**（默认关掉重力：失重下机器人悬在原地，"
+                         "每个关节单独动、不会倒，肉眼看得最清楚）")
+    ap.add_argument("--ctrl-table-hold", type=float, default=0.4,
+                    help="--print-ctrl-table 保持默认站姿的秒数（默认 0.4 s；太长会倒——"
+                         "零动作纯 PD 保持本来就站不住，不是 bug）")
     ap.add_argument("--cmd", nargs=3, type=float, default=[0.0, 0.0, 0.0], metavar=("VX", "VY", "WZ"),
                     help="速度指令 (默认 0.0 0.0 0.0；训练范围 vx[-1.0,1.2] vy[-0.5,0.5] wz[-0.8,0.8])")
     ap.add_argument("--duration", type=float, default=10.0,
@@ -1546,8 +2195,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="回退用的全局 joint_pos 动作尺度（仅在执行器数 != 29 时生效）")
     ap.add_argument("--kp", type=float, default=100.0, help="手动 PD 的 kp")
     ap.add_argument("--kd", type=float, default=2.0, help="手动 PD 的 kd")
-    ap.add_argument("--view", dest="view", action="store_true", default=True, help="打开 viewer（默认开）")
-    ap.add_argument("--no-view", dest="view", action="store_false", help="不开 viewer（headless）")
+    ap.add_argument("--view", dest="view", action="store_true", default=None,
+                    help="打开 viewer（默认：**不录像时开**；加了 --record 时默认关，"
+                         "避免同进程两个 GL 上下文）")
+    ap.add_argument("--no-view", dest="view", action="store_false",
+                    help="不开 viewer（headless）")
     ap.add_argument("--teleop", dest="teleop", action="store_true", default=True,
                     help="开 viewer 时启用 WASD/QE 键盘遥控（默认开）")
     ap.add_argument("--no-teleop", dest="teleop", action="store_false",
@@ -1561,12 +2213,87 @@ def main(argv: list[str] | None = None) -> int:
              "列名形如 `j_waist_pitch_joint`（按关节名，下游不靠下标猜）")
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
+    ap.add_argument(
+        "--gl", choices=["auto", "egl", "glfw", "osmesa"], default="auto",
+        help="OpenGL 后端（必须在 `import mujoco` 之前设 MUJOCO_GL）："
+             "auto=沿用环境变量（默认 glfw/GLX）；egl=离屏渲染（无头/录制最稳，能规避 GLX 问题）；"
+             "glfw=窗口（需 X/GLX）；osmesa=软件渲染。",
+    )
+    ap.add_argument("--no-faulthandler", action="store_true",
+                    help="关掉 faulthandler（默认开：段错误时直接打印 Python 栈，便于定位闪退）")
+    ap.add_argument("--no-x-error-guard", action="store_true",
+                    help="关掉 X11/GLX 错误防护（默认开：GLXBadContext 之类只告警，"
+                         "不让 Xlib 默认处理器直接 exit 进程）")
     args = ap.parse_args(argv)
+
+    # ── 0) 进程级诊断 / GL 后端：必须赶在**第一次 import mujoco** 之前 ──
+    if not args.no_faulthandler:
+        import faulthandler
+
+        faulthandler.enable()
+        print("[diag] faulthandler 已开启：若再发生段错误，会直接打印 Python 调用栈")
+    if not args.no_x_error_guard:
+        install_x_error_guard()
+    import os as _os
+
+    if args.gl != "auto":
+        _os.environ["MUJOCO_GL"] = args.gl
+        print(f"[gl] MUJOCO_GL={args.gl}（已在 import mujoco 之前设置）")
+    else:
+        print(f"[gl] MUJOCO_GL={_os.environ.get('MUJOCO_GL') or '(未设 → glfw/GLX)'}"
+              "（遇到 GLXBadContext 可试 --gl egl 走离屏）")
+    # ── viewer 默认策略：**录像时默认关** ──
+    #   同进程里「viewer 的渲染线程 GL 上下文」+「Renderer 的离屏 GL 上下文」
+    #   共享同一个 X display，是 GLXBadContext / 段错误的常见来源。
+    if args.view is None:
+        args.view = not args.record
+        if args.record:
+            print("[view] 检测到 --record 且未显式给 --view/--no-view ⇒ 默认 **不**开 viewer"
+                  "（两个 GL 上下文同进程易触发 GLXBadContext/闪退）；要边看边录请显式加 --view")
+    if args.view and args.record:
+        print("[gl] ⚠️ 同时开 viewer 与 --record：本进程有**两个 GL 上下文**"
+              "（viewer 渲染线程 + Renderer 主线程），部分驱动会 GLXBadContext/段错误；"
+              "建议分开跑，或加 --gl egl 纯离屏")
+    if args.view and args.gl == "egl":
+        raise SystemExit("--gl egl 无法创建窗口（viewer 需 glfw）⇒ 去掉 --gl egl 或加 --no-view")
+
+    # ── 资产预设：把「默认 xml / 扫描挂载 body / 观测关节序 / 动作关节序」一次切齐 ──
+    #    显式给的命令行参数优先（= 覆盖预设），没给才走预设。
+    if args.asset == "auto":
+        args.asset, _why = detect_asset_profile(args)
+        print(f"[asset] auto ⇒ **{args.asset}**（{_why}）；"
+              "不对请显式 --asset legacy|rev10")
+    else:
+        _auto, _why = detect_asset_profile(args)
+        if _auto != args.asset:
+            print(f"[asset] ⚠️⚠️ 你显式选了 **{args.asset}**，但路径线索指向 **{_auto}**（{_why}）。\n"
+                  "          两者关节序/扫描 body 整体不同：用错会“抽搐 + 摔倒后高频剧烈挣扎”。\n"
+                  "          确认无误再继续；P1(p1_pelvis_*) 策略必须用 --asset rev10。")
+    _prof = ASSET_PROFILES[args.asset]
+    _from_prof: list[str] = []
+    for _attr, _val in (("xml", _prof.xml), ("scan_body", _prof.scan_body),
+                        ("obs_joint_order", _prof.obs_joint_order),
+                        ("joint_order", _prof.policy_joint_order)):
+        if getattr(args, _attr) is None:
+            setattr(args, _attr, str(_val))
+            _from_prof.append(_attr)
+    set_scan_body(args.scan_body)
+    if args.print_ctrl_table:
+        args.view = False   # 表格模式不需要窗口
+    print(f"[asset] 预设 = {_prof.name}（{_prof.desc}）"
+          + (f"；以下取自预设：{', '.join(_from_prof)}" if _from_prof else "；全部被命令行覆盖"))
+    print(f"[asset] xml = {args.xml}")
+    print(f"[asset] 扫描挂载 body = {args.scan_body}   "
+          f"观测关节序 = {args.obs_joint_order}   动作关节序 = {args.joint_order}")
 
     if not Path(args.xml).is_file():
         raise SystemExit(
             f"找不到 MJCF: {args.xml}\n"
-            "先执行 `python tools/build_g1_mjcf.py` 生成可回放模型（注入执行器 + 默认站姿）。"
+            + ("先用 `python tools/build_g1_mjcf.py` 生成可回放模型（注入执行器 + 默认站姿）。"
+               if args.asset == "legacy" else
+               "rev10 的 play MJCF 应由 `python tools/build_g1_mjcf.py --init-root-height 0.7585` "
+               "从 `assets/official_rev10/g1_29dof_rev_1_0.xml` 生成到 "
+               "`assets/g1_29dof_rev10_play.xml`。")
         )
 
     if args.onnx_info:

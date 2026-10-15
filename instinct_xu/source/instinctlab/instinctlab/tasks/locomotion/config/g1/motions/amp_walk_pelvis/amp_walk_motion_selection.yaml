@@ -1,0 +1,53 @@
+# ============================================================================
+# ⛔ **已弃用 —— 不要再用于新版本**（用户 2026-10-01 明确要求）
+# ============================================================================
+# 本文件是 **17 clip 的大杂烩**（后退×2、侧移×2、原地转身×2、慢跑×3、弧线×2、
+# 直行×2、步态切换等）。AMP_mjlab 的实战教训 + 本仓库实测：
+#   **参考模态越多，"走路"在专家分布里的密度越稀 ⇒ 判别器给出的"像不像人"信号被摊薄**
+#   （表现为 `gap = d_ref − d_actor` 长期稳定不变、`d_actor` 卡死在某个负值）。
+#
+# ⇒ 新版本只允许使用下面两种"成套"搭配（数据集与指令**必须配套**）：
+#
+# | 方案 | 数据集 | 指令 |
+# |---|---|---|
+# | **A** | `amp_walk_1clip_forward_motion_selection.yaml`（**1 clip** 纯直行） | **前进 + 停止** |
+# | **B** | `amp_walk_v13_motion_selection.yaml`（**5 clip**：直行/弧线/侧移×2/后退） | **前后左右 + 停止 + 斜向**（V13 四档） |
+#
+# 本文件保留**仅为复现历史版本**（V1~V9 时期的默认数据集；V11←V10b 之后已被
+# `amp_walk_v10_motion_selection.yaml` 的 2-clip 覆盖 ⇒ V11~V17 实际用的是 2 clip）。
+# ============================================================================
+selected_files:
+  - file: arc_jog_left_loop_002__A029_retargeted.npz
+    weight: 1.0
+  - file: arc_walk_left_loop_001__A029_retargeted.npz
+    weight: 1.0
+  - file: idle_turn_270_001__A048_retargeted.npz
+    weight: 1.0
+  - file: idle_turn_360_001__A047_retargeted.npz
+    weight: 1.0
+  - file: jog_arc_cw_loop_004__A045_retargeted.npz
+    weight: 1.0
+  - file: jog_backward_loop_002__A022_retargeted.npz
+    weight: 1.0
+  - file: jog_backward_loop_003__A023_retargeted.npz
+    weight: 1.0
+  - file: jog_forward_loop_003__A021_retargeted.npz
+    weight: 1.0
+  - file: jog_forward_loop_003__A022_retargeted.npz
+    weight: 1.0
+  - file: step_rotate_idle_000_002__A026_retargeted.npz
+    weight: 1.0
+  - file: walk_arc_cw_loop_002__A046_retargeted.npz
+    weight: 1.0
+  - file: walk_backward_loop_001__A022_retargeted.npz
+    weight: 1.0
+  - file: walk_backward_loop_001__A024_retargeted.npz
+    weight: 1.0
+  - file: walk_forward_loop_002__A022_retargeted.npz
+    weight: 1.0
+  - file: walk_forward_loop_002__A024_retargeted.npz
+    weight: 1.0
+  - file: walk_sideway_left_loop_002__A021_retargeted.npz
+    weight: 1.0
+  - file: walk_sideway_right_loop_001__A022_retargeted.npz
+    weight: 1.0

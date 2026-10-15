@@ -199,6 +199,12 @@ class G1OmniLocoTeacherEnv(InstinctRlEnv):
     expected_policy_terms = OMNI_LOCO_OBSERVATION_TERMS
     expected_policy_dims = OMNI_LOCO_OBSERVATION_DIMS
     expected_scan_rays = 527
+    #: 期望的 **articulation 关节顺序**。默认 = 学长那套“肩优先/左右交错”序。
+    #: ⚠️ 它是 IsaacLab 把 URDF 转 USD 之后的**实际 dof 顺序**，无法从 URDF 文件推导
+    #:   （既不等于 `<joint>` 声明序，也不等于 link 序/DFS 序）。
+    #:   ⇒ 换资产/换根后子类只需覆盖这一项就能复用整套契约校验；
+    #:     校验失败时错误信息会**打印实际顺序**，便于一次性回填。
+    expected_joint_order = OMNI_LOCO_JOINT_ORDER
     allow_curriculum = False
 
     def load_managers(self):
@@ -224,8 +230,12 @@ class G1OmniLocoTeacherEnv(InstinctRlEnv):
         action_term = self.action_manager.get_term("joint_pos")
         if self.action_manager.total_action_dim != 29:
             errors.append(f"action dimension is {self.action_manager.total_action_dim}, expected 29")
-        if tuple(action_term._joint_names) != OMNI_LOCO_JOINT_ORDER:
-            errors.append(f"resolved joint order differs: {tuple(action_term._joint_names)}")
+        if tuple(action_term._joint_names) != tuple(self.expected_joint_order):
+            errors.append(
+                "resolved joint order differs:\n"
+                f"      实际 = {tuple(action_term._joint_names)}\n"
+                f"      期望 = {tuple(self.expected_joint_order)}"
+            )
         if not action_term.cfg.use_default_offset:
             errors.append("JointPositionAction use_default_offset is false")
         if action_term.cfg.clip is not None:

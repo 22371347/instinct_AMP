@@ -1,0 +1,29 @@
+# ============================================================================
+# V13（全量测试）的 AMP 参考数据集：**5 个 clip，按"模态"配平**
+# ============================================================================
+#   walk_forward_loop_002__A022       直行前进走（~0.6-1.0 m/s）      ⇒ 前后向档
+#   arc_walk_left_loop_001__A029      弧线走（前进+转向）             ⇒ 斜向/转向档
+#   walk_sideway_left_loop_002__A021  左侧移交叉跨步（0.72 m/s）      ⇒ 侧向档
+#   walk_sideway_right_loop_001__A022 右侧移交叉跨步（0.48 m/s）      ⇒ 侧向档
+#   walk_backward_loop_001__A022      后退走（0.55 m/s，步姿正常）    ⇒ 前后向档（后退）
+#
+# 选型原则（吃过 17-clip 的亏）：**只放指令集真正会采样到的模态**，且每个模态
+# 至少 1 个 clip。17-clip 那版把"专家分布"摊成 17 种形态 ⇒ "走"的密度被稀释，
+# 判别器对"像不像走"失去分辨力（gap 稳定 1.1 但 `d_actor` 卡死在 −0.56）。
+#
+# ⚠️ `walk_backward_loop_003__A143` 在本仓库**不存在**（原始 csv / retargeted npz 都没有，
+#    `amp_selected.txt` 也没有），按用户 2026-09-30 指示改用 `walk_backward_loop_001__A022`。
+#
+# ⚠️ 侧移 clip 是**交叉跨步**：与 `feet_crossing_cost` / `feet_lateral_width_cost` 不冲突 ——
+#    这两项都带 `gate_lateral`（`w_dir = |vx|/‖v‖`），**纯侧移时门控为 0**（设计上就是保护侧步的）。
+selected_files:
+  - file: walk_forward_loop_002__A022_retargeted.npz
+    weight: 1.0
+  - file: arc_walk_left_loop_001__A029_retargeted.npz
+    weight: 1.0
+  - file: walk_sideway_left_loop_002__A021_retargeted.npz
+    weight: 1.0
+  - file: walk_sideway_right_loop_001__A022_retargeted.npz
+    weight: 1.0
+  - file: walk_backward_loop_001__A022_retargeted.npz
+    weight: 1.0

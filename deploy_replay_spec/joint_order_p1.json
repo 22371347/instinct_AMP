@@ -1,0 +1,547 @@
+{
+  "task": "Instinct-Amp-Walk-Pelvis-G1-v0",
+  "policy": {
+    "onnx": "actor.onnx",
+    "normalizer": "policy_normalizer.npz",
+    "obs_dim": 1500,
+    "action_dim": 29,
+    "control_hz": 50.0,
+    "sim_dt": 0.005,
+    "decimation": 4
+  },
+  "robot": {
+    "root_body": "pelvis",
+    "init_root_z": 0.7585,
+    "total_mass": 33.341142000000005
+  },
+  "action": {
+    "scale": 1.0,
+    "use_default_offset": true,
+    "clip": null,
+    "target": "default_joint_pos[ctrl_order] + action[policy->ctrl]"
+  },
+  "normalizer": {
+    "formula": "(x - mean) / (std + eps)",
+    "eps": 0.01,
+    "applies_to": "whole 1500-vector"
+  },
+  "obs_terms": [
+    {
+      "name": "height_scan",
+      "per_frame": 279,
+      "frames": 4,
+      "scan": {
+        "mount_body": "pelvis",
+        "size_xy": [
+          3.0,
+          0.8
+        ],
+        "resolution": 0.1,
+        "grid": [
+          9,
+          31
+        ],
+        "rays": 279,
+        "forward_offset": 1.5,
+        "ray_alignment": "yaw",
+        "formula": "pelvis_z - hit_z - 0.5",
+        "clip": [
+          -1.0,
+          1.0
+        ],
+        "flat_ground_value": 0.25849999999999995
+      }
+    },
+    {
+      "name": "velocity_command",
+      "per_frame": 3,
+      "frames": 4,
+      "scale": 1.0,
+      "note": "body-frame [vx, vy, wz]"
+    },
+    {
+      "name": "projected_gravity",
+      "per_frame": 3,
+      "frames": 4,
+      "scale": 1.0
+    },
+    {
+      "name": "base_ang_vel",
+      "per_frame": 3,
+      "frames": 4,
+      "scale": 1.0,
+      "note": "pelvis body frame, = free-joint qvel[3:6] in MuJoCo"
+    },
+    {
+      "name": "joint_pos_rel",
+      "per_frame": 29,
+      "frames": 4,
+      "scale": 1.0
+    },
+    {
+      "name": "joint_vel",
+      "per_frame": 29,
+      "frames": 4,
+      "scale": 1.0
+    },
+    {
+      "name": "last_action",
+      "per_frame": 29,
+      "frames": 4,
+      "scale": 1.0
+    }
+  ],
+  "obs_stacking": {
+    "order": "term-major (each term's 4 frames contiguous)",
+    "within_term": "oldest -> newest"
+  },
+  "has_base_lin_vel_in_obs": false,
+  "joint_order": {
+    "policy_and_obs": [
+      "left_hip_pitch_joint",
+      "right_hip_pitch_joint",
+      "waist_yaw_joint",
+      "left_hip_roll_joint",
+      "right_hip_roll_joint",
+      "waist_roll_joint",
+      "left_hip_yaw_joint",
+      "right_hip_yaw_joint",
+      "waist_pitch_joint",
+      "left_knee_joint",
+      "right_knee_joint",
+      "left_shoulder_pitch_joint",
+      "right_shoulder_pitch_joint",
+      "left_ankle_pitch_joint",
+      "right_ankle_pitch_joint",
+      "left_shoulder_roll_joint",
+      "right_shoulder_roll_joint",
+      "left_ankle_roll_joint",
+      "right_ankle_roll_joint",
+      "left_shoulder_yaw_joint",
+      "right_shoulder_yaw_joint",
+      "left_elbow_joint",
+      "right_elbow_joint",
+      "left_wrist_roll_joint",
+      "right_wrist_roll_joint",
+      "left_wrist_pitch_joint",
+      "right_wrist_pitch_joint",
+      "left_wrist_yaw_joint",
+      "right_wrist_yaw_joint"
+    ],
+    "ctrl": [
+      "waist_pitch_joint",
+      "waist_roll_joint",
+      "waist_yaw_joint",
+      "left_hip_pitch_joint",
+      "left_hip_roll_joint",
+      "left_hip_yaw_joint",
+      "left_knee_joint",
+      "left_ankle_pitch_joint",
+      "left_ankle_roll_joint",
+      "right_hip_pitch_joint",
+      "right_hip_roll_joint",
+      "right_hip_yaw_joint",
+      "right_knee_joint",
+      "right_ankle_pitch_joint",
+      "right_ankle_roll_joint",
+      "left_shoulder_pitch_joint",
+      "left_shoulder_roll_joint",
+      "left_shoulder_yaw_joint",
+      "left_elbow_joint",
+      "left_wrist_roll_joint",
+      "left_wrist_pitch_joint",
+      "left_wrist_yaw_joint",
+      "right_shoulder_pitch_joint",
+      "right_shoulder_roll_joint",
+      "right_shoulder_yaw_joint",
+      "right_elbow_joint",
+      "right_wrist_roll_joint",
+      "right_wrist_pitch_joint",
+      "right_wrist_yaw_joint"
+    ],
+    "note": "官方 MJCF 的 qpos/qvel 序 = NPZ_ORDER（腿→腰→臂），与 ctrl 序不同；读状态务必按模型自报顺序 + 按名映射"
+  },
+  "policy_to_ctrl_index": [
+    8,
+    5,
+    2,
+    0,
+    3,
+    6,
+    9,
+    13,
+    17,
+    1,
+    4,
+    7,
+    10,
+    14,
+    18,
+    11,
+    15,
+    19,
+    21,
+    23,
+    25,
+    27,
+    12,
+    16,
+    20,
+    22,
+    24,
+    26,
+    28
+  ],
+  "default_joint_pos": {
+    "waist_pitch_joint": 0.0,
+    "waist_roll_joint": 0.0,
+    "waist_yaw_joint": 0.0,
+    "left_hip_pitch_joint": -0.312,
+    "left_hip_roll_joint": 0.0,
+    "left_hip_yaw_joint": 0.0,
+    "left_knee_joint": 0.669,
+    "left_ankle_pitch_joint": -0.363,
+    "left_ankle_roll_joint": 0.0,
+    "right_hip_pitch_joint": -0.312,
+    "right_hip_roll_joint": 0.0,
+    "right_hip_yaw_joint": 0.0,
+    "right_knee_joint": 0.669,
+    "right_ankle_pitch_joint": -0.363,
+    "right_ankle_roll_joint": 0.0,
+    "left_shoulder_pitch_joint": 0.2,
+    "left_shoulder_roll_joint": 0.2,
+    "left_shoulder_yaw_joint": 0.0,
+    "left_elbow_joint": 0.6,
+    "left_wrist_roll_joint": 0.0,
+    "left_wrist_pitch_joint": 0.0,
+    "left_wrist_yaw_joint": 0.0,
+    "right_shoulder_pitch_joint": 0.2,
+    "right_shoulder_roll_joint": -0.2,
+    "right_shoulder_yaw_joint": 0.0,
+    "right_elbow_joint": 0.6,
+    "right_wrist_roll_joint": 0.0,
+    "right_wrist_pitch_joint": 0.0,
+    "right_wrist_yaw_joint": 0.0
+  },
+  "gains": {
+    "waist_pitch_joint": {
+      "kp": 28.501246,
+      "kd": 1.814446,
+      "effort_limit": 50.0,
+      "armature": 0.00721945,
+      "damping": 0.0,
+      "joint_range": [
+        -0.52,
+        0.52
+      ]
+    },
+    "waist_roll_joint": {
+      "kp": 28.501246,
+      "kd": 1.814446,
+      "effort_limit": 50.0,
+      "armature": 0.00721945,
+      "damping": 0.0,
+      "joint_range": [
+        -0.52,
+        0.52
+      ]
+    },
+    "waist_yaw_joint": {
+      "kp": 40.179238,
+      "kd": 2.55789,
+      "effort_limit": 88.0,
+      "armature": 0.01017752,
+      "damping": 0.0,
+      "joint_range": [
+        -2.618,
+        2.618
+      ]
+    },
+    "left_hip_pitch_joint": {
+      "kp": 40.179238,
+      "kd": 2.55789,
+      "effort_limit": 88.0,
+      "armature": 0.01017752,
+      "damping": 0.0,
+      "joint_range": [
+        -2.5307,
+        2.8798
+      ]
+    },
+    "left_hip_roll_joint": {
+      "kp": 99.098428,
+      "kd": 6.308802,
+      "effort_limit": 139.0,
+      "armature": 0.025101925,
+      "damping": 0.0,
+      "joint_range": [
+        -0.5236,
+        2.9671
+      ]
+    },
+    "left_hip_yaw_joint": {
+      "kp": 40.179238,
+      "kd": 2.55789,
+      "effort_limit": 88.0,
+      "armature": 0.01017752,
+      "damping": 0.0,
+      "joint_range": [
+        -2.7576,
+        2.7576
+      ]
+    },
+    "left_knee_joint": {
+      "kp": 99.098428,
+      "kd": 6.308802,
+      "effort_limit": 139.0,
+      "armature": 0.025101925,
+      "damping": 0.0,
+      "joint_range": [
+        -0.087267,
+        2.8798
+      ]
+    },
+    "left_ankle_pitch_joint": {
+      "kp": 28.501246,
+      "kd": 1.814446,
+      "effort_limit": 50.0,
+      "armature": 0.00721945,
+      "damping": 0.0,
+      "joint_range": [
+        -0.87267,
+        0.5236
+      ]
+    },
+    "left_ankle_roll_joint": {
+      "kp": 28.501246,
+      "kd": 1.814446,
+      "effort_limit": 50.0,
+      "armature": 0.00721945,
+      "damping": 0.0,
+      "joint_range": [
+        -0.2618,
+        0.2618
+      ]
+    },
+    "right_hip_pitch_joint": {
+      "kp": 40.179238,
+      "kd": 2.55789,
+      "effort_limit": 88.0,
+      "armature": 0.01017752,
+      "damping": 0.0,
+      "joint_range": [
+        -2.5307,
+        2.8798
+      ]
+    },
+    "right_hip_roll_joint": {
+      "kp": 99.098428,
+      "kd": 6.308802,
+      "effort_limit": 139.0,
+      "armature": 0.025101925,
+      "damping": 0.0,
+      "joint_range": [
+        -2.9671,
+        0.5236
+      ]
+    },
+    "right_hip_yaw_joint": {
+      "kp": 40.179238,
+      "kd": 2.55789,
+      "effort_limit": 88.0,
+      "armature": 0.01017752,
+      "damping": 0.0,
+      "joint_range": [
+        -2.7576,
+        2.7576
+      ]
+    },
+    "right_knee_joint": {
+      "kp": 99.098428,
+      "kd": 6.308802,
+      "effort_limit": 139.0,
+      "armature": 0.025101925,
+      "damping": 0.0,
+      "joint_range": [
+        -0.087267,
+        2.8798
+      ]
+    },
+    "right_ankle_pitch_joint": {
+      "kp": 28.501246,
+      "kd": 1.814446,
+      "effort_limit": 50.0,
+      "armature": 0.00721945,
+      "damping": 0.0,
+      "joint_range": [
+        -0.87267,
+        0.5236
+      ]
+    },
+    "right_ankle_roll_joint": {
+      "kp": 28.501246,
+      "kd": 1.814446,
+      "effort_limit": 50.0,
+      "armature": 0.00721945,
+      "damping": 0.0,
+      "joint_range": [
+        -0.2618,
+        0.2618
+      ]
+    },
+    "left_shoulder_pitch_joint": {
+      "kp": 14.250623,
+      "kd": 0.907223,
+      "effort_limit": 25.0,
+      "armature": 0.003609725,
+      "damping": 0.0,
+      "joint_range": [
+        -3.0892,
+        2.6704
+      ]
+    },
+    "left_shoulder_roll_joint": {
+      "kp": 14.250623,
+      "kd": 0.907223,
+      "effort_limit": 25.0,
+      "armature": 0.003609725,
+      "damping": 0.0,
+      "joint_range": [
+        -1.5882,
+        2.2515
+      ]
+    },
+    "left_shoulder_yaw_joint": {
+      "kp": 14.250623,
+      "kd": 0.907223,
+      "effort_limit": 25.0,
+      "armature": 0.003609725,
+      "damping": 0.0,
+      "joint_range": [
+        -2.618,
+        2.618
+      ]
+    },
+    "left_elbow_joint": {
+      "kp": 14.250623,
+      "kd": 0.907223,
+      "effort_limit": 25.0,
+      "armature": 0.003609725,
+      "damping": 0.0,
+      "joint_range": [
+        -1.0472,
+        2.0944
+      ]
+    },
+    "left_wrist_roll_joint": {
+      "kp": 14.250623,
+      "kd": 0.907223,
+      "effort_limit": 25.0,
+      "armature": 0.003609725,
+      "damping": 0.0,
+      "joint_range": [
+        -1.97222,
+        1.97222
+      ]
+    },
+    "left_wrist_pitch_joint": {
+      "kp": 16.778327,
+      "kd": 1.068142,
+      "effort_limit": 5.0,
+      "armature": 0.00425,
+      "damping": 0.0,
+      "joint_range": [
+        -1.61443,
+        1.61443
+      ]
+    },
+    "left_wrist_yaw_joint": {
+      "kp": 16.778327,
+      "kd": 1.068142,
+      "effort_limit": 5.0,
+      "armature": 0.00425,
+      "damping": 0.0,
+      "joint_range": [
+        -1.61443,
+        1.61443
+      ]
+    },
+    "right_shoulder_pitch_joint": {
+      "kp": 14.250623,
+      "kd": 0.907223,
+      "effort_limit": 25.0,
+      "armature": 0.003609725,
+      "damping": 0.0,
+      "joint_range": [
+        -3.0892,
+        2.6704
+      ]
+    },
+    "right_shoulder_roll_joint": {
+      "kp": 14.250623,
+      "kd": 0.907223,
+      "effort_limit": 25.0,
+      "armature": 0.003609725,
+      "damping": 0.0,
+      "joint_range": [
+        -2.2515,
+        1.5882
+      ]
+    },
+    "right_shoulder_yaw_joint": {
+      "kp": 14.250623,
+      "kd": 0.907223,
+      "effort_limit": 25.0,
+      "armature": 0.003609725,
+      "damping": 0.0,
+      "joint_range": [
+        -2.618,
+        2.618
+      ]
+    },
+    "right_elbow_joint": {
+      "kp": 14.250623,
+      "kd": 0.907223,
+      "effort_limit": 25.0,
+      "armature": 0.003609725,
+      "damping": 0.0,
+      "joint_range": [
+        -1.0472,
+        2.0944
+      ]
+    },
+    "right_wrist_roll_joint": {
+      "kp": 14.250623,
+      "kd": 0.907223,
+      "effort_limit": 25.0,
+      "armature": 0.003609725,
+      "damping": 0.0,
+      "joint_range": [
+        -1.97222,
+        1.97222
+      ]
+    },
+    "right_wrist_pitch_joint": {
+      "kp": 16.778327,
+      "kd": 1.068142,
+      "effort_limit": 5.0,
+      "armature": 0.00425,
+      "damping": 0.0,
+      "joint_range": [
+        -1.61443,
+        1.61443
+      ]
+    },
+    "right_wrist_yaw_joint": {
+      "kp": 16.778327,
+      "kd": 1.068142,
+      "effort_limit": 5.0,
+      "armature": 0.00425,
+      "damping": 0.0,
+      "joint_range": [
+        -1.61443,
+        1.61443
+      ]
+    }
+  }
+}

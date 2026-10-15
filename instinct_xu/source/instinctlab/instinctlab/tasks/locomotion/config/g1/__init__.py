@@ -346,6 +346,15 @@ from .amp_walk_t5_env_cfg import (
     G1AmpWalkT5EnvCfg_PLAY,
     G1AmpWalkT5TeacherEnv,
 )
+# --- P1（2026-10-13）：换根 ⇒ 官方 G1 rev1.0（**pelvis 为根**）-------------------
+# 只换“与根/资产有关”的部分（资产、init 高度、高程图挂点、运动参考 prim+数据、
+# 判别器 anchor、关节序/镜像映射）；奖励函数与算法配方逐字沿 T2。
+# ⚠️ 必须**冷启动**：关节序与动作/观测语义都变了，旧 checkpoint 不可续训。
+from .amp_walk_pelvis_env_cfg import (
+    G1AmpWalkPelvisEnvCfg,
+    G1AmpWalkPelvisEnvCfg_PLAY,
+    G1AmpWalkPelvisTeacherEnv,
+)
 from .omni_loco_env_cfg import G1OmniLocoEnvCfg, G1OmniLocoEnvCfg_PLAY, G1OmniLocoTeacherEnv
 
 for task_id, env_cfg in (
@@ -1786,6 +1795,26 @@ for task_id, env_cfg in (
             "env_cfg_entry_point": env_cfg,
             "instinct_rl_cfg_entry_point": (
                 f"{agents.__name__}.amp_walk_t5_ppo_cfg:G1AmpWalkT5PPORunnerCfg"
+            ),
+        },
+    )
+
+
+# --- P1：换根 —— 官方 G1 rev1.0（pelvis 为根）--------------------------------
+# 任务契约（obs 1500 / 命令 / 动作语义 / 时序）与 T2 相同，只有关节序换成 PELVIS_JOINT_ORDER
+# ⇒ entry_point 用 P1 自己的校验器（它只覆盖 expected_joint_order）。
+for task_id, env_cfg in (
+    ("Instinct-Amp-Walk-Pelvis-G1-v0", G1AmpWalkPelvisEnvCfg),
+    ("Instinct-Amp-Walk-Pelvis-G1-Play-v0", G1AmpWalkPelvisEnvCfg_PLAY),
+):
+    gym.register(
+        id=task_id,
+        entry_point=G1AmpWalkPelvisTeacherEnv,
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": env_cfg,
+            "instinct_rl_cfg_entry_point": (
+                f"{agents.__name__}.amp_walk_pelvis_ppo_cfg:G1AmpWalkPelvisPPORunnerCfg"
             ),
         },
     )

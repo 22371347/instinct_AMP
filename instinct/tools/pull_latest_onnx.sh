@@ -51,6 +51,9 @@ LIST_ONLY=0
 TAG_OVERRIDE=""
 RUN_ARG=""
 CKPT_ARG=""
+#: ⭐ 回放侧资产开关：legacy(torso 根) 为空（默认），P1(pelvis 根) = `--asset rev10`。
+#: 由 `resolve_play_task()` 根据 run 名/任务 id 自动置位，供下面本地自检与提示复用。
+PLAY_ASSET_FLAG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --list) LIST_ONLY=1; shift ;;
@@ -122,6 +125,16 @@ resolve_play_task() {
       if [[ ${#_x} -gt ${#VER} ]]; then VER="$_x"; PLAY_TASK="$_id"; fi
     fi
   done <<< "$_IDS"
+  # ⭐ P1 臂（官方 rev1.0 / **pelvis 为根**）：run 名形如
+  #   `20261013_162510_p1_pelvis_official_rev10_cold_p1_pelvis_official_rev10`
+  #   —— 里面**没有** `G1AmpWalk<X>` 锚点、也没有 `V<数字>`，上面两套匹配都必失配，
+  #   所以必须在这里显式映射，否则会静默回退到 `Instinct-Amp-Walk-G1-Play-v0`
+  #   （→ 用错资产/关节序导出，ONNX 直接不可用）。
+  if [[ -z "$PLAY_TASK" ]] && printf '%s' "$RUN_MAIN" | grep -qiE 'p1_pelvis|G1AmpWalkPelvis|pelvis_official_rev10'; then
+    VER="p1"
+    PLAY_TASK="Instinct-Amp-Walk-Pelvis-G1-Play-v0"
+    PLAY_ASSET_FLAG="--asset rev10"
+  fi
   # ⭐ 基座任务（T0 / OmniLoco 教师）：run 名里**不含** `G1AmpWalk<X>` 锚点，
   #   走另一套注册 id。放在 AMP 分支之后 ⇒ 不会误判 AMP 臂。
   if [[ -z "$PLAY_TASK" ]] && printf '%s' "$RUN_MAIN" | grep -qiE 'G1UnifiedOmniLoco|omni_loco|loco_base'; then
@@ -193,7 +206,14 @@ if [[ "$LIST_ONLY" == "1" ]]; then
     _ck="${CKPT_ARG:-（该 run 还没有 model_*.pt）}"
     _st="${_ck#model_}"; _st="${_st%.pt}"
     echo "    → 任务: ${PLAY_TASK:-（无法判定）}"
-    echo "    → 本地目录: instinct/eval/${TAG_OVERRIDE:-v$(printf '%s' "${VER#V}" | tr 'A-Z' 'a-z')_${_st%.pt}}"
+    # 与下面真正拉取时的 TAG 规则保持一致：P1(pelvis 根) → `p1_<step>`；V 系列 → `v<x>_<step>`
+    if [[ "$VER" == "p1" ]]; then
+      _tagdef="p1_${_st%.pt}"
+    else
+      _tagdef="v$(printf '%s' "${VER#V}" | tr 'A-Z' 'a-z')_${_st%.pt}"
+    fi
+    echo "    → 本地目录: instinct/eval/${TAG_OVERRIDE:-$_tagdef}"
+    echo "    → 回放资产: ${PLAY_ASSET_FLAG:-（默认 legacy：torso 根）}"
     echo "    → checkpoint: $_ck"
     echo
   fi
@@ -262,7 +282,12 @@ echo "选定: run=$RUN_ARG  ckpt=$CKPT_ARG"
 RUN_MAIN="${RUN_ARG%%_from*}"
 resolve_play_task   # 见顶部 `resolve_play_task()`（以云端注册表为准，取最长匹配）
 if [[ -n "$VER" ]]; then
-  TAG="${TAG_OVERRIDE:-v$(printf '%s' "${VER#V}" | tr 'A-Z' 'a-z')_${STEP}}"
+  if [[ "$VER" == "p1" ]]; then
+    # P1 臂（palvis 根）单独一套标签：`p1_<step>`，与 V 系列一眼区分
+    TAG="${TAG_OVERRIDE:-p1_${STEP}}"
+  else
+    TAG="${TAG_OVERRIDE:-v$(printf '%s' "${VER#V}" | tr 'A-Z' 'a-z')_${STEP}}"
+  fi
 else
   TAG="${TAG_OVERRIDE:-v1_${STEP}}"
   PLAY_TASK="Instinct-Amp-Walk-G1-Play-v0"
@@ -362,20 +387,24 @@ source /home/leo/miniconda3/etc/profile.d/conda.sh && conda activate instinct
 echo
 echo "──── 本地自检 ────"
 python instinct/tools/g1_mujoco_play.py --onnx-info --policy "$DEST/actor.onnx" 2>&1 | grep -E "输入|输出|input|output|\[onnx"
-python instinct/tools/g1_mujoco_play.py --policy "$DEST/actor.onnx" \
+python instinct/tools/g1_mujoco_play.py $PLAY_ASSET_FLAG --policy "$DEST/actor.onnx" \
   --no-view --no-teleop --duration 2 --cmd 0.5 0 0 --no-realtime 2>&1 \
-  | grep -E "\[obs\] obs_mode|\[obs\] 第 1 帧|\[pace\]|❌" | head -8
+  | grep -E "\[asset\]|\[obs\] obs_mode|\[obs\] 第 1 帧|\[pace\]|❌" | head -8
 
 cat <<EOF
 
 ════════ 直接用 ════════
 # 开窗 + WASD/QE 键盘遥控（会**自动配上**同目录的 policy_normalizer.npz）
-python instinct/tools/g1_mujoco_play.py --policy $DEST/actor.onnx --duration 0
+python instinct/tools/g1_mujoco_play.py $PLAY_ASSET_FLAG --policy $DEST/actor.onnx --duration 0
 
 # 与别的版本对比时，各自指向自己的子目录即可（不会互相覆盖归一化器）：
 #   --policy instinct/eval/v1_5000/actor.onnx
 #
+# ⭐ 资产/关节序由 run 名自动判定（$PLAY_ASSET_FLAG）：
+#    p1_pelvis_* → `--asset rev10`（官方 rev1.0，pelvis 为根）；V1~T5 → 默认 legacy（torso 为根）。
+#    两个臂的关节序不同（换根必改序），**必须**让工具自己切，不要手工拼。
+#
 # ⭐ 观测布局按 ONNX 输入维度**自动选**：626 → amp626（527 射线、居中）；
-#    378 → amp378（279 射线、中心前移 1.5 m）。叠加的橙色扫描框会跟着切。
-#    想强制指定：--obs-mode amp626 | amp378 | legacy
+#    378 → amp378（279 射线、中心前移 1.5 m）；1500 → amp1500（T2/P1）。
+#    叠加的橙色扫描框会跟着切。想强制指定：--obs-mode amp626 | amp378 | amp1500 | legacy
 EOF

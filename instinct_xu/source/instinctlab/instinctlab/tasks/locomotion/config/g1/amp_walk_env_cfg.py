@@ -651,14 +651,33 @@ class G1AmpWalkTeacherEnv(G1OmniLocoTeacherEnv):
         try:
             from .omni_loco_env_cfg import OMNI_LOCO_JOINT_ORDER
 
-            _order_ok = tuple(robot.joint_names) == tuple(OMNI_LOCO_JOINT_ORDER)
-            _order_msg = "一致" if _order_ok else "❌不一致（增广标签会错！）"
+            # ⚠️ 用 `self.expected_joint_order`（子类可覆盖）而不是写死老常量：
+            #    换根臂（P1）的 articulation 序**本来就**与 torso 根臂不同，
+            #    拿老常量去比会打出一句误导性的"❌不一致（增广标签会错！）"。
+            _want = tuple(getattr(self, "expected_joint_order", OMNI_LOCO_JOINT_ORDER))
+            _order_ok = tuple(robot.joint_names) == _want
+            if _order_ok:
+                _order_msg = "一致（与本臂 `expected_joint_order`）"
+            elif tuple(robot.joint_names) == tuple(OMNI_LOCO_JOINT_ORDER):
+                _order_msg = (
+                    "本臂序 ≠ OMNI_LOCO_JOINT_ORDER（=旧 torso 根资产序）"
+                    "，但**与本臂 expected_joint_order 的关系需看上一行契约结果**"
+                )
+            else:
+                _order_msg = "❌ 与 expected_joint_order 不一致（契约若也失败则已 raise）"
+            # 只有"数据层增广真的开着"时，顺序不一致才会污染标签
+            if _order_ok and _cond:
+                _order_msg += "；数据层增广已启用，映射口径一致 ✅"
+            elif (not _order_ok) and _cond:
+                _order_msg += "；⚠️ 数据层增广**已启用**且顺序不符 ⇒ 标签会错！"
+            elif _cond is False:
+                _order_msg += "；数据层增广未启用（无标签风险）"
         except Exception as _exc:  # pragma: no cover - 诊断路径不该拖垮启动
             _order_msg = f"无法核对（{_exc!r}）"
         print(
             f"[AMP-WALK INFO] 数据层镜像增广：映射={'已设' if _jm is not None else '未设'}，"
             f"运行时条件={_cond}，被镜像 env 比例={_mask}；"
-            f"joint 顺序 vs OMNI_LOCO_JOINT_ORDER：{_order_msg}"
+            f"joint 顺序判断：{_order_msg}"
         )
         if not has_foot_bodies:
             # 这是**预期**情况，不是异常：`LL_FOOT`/`LR_FOOT` 在 URDF 里是 ankle_roll_link

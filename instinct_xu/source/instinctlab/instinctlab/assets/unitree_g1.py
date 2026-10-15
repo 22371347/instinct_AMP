@@ -573,6 +573,63 @@ G1_29DOF_TORSOBASE_POPSICLE_CFG = ArticulationCfg(
     actuators=beyondmimic_g1_29dof_actuators,
 )
 
+# ---------------------------------------------------------------------------
+# 官方 Unitree G1 rev1.0（**pelvis 为根**）
+# ---------------------------------------------------------------------------
+# 与 `G1_29DOF_TORSOBASE_POPSICLE_CFG` 的**唯一区别是 root**：
+#   * torso-base 版：浮动基在 `torso_link`，腰链是 torso→waist_pitch→waist_roll→waist_yaw→pelvis
+#     （父子方向被反转但**轴未取反** ⇒ 三个腰关节的符号与厂商 URDF 相反）；
+#   * 本版：直接用**厂商 rev1.0 URDF**，浮动基在 `pelvis`，腰链为
+#     pelvis→waist_yaw→waist_roll→waist_pitch→torso（轴 = 厂商值）
+#     ⇒ 腰关节符号与厂商/参考动作数据**一致**。
+#
+# 落地资产：`resources/unitree_g1/official_rev10/{g1_29dof_rev_1_0.urdf, meshes×35}`
+#
+# ⚠️ `init_state.pos.z = 0.7585`：MJCF FK 实测的“default 站姿 + 脚掌着地”时的**骨盆**离地高度
+#    （同姿态下 torso = 0.8025，torso−pelvis = 0.0440，与旧模型逐位相同）。
+#    它同时也是 `track_base_height` 的目标（`default_root_state[:, 2]`）
+#    ⇒ 换根后“量 root”就是“量骨盆”，**无需换奖励函数**。
+# ⚠️ 总质量 33.3411 kg、相对骨盆的质心与旧模型完全一致（已验证）。
+G1_29DOF_REV10_PELVIS_CFG = ArticulationCfg(
+    spawn=sim_utils.UrdfFileCfg(
+        fix_base=False,
+        replace_cylinders_with_capsules=True,
+        asset_path=f"{__file_dir__}/resources/unitree_g1/official_rev10/g1_29dof_rev_1_0.urdf",
+        activate_contact_sensors=True,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            retain_accelerations=False,
+            linear_damping=0.0,
+            angular_damping=0.0,
+            max_linear_velocity=1000.0,
+            max_angular_velocity=1000.0,
+            max_depenetration_velocity=1.0,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=True, solver_position_iteration_count=8, solver_velocity_iteration_count=4
+        ),
+        joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
+            gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0, damping=0)
+        ),
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.7585),
+        joint_pos={
+            ".*_hip_pitch_joint": -0.312,
+            ".*_knee_joint": 0.669,
+            ".*_ankle_pitch_joint": -0.363,
+            ".*_elbow_joint": 0.6,
+            "left_shoulder_roll_joint": 0.2,
+            "left_shoulder_pitch_joint": 0.2,
+            "right_shoulder_roll_joint": -0.2,
+            "right_shoulder_pitch_joint": 0.2,
+        },
+        joint_vel={".*": 0.0},
+    ),
+    soft_joint_pos_limit_factor=0.9,
+    actuators=beyondmimic_g1_29dof_actuators,
+)
+
 G1_29DOF_LINKS = [  # Order not guaranteed.
     "torso_link",
     "left_shoulder_pitch_link",

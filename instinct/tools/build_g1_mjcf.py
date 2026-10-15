@@ -123,10 +123,10 @@ def patch_joint_physics(text: str) -> tuple[str, int]:
     return text, patched
 
 
-def build_keyframe_block() -> str:
+def build_keyframe_block(base: Path = BASE_POPSICLE, init_root_height: float = P.INIT_ROOT_HEIGHT) -> str:
     import mujoco
 
-    m = mujoco.MjModel.from_xml_path(str(BASE_POPSICLE))
+    m = mujoco.MjModel.from_xml_path(str(base))
     qpos = m.qpos0.copy()
     # 定位免费关节占用的 qpos 长度
     free_adr = None
@@ -137,7 +137,7 @@ def build_keyframe_block() -> str:
     if free_adr is None:
         raise SystemExit("模型里找不到 free joint（浮动基），无法生成 keyframe")
     free_len = 7
-    qpos[free_adr + 2] = P.INIT_ROOT_HEIGHT  # z
+    qpos[free_adr + 2] = init_root_height  # z
     for j in range(m.njnt):
         if int(m.jnt_type[j]) != mujoco.mjtJoint.mjJNT_HINGE:
             continue
@@ -147,7 +147,7 @@ def build_keyframe_block() -> str:
     return (
         "  <keyframe>\n"
         '    <!-- popsicle 默认站姿 (_POPSICLE_INIT_STATE)，root 高 '
-        f"{P.INIT_ROOT_HEIGHT} m -->\n"
+        f"{init_root_height} m -->\n"
         f'    <key name="home" qpos="{vec}"/>\n'
         "  </keyframe>"
     )
@@ -173,11 +173,34 @@ def inject_ground(text: str, base: Path) -> tuple[str, bool]:
     return text[: m.end()] + "\n" + GROUND_BLOCK + text[m.end():], True
 
 
-def generate(base: Path, out: Path) -> Path:
+def generate(
+    base: Path,
+    out: Path,
+    init_root_height: float = P.INIT_ROOT_HEIGHT,
+    strip_actuator: bool = False,
+    strip_scene: bool = False,
+) -> Path:
     if not base.is_file():
         raise SystemExit(f"基础 MJCF 不存在: {base}\n请确认已 clone InstinctMJ 仓库。")
 
     text = base.read_text(encoding="utf-8")
+
+    # 0) 可选：先剥掉基础模型自带的 <actuator>（官方 G1 MJCF 是 <motor>，本脚本要自建 <position>）
+    if strip_actuator and "<actuator" in text:
+        text, n_act = re.subn(r"\n?\s*<actuator>.*?</actuator>", "", text, flags=re.S)
+        if n_act:
+            print(f"[strip] 已移除基础模型自带的 <actuator> 块（{n_act} 处）")
+
+    # 0.5) 可选：剥离基础模型尾部自带的“场景块”（第 2 个及以后的 <asset>/<worldbody>）。
+    #      官方 rev1.0 的 xml 把 天空盒/棋盘地面/灯光 追加在机器人后面，
+    #      会和本脚本注入的 `floor` 重名（MuJoCo 直接报 repeated name）。
+    if strip_scene:
+        for tag in ("asset", "worldbody"):
+            blocks = list(re.finditer(rf"\n?[ \t]*<{tag}>.*?</{tag}>", text, flags=re.S))
+            for b in reversed(blocks[1:]):
+                text = text[: b.start()] + text[b.end():]
+            if len(blocks) > 1:
+                print(f"[strip] 已移除第 2 个及以后的 <{tag}> 块（{len(blocks) - 1} 处）")
 
     # 1) meshdir 改为绝对路径，使生成文件可放在任意位置
     def abs_meshdir(match: re.Match) -> str:
@@ -206,7 +229,13 @@ def generate(base: Path, out: Path) -> Path:
     if "<keyframe" in text:
         raise SystemExit("基础 MJCF 已含 <keyframe>，请改用 --base 指定无 keyframe 的模型")
 
-    payload = "\n\n" + build_actuator_block() + "\n\n" + build_keyframe_block() + "\n"
+    payload = (
+        "\n\n"
+        + build_actuator_block()
+        + "\n\n"
+        + build_keyframe_block(base, init_root_height)
+        + "\n"
+    )
     if "</mujoco>" not in text:
         raise SystemExit("基础 MJCF 缺少 </mujoco> 结束标签")
     text = text.replace("</mujoco>", payload + "</mujoco>")
@@ -334,6 +363,28 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--with-shoe", action="store_true", help="使用跑酷任务的带鞋变体作为基础模型")
     ap.add_argument("--base", help="自定义基础 MJCF（必须无 actuator/keyframe）")
     ap.add_argument("--out", default=str(DEFAULT_OUT), help=f"输出路径（默认 {DEFAULT_OUT}）")
+    ap.add_argument(
+        "--init-root-height",
+        type=float,
+        default=P.INIT_ROOT_HEIGHT,
+        help=(
+            f"keyframe 里**根刚体**的离地高度（默认 {P.INIT_ROOT_HEIGHT}）。"
+            "torso 根用 0.82；官方 pelvis 根模型用 0.7585（= 默认站位骨盆高度，已实测）"
+        ),
+    )
+    ap.add_argument(
+        "--strip-actuator",
+        action="store_true",
+        help="先剥掉基础模型自带的 <actuator> 块（官方 G1 MJCF 为 <motor>，不剥会与本脚本自建的冲突）",
+    )
+    ap.add_argument(
+        "--strip-scene",
+        action="store_true",
+        help=(
+            "先剥掉基础模型自带的“场景块”（第 2 个及以后的 <asset>/<worldbody>："
+            "官方 rev1.0 xml 的天空盒+棋盘地面+灯光），避免与本脚本注入的地面重名"
+        ),
+    )
     args = ap.parse_args(argv)
 
     base = Path(args.base) if args.base else (BASE_POPSICLE_SHOE if args.with_shoe else BASE_POPSICLE)
@@ -341,7 +392,13 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"基础模型: {base}")
     print(f"输出路径: {out}")
-    generate(base, out)
+    generate(
+        base,
+        out,
+        init_root_height=args.init_root_height,
+        strip_actuator=args.strip_actuator,
+        strip_scene=args.strip_scene,
+    )
     print(f"✅ 已生成 {out}  ({out.stat().st_size / 1024:.1f} KB)")
     return 0 if verify(out) else 1
 
