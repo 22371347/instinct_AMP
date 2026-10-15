@@ -76,6 +76,33 @@ _UPSTREAM_TOP = ("ManagerBasedRLEnvCfg", "InteractiveSceneCfg", "RslRlOnPolicyRu
 #: 上游模块前缀：属于这些的实例可以**内联用它自己的类**，其余（本项目）必须被生成的类替换
 _UPSTREAM_MODULES = ("isaaclab", "rsl_rl", "mjlab", "torch", "numpy", "gymnasium")
 
+#: 环境命名空间正则（项目里 `reference_prim_path` 原本就是这么写的）。
+#:
+#: ⚠️ 为什么生成物要把 `{ENV_REGEX_NS}` 写成它（云端实测踩坑）：
+#: IsaacLab `configclass.copy()` 会**重新执行 `__post_init__`**
+#: （`isaaclab/sensors/sensor_base.py:59` 就是 `self.cfg = cfg.copy()`），而我们的生成类把
+#: `prim_path` 字面量**写死在 `__post_init__`** 里 ⇒ 运行时已被 `InteractiveScene` 替换好的
+#: `/World/envs/env_.*/Robot/pelvis` 会被**退回成占位符** ⇒ `SensorBase._initialize_impl` 的
+#: `cfg.prim_path.rsplit("/", 1)[0]` 得到 `{ENV_REGEX_NS}/Robot` ⇒
+#: `ValueError: Prim path ... is not global`。写成绝对正则后 copy 多少次都稳定
+#: （`InteractiveScene` 的 `.format()` 对不含占位符的字符串是 no-op）。
+ENV_NS = "/World/envs/env_.*"
+
+
+def canon_env_ns(obj: Any) -> Any:
+    """把嵌套结构里的 `ENV_NS` 归一回 `{ENV_REGEX_NS}`（等价校验专用）。
+
+    生成物用绝对正则、链式用占位符，两者语义相同 ⇒ 比较前统一成同一写法，
+    否则快照 diff 会为每个 prim_path 误报一处差异。
+    """
+    if isinstance(obj, str):
+        return obj.replace(ENV_NS, "{ENV_REGEX_NS}")
+    if isinstance(obj, dict):
+        return {k: canon_env_ns(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [canon_env_ns(v) for v in obj]
+    return obj
+
 
 def is_ours(v: Any) -> bool:
     """实例是否属于**本项目**的 cfg 类（⇒ 展平后不得再 import，必须生成替身类）。
@@ -328,6 +355,12 @@ class Emitter:
         if v is True or v is False:
             return "True" if v else "False"
         if isinstance(v, (int, float, str)):
+            if isinstance(v, str) and "{ENV_REGEX_NS}" in v:
+                # ⭐ 占位符 → **绝对正则**（项目里 `reference_prim_path` 本来就是这种写法）。
+                #    详情见文件头 `ENV_NS` 处：`configclass.copy()` 会重跑 `__post_init__`，
+                #    写死的占位符会把运行时已替换好的路径退回成 `{ENV_REGEX_NS}` ⇒ 真机报错。
+                v = v.replace("{ENV_REGEX_NS}", ENV_NS)
+                self.notes.append(f"{where}: `{{ENV_REGEX_NS}}` → `{ENV_NS}`（绝对正则）")
             if isinstance(v, str) and self.rel_base and os.path.isabs(v) and os.path.exists(v):
                 # ⭐ 绝对路径 → 相对生成文件自身目录（换机可用）。
                 # ⚠️ 必须加 `os.path.exists` 守卫：像 `/World/ground`、`{ENV_REGEX_NS}/...`、
@@ -661,6 +694,9 @@ def verify(chain_spec: str, flat_file: str, flat_attr: str, limit: int) -> int:
     flat_obj = _load_flat(flat_file, flat_attr)
 
     a, b = normalize(chain_obj), normalize(flat_obj)
+    # ⭐ 等价规范化：生成物把 `{ENV_REGEX_NS}` 写成了绝对正则 `ENV_NS`（见 `Emitter.value`），
+    #    两者语义相同 ⇒ 比较前统一写法，否则每个 prim_path 都会误报一处差异。
+    a, b = canon_env_ns(a), canon_env_ns(b)
     diffs: list[str] = []
     _flatten_diff(a, b, "<root>", diffs, limit)
     if not diffs:
