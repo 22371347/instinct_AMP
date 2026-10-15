@@ -32,7 +32,11 @@ if TYPE_CHECKING:
         RayEdgeCylinderCfg,
         FeatureEdgeCylinderCfg,
     )
-import pyvista as pv
+# ⚠️ `pyvista` 改成**惰性导入**（真正用到它的地方是 `FeatureEdgeCylinder.generate`）。
+#    原因：云端 vtk 与 pyvista 0.49 不兼容 —— `ImportError: Cannot import name
+#    'vtkMatrix3x3' from 'vtkmodules.vtkCommonMath'`。若在模块级 import，整个
+#    `instinctlab.terrains` 会在**导入期**就崩掉，连带把所有走 terrain 的任务
+#    （vault 等）打死。惰性化后：不用 FeatureEdgeCylinder 的任务完全不受影响。
 
 
 class EdgeCylinder(VirtualObstacleBase):
@@ -672,6 +676,8 @@ class FeatureEdgeCylinder(VirtualObstacleBase):
         # extract vertices and faces from the trimesh object
         points = mesh.vertices.astype(np.float32)
         indices = mesh.faces.astype(np.int32)
+        import pyvista as pv  # 局部导入：见文件头（vtk/pyvista 版本兼容性）
+
         pv_mesh = pv.PolyData(points, np.hstack((np.full((indices.shape[0], 1), 3), indices)))
         edges = pv_mesh.extract_feature_edges(
             feature_angle=self.cfg.feature_angle,
