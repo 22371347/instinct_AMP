@@ -141,6 +141,15 @@ resolve_play_task() {
     VER="t0"
     PLAY_TASK="Instinct-Unified-OmniLoco-G1-Play-v0"
   fi
+  # ⭐ 越障（perceptive vault / beyondmimic）：run 名形如
+  #   `20261015_225907_g1PerceptiveVaultPhpTeacher_concatMotionBins__GPU0`。
+  #   它的任务 id 注册在 `tasks/shadowing/perceptive/config/g1/__init__.py`
+  #   —— **不在 `config/g1`**，所以上面那套（扫 config/g1 注册表）必失配 ⇒ 显式映射。
+  #   资产保持默认 legacy（越障用 torso 根资产，与 P1 的 pelvis 根不同）。
+  if [[ -z "$PLAY_TASK" ]] && printf '%s' "$RUN_MAIN" | grep -qiE 'PerceptiveVault|perceptive_vault'; then
+    VER="vault"
+    PLAY_TASK="Instinct-Perceptive-Vault-G1-Play-v0"
+  fi
   if [[ -z "$VER" ]]; then
     # 兼容极老的 run（run 名里没有 G1AmpWalk 版本锚点）⇒ 退回正则
     VER="$(printf '%s' "$RUN_MAIN" | grep -oE 'V[0-9]+[a-z]?' | tail -1)"
@@ -206,9 +215,12 @@ if [[ "$LIST_ONLY" == "1" ]]; then
     _ck="${CKPT_ARG:-（该 run 还没有 model_*.pt）}"
     _st="${_ck#model_}"; _st="${_st%.pt}"
     echo "    → 任务: ${PLAY_TASK:-（无法判定）}"
-    # 与下面真正拉取时的 TAG 规则保持一致：P1(pelvis 根) → `p1_<step>`；V 系列 → `v<x>_<step>`
+    # 与下面真正拉取时的 TAG 规则保持一致：P1(pelvis 根) → `p1_<step>`；
+    # 越障 → `vault_<step>`；V 系列 → `v<x>_<step>`
     if [[ "$VER" == "p1" ]]; then
       _tagdef="p1_${_st%.pt}"
+    elif [[ "$VER" == "vault" ]]; then
+      _tagdef="vault_${_st%.pt}"
     else
       _tagdef="v$(printf '%s' "${VER#V}" | tr 'A-Z' 'a-z')_${_st%.pt}"
     fi
@@ -285,6 +297,9 @@ if [[ -n "$VER" ]]; then
   if [[ "$VER" == "p1" ]]; then
     # P1 臂（palvis 根）单独一套标签：`p1_<step>`，与 V 系列一眼区分
     TAG="${TAG_OVERRIDE:-p1_${STEP}}"
+  elif [[ "$VER" == "vault" ]]; then
+    # 越障（perceptive vault）单独一套标签：`vault_<step>`，与 AMP 的 v<X> 区分
+    TAG="${TAG_OVERRIDE:-vault_${STEP}}"
   else
     TAG="${TAG_OVERRIDE:-v$(printf '%s' "${VER#V}" | tr 'A-Z' 'a-z')_${STEP}}"
   fi
