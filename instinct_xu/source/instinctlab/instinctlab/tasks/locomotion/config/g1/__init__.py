@@ -350,11 +350,8 @@ from .amp_walk_t5_env_cfg import (
 # 只换“与根/资产有关”的部分（资产、init 高度、高程图挂点、运动参考 prim+数据、
 # 判别器 anchor、关节序/镜像映射）；奖励函数与算法配方逐字沿 T2。
 # ⚠️ 必须**冷启动**：关节序与动作/观测语义都变了，旧 checkpoint 不可续训。
-from .amp_walk_pelvis_env_cfg import (
-    G1AmpWalkPelvisEnvCfg,
-    G1AmpWalkPelvisEnvCfg_PLAY,
-    G1AmpWalkPelvisTeacherEnv,
-)
+from .amp_walk_p1_contract import G1AmpWalkP1TeacherEnv
+from .amp_walk_p1_env_cfg import G1AmpWalkP1EnvCfg, G1AmpWalkP1EnvCfg_PLAY
 from .omni_loco_env_cfg import G1OmniLocoEnvCfg, G1OmniLocoEnvCfg_PLAY, G1OmniLocoTeacherEnv
 
 for task_id, env_cfg in (
@@ -1801,20 +1798,24 @@ for task_id, env_cfg in (
 
 
 # --- P1：换根 —— 官方 G1 rev1.0（pelvis 为根）--------------------------------
-# 任务契约（obs 1500 / 命令 / 动作语义 / 时序）与 T2 相同，只有关节序换成 PELVIS_JOINT_ORDER
-# ⇒ entry_point 用 P1 自己的校验器（它只覆盖 expected_joint_order）。
+# ⭐ 2026-10-15：环境配置已**展平**为一份自包含文件（原 46 层继承链 → 1 个文件，
+# 不再继承任何其它 AMP 版本）。等价性不是靠人读代码，而是靠"解析结果快照 diff"
+# 机检证明：`instinct/tools/flatten_cfg.py verify`（本地 + 云端均 ✅）。
+# 任务 id 保持不变 ⇒ 外部脚本/文档引用无需改动。
+# entry_point 用 P1 自己的校验器（`amp_walk_p1_contract.G1AmpWalkP1TeacherEnv`，
+# 不继承其它版本，直接把期望值写在里面）。
 for task_id, env_cfg in (
-    ("Instinct-Amp-Walk-Pelvis-G1-v0", G1AmpWalkPelvisEnvCfg),
-    ("Instinct-Amp-Walk-Pelvis-G1-Play-v0", G1AmpWalkPelvisEnvCfg_PLAY),
+    ("Instinct-Amp-Walk-Pelvis-G1-v0", G1AmpWalkP1EnvCfg),
+    ("Instinct-Amp-Walk-Pelvis-G1-Play-v0", G1AmpWalkP1EnvCfg_PLAY),
 ):
     gym.register(
         id=task_id,
-        entry_point=G1AmpWalkPelvisTeacherEnv,
+        entry_point=G1AmpWalkP1TeacherEnv,
         disable_env_checker=True,
         kwargs={
             "env_cfg_entry_point": env_cfg,
             "instinct_rl_cfg_entry_point": (
-                f"{agents.__name__}.amp_walk_pelvis_ppo_cfg:G1AmpWalkPelvisPPORunnerCfg"
+                f"{agents.__name__}.amp_walk_p1_ppo_cfg:G1AmpWalkP1PPORunnerCfg"
             ),
         },
     )
