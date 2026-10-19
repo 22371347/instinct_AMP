@@ -104,12 +104,17 @@ class VaultMotionCfg(AmassMotionCfgBase):
 
 
 motion_reference_cfg = MotionReferenceManagerCfg(
-    prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+    # ⚠️ 这里必须是**机器人的 articulation 根 prim**（报错原文：
+    #   "For robot motion reference, only accept articulated prims for now"）。
+    #   popsicle(torso 根) 时代写 `Robot/torso_link` 恰好就是根；换 rev10(pelvis 根) 后
+    #   `Robot/torso_link` 变成子 link ⇒ 必须改为 `Robot/pelvis`。
+    prim_path="{ENV_REGEX_NS}/Robot/pelvis",
     # ⭐ 必须用 **pelvis 为根**的 URDF（见上面 `VAULT_FK_URDF` 的说明）：
     #   数据集 base_pos_w 是 pelvis 的位姿，而 FK 的浮动基座 = URDF 根 link。
     #   用 popsicle（torso 根）会整体偏 4.4 cm。
     robot_model_path=VAULT_FK_URDF,
-    reference_prim_path="/World/envs/env_.*/RobotReference/torso_link",
+    #: 参考模型同样用 rev10（root=pelvis）⇒ 镜像 prim 也是 pelvis。
+    reference_prim_path="/World/envs/env_.*/RobotReference/pelvis",
     link_of_interests=[
         "pelvis",
         "torso_link",
