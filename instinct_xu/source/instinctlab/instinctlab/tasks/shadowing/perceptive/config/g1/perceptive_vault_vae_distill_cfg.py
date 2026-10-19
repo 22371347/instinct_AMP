@@ -15,11 +15,12 @@ from isaaclab.utils.noise import UniformNoiseCfg
 
 import instinctlab.envs.mdp as instinct_mdp
 import instinctlab.tasks.shadowing.perceptive.perceptive_env_cfg as perceptual_cfg
-from instinctlab.assets.unitree_g1 import G1_29DOF_TORSOBASE_POPSICLE_CFG
+from instinctlab.assets.unitree_g1 import G1_29DOF_REV10_PELVIS_CFG
 
 from . import perceptive_vault_cfg as vault_env_cfg
 
-G1_CFG = G1_29DOF_TORSOBASE_POPSICLE_CFG
+#: 与 teacher（`perceptive_vault_cfg`）/ FK 统一到官方 rev1.0（pelvis 根）。
+G1_CFG = G1_29DOF_REV10_PELVIS_CFG
 DISTILL_PROPRIO_HISTORY_LENGTH = 0
 VAULT_SKILL_COMMAND_X_RANGE = (0.0, 4.0)
 # Match agent loss_curriculum_iterations / PHP K/2.

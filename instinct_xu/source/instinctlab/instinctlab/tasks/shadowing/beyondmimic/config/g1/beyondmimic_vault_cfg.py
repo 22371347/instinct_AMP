@@ -10,7 +10,7 @@ from isaaclab.utils import configclass
 
 import instinctlab.tasks.shadowing.beyondmimic.beyondmimic_env_cfg as beyondmimic_cfg
 from instinctlab.assets.unitree_g1 import (
-    G1_29DOF_TORSOBASE_POPSICLE_CFG,
+    G1_29DOF_REV10_PELVIS_CFG,
     beyondmimic_action_scale,
     beyondmimic_g1_29dof_actuators,
 )
@@ -24,7 +24,14 @@ from instinctlab.motion_reference import MotionReferenceManagerCfg
 from instinctlab.motion_reference.motion_files.amass_motion_cfg import AmassMotionCfg as AmassMotionCfgBase
 from instinctlab.motion_reference.utils import motion_interpolate_bilinear
 
-G1_CFG = G1_29DOF_TORSOBASE_POPSICLE_CFG
+#: ⭐⭐ 机器人本体 = **官方 rev1.0（pelvis 根）**，与下面的 `VAULT_FK_URDF` **成对**：
+#: 之前本体用的是 popsicle(torso 根)，而 FK 已改成 rev10(pelvis 根) ⇒ 两者不同源，导致
+#:   ① 三个腰关节**符号相反**（实测：`waist_*=+0.3` 时躯干旋转方向相反）；
+#:   ② 观测/奖励里的 **base 也不同源**（机器人 root=torso vs 参考 base=pelvis）⇒
+#:      `base_position_imitation_gauss` 基准直接差 torso−pelvis = **0.0440 m**。
+#: 换成 rev10 后：root=pelvis ⇒ 与参考 base 一致、腰符号一致 ⇒ 内部完全自洽。
+#: ⚠️ 该改动使旧 ckpt（popsicle 训练）**不再可用**，需从零重训。
+G1_CFG = G1_29DOF_REV10_PELVIS_CFG
 
 #: ⭐⭐ FK 的**浮动基座 = URDF 的根 link**（`MotionReferenceManager._initialize_robot_kinematics`
 #: 用 `pk.build_chain_from_urdf` 建链） —— 而本仓所有 retarget 数据集的 `base_pos_w`

@@ -20,7 +20,7 @@ import instinctlab.envs.mdp as instinct_mdp
 import instinctlab.tasks.shadowing.perceptive.perceptive_env_cfg as perceptual_cfg
 from instinctlab.assets.unitree_g1 import (
     G1_29DOF_LINKS,
-    G1_29DOF_TORSOBASE_POPSICLE_CFG,
+    G1_29DOF_REV10_PELVIS_CFG,
     beyondmimic_g1_29dof_actuators,
 )
 from instinctlab.tasks.shadowing.beyondmimic.config.g1 import beyondmimic_vault_cfg as vault_cfg
@@ -30,7 +30,10 @@ from instinctlab.sensors import get_link_prim_targets
 # Match BeyondMimic: no proprio history stack (history_length=0).
 TEACHER_PROPRIO_HISTORY_LENGTH = 0
 
-G1_CFG = G1_29DOF_TORSOBASE_POPSICLE_CFG
+#: 机器人本体 = 官方 rev1.0（pelvis 根），与 `beyondmimic_vault_cfg.VAULT_FK_URDF`
+#: **成对**使用（见该文件里 `G1_CFG` 的说明）：root=pelvis ⇒ 与参考动作 base 一致、
+#: 腰关节符号一致，避免"腰反相 + base 偏 4.4 cm"。
+G1_CFG = G1_29DOF_REV10_PELVIS_CFG
 VAULT_CAMERA_PITCH_DEG = 34
 VAULT_CAMERA_FOVY_DEG = 70
 VAULT_CAMERA_DEPTH_RANGE = (0.0, 3.0)
