@@ -309,6 +309,29 @@ PY
 | 身高奖励 | `track_base_height`（torso，靶 0.82） | `track_pelvis_height`（pelvis，靶 **0.7585**） |
 | 动作尺度 | 逐关节 `0.25·effort/kp` | **不变**，但按新关节序排列 |
 
+#### ⚠️ 8.1 `motion_reference.prim_path` 必须是**新的 articulation 根**（否则直接起不来）
+
+换根后最容易漏的一条，实测报错原文：
+
+```
+RuntimeError: Failed to find a valid prim view class for the prim paths:
+/World/envs/env_.*/Robot/torso_link, For robot motion reference,
+only accept articulated prims for now.
+```
+
+原因：旧资产 root = `torso_link`，所以 `prim_path=".../Robot/torso_link"` **恰好**就是
+articulation 根；换成 pelvis 根后它变成**子 link** ⇒ 不再是 articulated prim。
+
+**必须同步改**（本项目实际改动）：
+
+| 字段 | 旧值 | 新值 |
+|---|---|---|
+| `MotionReferenceManagerCfg.prim_path` | `{ENV_REGEX_NS}/Robot/torso_link` | `{ENV_REGEX_NS}/Robot/pelvis` |
+| `MotionReferenceManagerCfg.reference_prim_path` | `/World/envs/env_.*/RobotReference/torso_link` | `/World/envs/env_.*/RobotReference/pelvis` |
+
+⚠️ 注意区分：**高程图/相机的 `prim_path` 是 Sensor 类型，不必跟着换根**（本项目保留
+`Robot/torso_link`，因为 rev10 也有该 link；挂在躯干上才看得见前方地形）。
+
 ### Step 9 — 契约校验器（fail-fast，最重要的工程习惯）
 
 把"关节序 + 观测布局 + 关键常量"写成**运行时断言**，让配置错误**在训练第 0 秒就崩**，
