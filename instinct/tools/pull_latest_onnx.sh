@@ -311,6 +311,12 @@ echo "本地标签: $TAG   任务: $PLAY_TASK"
 
 # ⭐ 预检：这个 Play 任务**真的注册过**吗？版本号判错就别白等 Kit 启动 2 分钟。
 REG_SRC="$XU/source/instinctlab/instinctlab/tasks/locomotion/config/g1/__init__.py"
+# ⭐ 越障（perceptive vault）的 Play 任务注册在 **shadowing/perceptive**，不在 locomotion。
+#   （2026-10-16 实测踩坑：写死 locomotion ⇒ vault 必然走到下面 `exit 6`，
+#    现象是「run 子串与 ckpt 都选对了，却报『云端没有注册任务』」。）
+if [[ "$VER" == "vault" ]]; then
+  REG_SRC="$XU/source/instinctlab/instinctlab/tasks/shadowing/perceptive/config/g1/__init__.py"
+fi
 task_registered() {
   "${SSH[@]}" "grep -q '\"$1\"' $REG_SRC && echo __FOUND__" 2>/dev/null | grep -q '__FOUND__'
 }
@@ -330,7 +336,7 @@ if ! task_registered "$PLAY_TASK"; then
 fi
 if ! task_registered "$PLAY_TASK"; then
   echo "❌ 云端没有注册任务 $PLAY_TASK（版本号判错？）—— 已注册的 Play 任务（尾部 8 个）："
-  "${SSH[@]}" "grep -oE '\"Instinct-Amp-Walk-[^\"]*-Play-v0\"' $REG_SRC | tail -8" 2>/dev/null \
+  "${SSH[@]}" "grep -oE '\"Instinct-[^\"]*-Play-v0\"' $REG_SRC | tail -8" 2>/dev/null \
     | grep -vE 'credentials|password' | sed 's/^/    /'
   exit 6
 fi
@@ -416,7 +422,7 @@ python instinct/tools/g1_mujoco_play.py $PLAY_ASSET_FLAG --policy $DEST/actor.on
 #   --policy instinct/eval/v1_5000/actor.onnx
 #
 # ⭐ 资产/关节序由 run 名自动判定（$PLAY_ASSET_FLAG）：
-#    p1_pelvis_* → `--asset rev10`（官方 rev1.0，pelvis 为根）；V1~T5 → 默认 legacy（torso 为根）。
+#    p1_pelvis_* → '--asset rev10'（官方 rev1.0，pelvis 为根）；V1~T5 → 默认 legacy（torso 为根）。
 #    两个臂的关节序不同（换根必改序），**必须**让工具自己切，不要手工拼。
 #
 # ⭐ 观测布局按 ONNX 输入维度**自动选**：626 → amp626（527 射线、居中）；

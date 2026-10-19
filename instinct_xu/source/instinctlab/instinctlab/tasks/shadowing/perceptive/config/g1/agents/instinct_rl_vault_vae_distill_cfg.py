@@ -153,7 +153,9 @@ class G1PerceptiveVaultVaeDistillPPORunnerCfg(InstinctRlOnPolicyRunnerCfg):
 
     num_steps_per_env = 24
     max_iterations = 20000
-    save_interval = 1000
+    #: ⚠️ 2026-10-16：`1000` → `200`（与 teacher 侧 `instinct_rl_vault_cfg.py` 保持一致），
+    #: 便于蒸馏阶段挑选中间 ckpt 做回放/对比。
+    save_interval = 200
     log_interval = 10
     experiment_name = "g1_perceptive_vault_vae_distill"
 

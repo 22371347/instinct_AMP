@@ -85,9 +85,31 @@ def main(argv=None):
 
     print(f"[npz] {Path(args.npz).name}: {n} 帧 @ {fr:g} fps = {n / fr:.2f} s")
     print(f"[box] pos={box_pos.tolist()} size={box_size.tolist()} ⇒ 顶面 z={box_top:.3f} m")
-    print(f"[xml] {Path(args.xml).name}  根 body = "
-          f"{mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, 1)}")
+    _xml_root = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, 1)
+    print(f"[xml] {Path(args.xml).name}  根 body = {_xml_root}")
     print(f"[map] 关节按名重排：qpos[0]={qpos_joint_names[0]} ← npz 列 {col[0]}")
+
+    # ⭐ 资产/基座自洽性检查（2026-10-19 加）：
+    #    `--base-body pelvis` 那条分支只做**纯平移**补偿（d.qpos[0:3] += base_p - xpos[pelvis]），
+    #    ⇒ 根不是 pelvis 时，"全模型最低点 0.000 m" 仍然会成立（平移把脚贴到地上），
+    #    **但姿态补偿不了**：torsobase(popsicle) 资产的腰链父子方向被反转且轴未取反
+    #    ⇒ 腰关节符号与数据集相反 ⇒ 躯干/腰整体反相，步态看起来"别扭但没穿地"。
+    #    这是最容易被误判成"数据有问题"的情形，所以必须显式告警。
+    _want_root = {"pelvis": "pelvis", "torso": "torso_link"}[args.base_body]
+    if _xml_root != _want_root:
+        print()
+        print("=" * 78)
+        print(f"⚠️⚠️ 资产与基座语义不自洽：--base-body={args.base_body}（期望根 {_want_root}）")
+        print(f"      但 {Path(args.xml).name} 的根 body = **{_xml_root}**")
+        print("      ⇒ 本脚本只会做**纯平移**对齐（脚贴地），**无法**修正关节符号/腰链方向：")
+        print("        · 旧 torsobase(popsicle) 资产的腰关节符号与厂商/数据集**相反**")
+        print("          ⇒ 腰、躯干会反相，步态看着怪但不会穿地（极难发现）")
+        print("      ⇒ 换用与新资产匹配的 MJCF（如 `instinct/assets/g1_29dof_rev10_play.xml`），")
+        print("        或在训练侧确认 `VAULT_FK_URDF` 指向以 pelvis 为根的 URDF。")
+        print("=" * 78)
+        print()
+    else:
+        print(f"[asset-check] 根 body 与 --base-body 自洽 ✅（{_xml_root}）")
 
     renderer_w = max(int(m.vis.global_.offwidth), args.width)
     renderer_h = max(int(m.vis.global_.offheight), args.height)

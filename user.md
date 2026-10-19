@@ -1,6 +1,20 @@
 仿真代码：
 source /home/leo/miniconda3/etc/profile.d/conda.sh && conda activate instinct
 
+# 曲线
+bash instinct/tools/refresh_plots.sh once p1_pelvis_official_rev10_cold   # P1（展平）
+bash instinct/tools/refresh_plots.sh once g1PerceptiveVault               # 越障
+
+# ONNX（--list 先预览，不占 GPU）
+bash instinct/tools/pull_latest_onnx.sh p1 --list
+bash instinct/tools/pull_latest_onnx.sh g1PerceptiveVault_1 --list
+
+# 本地回放（--asset 已默认 auto，会按路径自判；越障=legacy，P1=rev10）
+python instinct/tools/g1_mujoco_play.py --policy instinct/eval/vault_2000/actor.onnx --duration 0
+
+
+
+
 python instinct/tools/g1_mujoco_play.py --policy /home/leo/rsl_project/llp/instinct/eval/vt2_11500/actor.onnx --duration 0
 
 
@@ -113,5 +127,12 @@ walk_sideway_left_A021
 2、修改完成后我们需要回放instinct_xu/source/instinctlab/instinctlab/tasks/shadowing/beyondmimic/config/g1/motions/vault/g1_speed_vault_retargeted.npz数据集进行验证，导出数据集replay视频人工核对
 3、AMP专家任务已经初步完成。我建立了一个还未初始化的github仓库https://github.com/22371347/instinct_AMP.git，我们把当前的仓库上传备份后，可以移除本地大多数确定不再使用的版本配置文件、plots曲线、tool脚本，仅把最终版本p1和训练过程中的调试经验进行保留，对确认有误/不再有效的.md笔记文件也可以归档或者移除。同时由于各个env_cfg间有较复杂的嵌套和继承关系，我希望能在p1的配置脚本中进行整理，不继承我们其他AMP版本的资产而是优化为一个完整独立的配置文件。
 
+ssh -p 30856 root@183.147.142.40
+l1a_T*8e#j+LW2D7
+
+越障回放：
+cd /root/gpufree-data/instinct_xu && ./play.sh --task Instinct-Perceptive-Vault-G1-Play-v0 \
+  --load_run 20261015_225907_g1PerceptiveVaultPhpTeacher_concatMotionBins__GPU0 \
+  --checkpoint model_1000.pt --num_envs 16 --device cuda:0 --headless --video --video_length 3000
 
 

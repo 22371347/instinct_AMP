@@ -51,7 +51,10 @@ class G1PerceptiveVaultPPORunnerCfg(InstinctRlOnPolicyRunnerCfg):
 
     num_steps_per_env = 24
     max_iterations = 50000
-    save_interval = 1000
+    #: ⚠️ 2026-10-16：`1000` → `200`。1000 轮的间隔太粗（≈100 分钟才出一份），
+    #: 回放/评估时几乎没有可选的中间点，且"第一个可用 ckpt"要等近两小时。
+    #: 6 s/iter ⇒ 200 轮 ≈ 20 分钟一份；跑满 50000 轮共 250 份 × ~10.5 MB ≈ 2.6 GB（可接受）。
+    save_interval = 200
     log_interval = 10
     experiment_name = "g1_perceptive_vault_shadowing"
 
